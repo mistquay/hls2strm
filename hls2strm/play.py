@@ -35,7 +35,7 @@ from .quality import QualityProber, filter_master, from_master, label as quality
 from .quality import parse_heights, parse_label, tier as quality_tier
 from .sites.hosts import ts_start
 from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
-from .runtime import deadline as request_deadline, traffic, stage, measured_lock, attempt_wait_state
+from .runtime import deadline as request_deadline, traffic, stage, measured_lock, attempt_wait_state, trace
 from .playback import PlaybackSessions
 from .playback_selection import PlaybackSelection
 
@@ -285,7 +285,10 @@ class Resolver:
         sources = await self.db.get_sources(v["id"])
         ranked = self.rank(sources, site=site, direct_only=direct_only, remote=remote, want=want)
         # 先应用字幕偏好，再排除本轮失败候选，不能借排除绕过“字幕不回退”。
+        before = len(ranked)
         ranked = [src for src in ranked if (src["id"], 0) not in excluded]
+        if excluded:
+            trace(f"客户端/本轮已排除 {len(excluded)} 个候选，剩 {len(ranked)}/{before} 个源可试")
         timeout = self.store.current.resolve_timeout
         deadline = request_deadline.get() or time.monotonic() + timeout
         if not ranked:
@@ -305,6 +308,7 @@ class Resolver:
                 errors.append(f"超过 {timeout} 秒，没再试后面的源")
                 break
             label = f"{get_site(src['site']).label} {src['key']}"
+            trace(f"试源 {label}（#{src['id']}）")
             wait_state = {}
             wait_token = attempt_wait_state.set(wait_state)
             try:
@@ -317,19 +321,23 @@ class Resolver:
                 await self.db.mark_source_gone(src["site"], src["key"])
                 gone += 1
                 errors.append(f"{label} 已下架")
+                trace(f"{label} 已下架")
                 log.info("源 %s 已下架：%s", label, e)
                 continue
             except Blocked as e:
                 blocked = e
                 errors.append(f"{label} 站点拦截中")
+                trace(f"{label} 站点拦截中：{e}")
                 continue
             except CandidateExcluded:
                 errors.append(f"{label} 的线路已在本轮排除")
+                trace(f"{label} 的线路已在本轮排除")
                 continue
             except PoolBusy:
                 raise
             except TimeoutError:
                 errors.append(f"{label}：单次解析超时")
+                trace(f"{label} 单次解析超时")
                 self.metrics.inc("play_attempt_timeout")
                 if not wait_state.get("local_timeout"):
                     await self.db.source_failed(src["id"], "单次解析超时")
@@ -339,6 +347,7 @@ class Resolver:
                 if not wait_state.get("local_timeout"):
                     await self.db.source_failed(src["id"], msg)
                 errors.append(f"{label}：{msg}")
+                trace(f"{label} 取地址失败：{msg}")
                 log.warning("源 %s 取地址失败：%s", label, msg)
                 continue
             finally:
@@ -901,6 +910,7 @@ def _upstream(r: Resolved, path: str) -> str | None:
 def _cdn_error(request: Request, r: Resolved, msg: str) -> HTTPException:
     """中转时 CDN 出错：记进这个播放站的连通性，返回给播放器 502。"""
     _ctx(request).resolver.health.record(r.host, False, error=msg)
+    trace(msg)
     return HTTPException(502, msg)
 
 
@@ -1074,7 +1084,10 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = "", s: 
     except PoolBusy as e:
         raise HTTPException(503, str(e), headers={"Retry-After": "1"}) from None
     except (FetchError, ParseError) as e:
+        trace(f"源 #{source_id} 取播放地址失败：{e}")
         raise HTTPException(502, f"解析播放地址失败：{e}") from None
+    trace(f"源 #{source_id} {r.site.label} {r.source['key']}" + (f" 线路 {r.line['line']}" if r.line else "")
+          + f"，取 {path}")
     headers_up = r.traits.headers or None
     for attempt in range(2):
         url = _upstream(r, path)
@@ -1090,6 +1103,7 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = "", s: 
         if resp.status_code in (403, 410) and attempt == 0 and not path.startswith("_x/"):
             await close_stream(resp)
             ctx.metrics.inc("play_token_expired")
+            trace(f"CDN 返回 HTTP {resp.status_code}，换新地址重试")
             try:
                 r = await (ctx.resolver.session_source(source_id, s, stale=r.url) if s else ctx.resolver.ensure_source(source_id, stale=r.url))
             except (NotFound, VideoGone, Blocked, FetchError, ParseError) as e:

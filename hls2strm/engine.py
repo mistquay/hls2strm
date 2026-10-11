@@ -964,6 +964,12 @@ class Engine:
         """删掉影片在这些站点的源（以后列表、详情、补源再抓到也不用）。删完没有能用的源了（别的源所在站点停用、
         没有启用的线路也算没有），影片从所有输出库移出，文件搬进归档目录，记下移出了哪些库，恢复时搬回去。
         返回影片是不是移出了。"""
+        # 同一部片的删源排队做（两个站点清退同时跑会碰上）：读状态、改库、搬文件之间不能被插进来，
+        # 否则后来的会把它当成「以前下架过又回来」，删掉先来的刚记下的归档记录
+        async with self._output_locks.setdefault(video_id, asyncio.Lock()):
+            return await self._remove_sources(video_id, sites)
+
+    async def _remove_sources(self, video_id: int, sites: list[str]) -> bool:
         v = await self.db.get_video_by_id(video_id)
         if v is None:
             return False
@@ -976,11 +982,10 @@ class Engine:
             return False
         if v["status"] != "removed":
             await self.db.delete_archives(video_id)  # 以前下架过又回来的：旧的归档记录不要了，文件留在归档目录里
-        async with self._output_locks.setdefault(video_id, asyncio.Lock()):
-            for out in outputs:
-                if lib := self.libs.get(out["library_id"]):
-                    await self._archive_files(lib, v, out["strm_path"])
-                await self.db.delete_output(video_id, out["library_id"])
+        for out in outputs:
+            if lib := self.libs.get(out["library_id"]):
+                await self._archive_files(lib, v, out["strm_path"])
+            await self.db.delete_output(video_id, out["library_id"])
         log.info("删源 %s：删掉 %s 的源，没有能用的源了，移出%s", v["slug"], "、".join(sites),
                  "「" + "」「".join(o["library_name"] for o in outputs) + "」" if outputs else "（本来就不在输出库里）")
         return True
@@ -1312,27 +1317,46 @@ class Engine:
 
         还没跑首轮全量的订阅记 0（库还不完整，什么都确认不了）；没跑过但不需要首轮的，从订阅创建时算起。
         """
-        last_done = await self.db.subscription_last_done()
         cutoffs: dict[int, int] = {}
-        for sub in await self.db.list_subscriptions():
-            if not sub["enabled"] or not has_schedule(sub):
-                continue
-            t = (last_done.get(sub["id"]) or sub["created_at"]) if sub["initialized"] else 0
+        for sub, t in await self._sub_cutoffs():
             cutoffs[sub["library_id"]] = min(cutoffs.get(sub["library_id"], t), t)
         return cutoffs
 
-    def _seen_before(self, lib: dict, sub_cutoffs: dict[int, int]) -> int:
-        """首次出现早于这个时间点的影片，才能确认没被分到排除库；没有排除库就不用等。"""
-        t = int(time.time()) + 1
+    async def _sub_cutoffs(self) -> list[tuple[dict, int]]:
+        """[(定时订阅, 它最近一轮跑完的任务的开始时间)]，规则见 _subscription_cutoffs。"""
+        last_done = await self.db.subscription_last_done()
+        return [(sub, (last_done.get(sub["id"]) or sub["created_at"]) if sub["initialized"] else 0)
+                for sub in await self.db.list_subscriptions() if sub["enabled"] and has_schedule(sub)]
+
+    def _waits_on(self, lib: dict) -> set[int]:
+        """归并写这个库之前要等哪些库的订阅：排除库，以及它们的来源库、排除库（一路往下）。"""
         todo, seen = list(lib["excludes"]), set()
         while todo:
             lid = todo.pop()
             if lid in seen or lid not in self.libs:
                 continue
             seen.add(lid)
-            t = min(t, sub_cutoffs.get(lid, t))
             todo += self.libs[lid]["sources"] + self.libs[lid]["excludes"]
-        return t
+        return seen
+
+    def _seen_before(self, lib: dict, sub_cutoffs: dict[int, int]) -> int:
+        """首次出现早于这个时间点的影片，才能确认没被分到排除库；没有排除库就不用等。"""
+        t = int(time.time()) + 1
+        return min([t] + [sub_cutoffs[lid] for lid in self._waits_on(lib) if lid in sub_cutoffs])
+
+    async def settle_waits(self) -> dict[int, dict]:
+        """有排除库的库现在卡在哪个订阅上：{库 id: {subscription_id, subscription, library, since}}。
+        since 是那个订阅最近一轮跑完的开始时间，之后首次出现的影片要等它再跑完一轮；0 是它首轮全量还没完成，
+        跑完之前这个库一部新片都写不了。"""
+        cutoffs = await self._sub_cutoffs()
+        out = {}
+        for lib in self.libs.values():
+            waits = self._waits_on(lib)
+            if found := [(t, sub) for sub, t in cutoffs if sub["library_id"] in waits]:
+                t, sub = min(found, key=lambda x: x[0])
+                out[lib["id"]] = {"subscription_id": sub["id"], "subscription": sub["name"],
+                                  "library": self.libs[sub["library_id"]]["name"], "since": t}
+        return out
 
     def _dependency_order(self) -> list[dict]:
         """来源库、排除库排在依赖它们的库前面（保存时已校验不成环）。"""

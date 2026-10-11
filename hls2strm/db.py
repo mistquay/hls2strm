@@ -1080,7 +1080,8 @@ class Database:
     async def list_libraries(self) -> list[dict]:
         rows = await self._all(
             """SELECT l.*, (SELECT COUNT(*) FROM outputs o WHERE o.library_id=l.id) AS videos,
-                      (SELECT COUNT(*) FROM outputs o WHERE o.library_id=l.id AND o.strm_path='') AS pending,
+                      (SELECT COUNT(*) FROM outputs o JOIN videos v ON v.id=o.video_id
+                        WHERE o.library_id=l.id AND o.strm_path='' AND v.status='active') AS pending,
                       (SELECT COUNT(*) FROM subscriptions s WHERE s.library_id=l.id) AS subscriptions
                FROM libraries l ORDER BY l.id"""
         )

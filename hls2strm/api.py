@@ -577,7 +577,9 @@ class LibraryBody(BaseModel):
 async def list_libraries(request: Request):
     c = _ctx(request)
     libs = await c.db.list_libraries()
+    waits = await c.engine.settle_waits()
     for lib in libs:
+        lib["waiting"] = waits.get(lib["id"]) if lib["pending"] else None  # 等待归入卡在哪个订阅
         lib["missing"] = c.engine.missing.get(lib["id"], 0)
         lib["root"] = str(c.writer.library_root(lib))
         lib["external_root"] = str(c.writer.external_root(lib) or "")

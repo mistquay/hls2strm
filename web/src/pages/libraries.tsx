@@ -30,8 +30,22 @@ export default function Libraries() {
 
 // ---- 输出库 ----
 
+/** 有排除库的库要等排除库的订阅都跑完一轮，才确认新片不属于排除库、写出 strm；这里说明现在卡在哪个订阅。 */
+function WaitingReason({ waiting, sub }: { waiting: NonNullable<Library["waiting"]>; sub?: Subscription }) {
+  const who = `「${waiting.subscription}」（${waiting.library}）`;
+  if (!waiting.since)
+    return <div className="mt-1 text-xs text-err">卡在{who}：它的首轮全量还没完成，完成前这个库一部新片都不会写出。跑完首轮、标记首轮已完成或停用它都能放行</div>;
+  return (
+    <div className="mt-1 text-xs text-muted">
+      在等{who}再跑完一轮：{fmtTime(waiting.since)} 之后新加的片要等它确认不属于排除库
+      {sub && `，下次 ${nextSubscriptionTime(sub)}`}
+    </div>
+  );
+}
+
 function LibrariesPanel() {
   const { data: libs = [] } = useLibraries(true);
+  const { data: subs = [] } = useSubscriptions();
   const { data: status } = useStatus();
   const run = useRun();
   const [editing, setEditing] = useState<Library | "new" | null>(null);
@@ -141,6 +155,7 @@ function LibrariesPanel() {
                 {l.excludes.length > 0 && <div>排除：{names(l.excludes)}</div>}
                 {!l.rule_text && !l.sources.length && !l.excludes.length && <span className="text-muted">-</span>}
                 {l.pending > 0 && l.excludes.length > 0 && <Chip tone="warn">等待归入 {fmtNum(l.pending)}</Chip>}
+                {l.pending > 0 && l.waiting && <WaitingReason waiting={l.waiting} sub={subs.find(s => s.id === l.waiting?.subscription_id)} />}
               </Td>
               <Td className="text-right">
                 {fmtNum(l.videos)}
@@ -372,12 +387,32 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
 
 // ---- 订阅 ----
 
+const SUB_STATES: Record<string, string> = { running: "运行中", scheduled: "定时 / 手动", uninitialized: "未跑首轮全量", disabled: "已停用", site_off: "站点停用或已清退" };
+
+function subGroup(sub: Subscription): string {
+  if (sub.listing_job_id || sub.active_job_id) return "running";
+  if (!sub.enabled) return "disabled";
+  return sub.initialized ? "scheduled" : "uninitialized";
+}
+
 function SubscriptionsPanel() {
   const { data: subs = [] } = useSubscriptions(true);
+  const { data: libs = [] } = useLibraries();
+  const { data: status } = useStatus();
+  const { data: retired = [] } = useQuery({ queryKey: ["site-retirements"], queryFn: ({ signal }) => api.get<{ site: string }[]>("/api/site-retirements", signal) });
   const meta = useMeta();
   const run = useRun();
   const [editing, setEditing] = useState<Subscription | "new" | null>(null);
+  const [filter, setFilter] = useState({ q: "", site: "", library: "", state: "" });
   const done = { invalidate: [["subscriptions"], ["status"], ["jobs"]] };
+  const retiredSites = new Set(retired.map(r => r.site));
+  const siteOff = (site: string) => retiredSites.has(site) || status?.sites.find(s => s.name === site)?.enabled === false;
+  const shown = subs.filter(sub =>
+    (!filter.q || sub.name.toLowerCase().includes(filter.q.toLowerCase()) || sub.source.includes(filter.q))
+    && (!filter.site || sub.site === filter.site)
+    && (!filter.library || String(sub.library_id) === filter.library)
+    && (!filter.state || (filter.state === "site_off" ? siteOff(sub.site) : subGroup(sub) === filter.state)));
+  const set = (k: keyof typeof filter) => (e: { target: { value: string } }) => setFilter({ ...filter, [k]: e.target.value });
 
   return (
     <Panel
@@ -390,6 +425,25 @@ function SubscriptionsPanel() {
       }
       bodyClassName="px-4 py-0"
     >
+      <div className="flex flex-wrap items-center gap-2 py-3">
+        <Input className="w-48" placeholder="名称或来源" value={filter.q} onChange={set("q")} />
+        <Select value={filter.site} onChange={set("site")}>
+          <option value="">全部站点</option>
+          {Object.entries(meta.sites).map(([key, s]) => <option key={key} value={key}>{s.label}{retiredSites.has(key) ? "（已清退）" : ""}</option>)}
+        </Select>
+        <Select value={filter.library} onChange={set("library")}>
+          <option value="">全部输出库</option>
+          {libs.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}
+        </Select>
+        <Select value={filter.state} onChange={set("state")}>
+          <option value="">全部状态</option>
+          {Object.entries(SUB_STATES).map(([key, text]) => <option key={key} value={key}>{text}</option>)}
+        </Select>
+        {(filter.q || filter.site || filter.library || filter.state) && (
+          <Button size="sm" variant="ghost" onClick={() => setFilter({ q: "", site: "", library: "", state: "" })}>清除筛选</Button>
+        )}
+        <span className="ml-auto text-[13px] text-muted">{shown.length === subs.length ? `共 ${subs.length} 个` : `显示 ${shown.length} / ${subs.length} 个`}</span>
+      </div>
       <Table>
         <thead>
           <tr>
@@ -404,17 +458,24 @@ function SubscriptionsPanel() {
           </tr>
         </thead>
         <tbody>
-          {subs.map(sub => {
+          {!shown.length && <EmptyRow cols={8}>{subs.length ? "没有符合筛选的订阅" : "还没有订阅"}</EmptyRow>}
+          {shown.map(sub => {
             const st = subState(sub);
             const sortName = sub.sort ? meta.site(sub.site).sorts[sub.sort] ?? sub.sort : "";
+            const off = siteOff(sub.site);
             return (
-              <tr key={sub.id}>
+              <tr key={sub.id} className={sub.enabled ? "" : "text-muted"}>
                 <Td>
                   <div className="font-medium">{sub.name}</div>
                   <div className="text-xs text-muted">
                     {meta.label(sub.site)} <Mono className="text-xs">{sub.source}</Mono>
                     {sortName && `，按${sortName}`}
                   </div>
+                  {off && (
+                    <Chip tone="neutral" className="mt-1" title="站点停用时这个订阅的抓取任务不会执行">
+                      {retiredSites.has(sub.site) ? "站点已清退" : "站点已停用"}
+                    </Chip>
+                  )}
                 </Td>
                 <Td className="text-[13px]">{sub.library_name}</Td>
                 <Td className="whitespace-nowrap text-[13px]">
@@ -436,7 +497,7 @@ function SubscriptionsPanel() {
                 <Td className="whitespace-nowrap text-[13px] text-muted">{sub.last_run_at ? fmtTime(sub.last_run_at) : "-"}</Td>
                 <Td className="whitespace-nowrap text-[13px] text-muted">{nextSubscriptionTime(sub)}</Td>
                 <Td className="whitespace-nowrap text-right">
-                  {!sub.listing_job_id &&
+                  {!sub.listing_job_id && !off &&
                     (sub.initialized ? (
                       <Button size="sm" onClick={() => runSubscription(run, sub, "incremental")}>
                         立即增量
@@ -454,7 +515,7 @@ function SubscriptionsPanel() {
                     </MenuTrigger>
                     <MenuContent>
                       <MenuItem onSelect={() => setEditing(sub)}>编辑</MenuItem>
-                      {!sub.listing_job_id && sub.initialized ? <MenuItem onSelect={() => runSubscription(run, sub, "full")}>重跑全量</MenuItem> : null}
+                      {!sub.listing_job_id && sub.initialized && !off ? <MenuItem onSelect={() => runSubscription(run, sub, "full")}>重跑全量</MenuItem> : null}
                       {!sub.listing_job_id && !sub.initialized ? (
                         <MenuItem
                           onSelect={async () => {

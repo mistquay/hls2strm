@@ -422,6 +422,8 @@ export interface Library {
   excludes: number[];
   videos: number;
   pending: number;
+  /** 等待归入卡在哪个订阅：since 是它最近一轮跑完的开始时间，0 是首轮全量还没完成 */
+  waiting: { subscription_id: number; subscription: string; library: string; since: number } | null;
   subscriptions: number;
   missing: number;
 }

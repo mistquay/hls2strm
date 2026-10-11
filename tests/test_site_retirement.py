@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -79,6 +80,46 @@ def test_retire_site_archives_and_restores(make_store, boot, tmp_path):
         assert (await db.get_video_by_id(scraped["id"]))["status"] == "active"
         assert not stash.exists() and await db._one("SELECT 1 FROM archives") is None
         assert await db._one("SELECT 1 FROM site_retirements") is None
+        await engine.stop()
+
+    asyncio.run(run())
+
+
+def test_concurrent_removals_keep_archive_record(make_store, boot):
+    """两个站点清退同时处理同一部片：后来的不能把先来的当成「以前下架过」，删掉它刚记下的归档记录。"""
+    async def run():
+        db, store = await make_store()
+        html, ids = model_fixture()
+        engine = Engine(db, FakeFetcher(html, ids), OutputWriter(store), store, Metrics(), boot)
+        await engine.start()
+        await wait_job(db, await engine.create_crawl("/models/abc/", end_page=1, detail=False))
+        v = await db.get_video("ipzz-983")
+        await db.upsert_item("missav", SourceItem(key="ipzz-983", code="IPZZ-983", title="IPZZ-983"), "ipzz-983",
+                             engine._rank)
+        # 两个站都停用了（清退时就是这样）：两边都认为对方的源不能用，都会走下架
+        await store.update({"sites": {"jable": {"enabled": False}, "missav": {"enabled": False}}})
+        # 固定线上出事的先后：第二个读到影片状态后，等第一个记下归档才继续
+        archived, calls, usable, add_archive = asyncio.Event(), [], engine._usable, db.add_archive
+
+        async def slow_usable(sources):
+            calls.append(1)
+            if len(calls) == 2:
+                await archived.wait()
+            return await usable(sources)
+
+        async def noted_add_archive(*args):
+            await add_archive(*args)
+            archived.set()
+
+        engine._usable, db.add_archive = slow_usable, noted_add_archive
+        await asyncio.gather(engine.remove_sources(v["id"], ["jable"]), engine.remove_sources(v["id"], ["missav"]))
+        engine._usable, db.add_archive = usable, add_archive
+        await store.update({"sites": {"jable": {"enabled": True}, "missav": {"enabled": True}}})
+        assert (await db.get_video_by_id(v["id"]))["status"] == "removed"
+        rec = await db.get_archive(v["id"], 1)
+        assert rec is not None and all(Path(dst).exists() for _, dst in rec["moves"])
+        await wait_job(db, await engine.create_source_removal([v["id"]]))
+        assert Path(rec["strm"]).is_file()
         await engine.stop()
 
     asyncio.run(run())

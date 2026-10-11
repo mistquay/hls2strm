@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
 from collections import deque
 
@@ -11,15 +12,19 @@ from curl_cffi.curl import CURL_WRITEFUNC_PAUSE, CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.utils import set_curl_options
 
-from .runtime import stage, local_queue
+from .runtime import stage, local_queue, trace, upstream_target
 from .errors import PoolBusy
 
+log = logging.getLogger(__name__)
+
 BUFFER_BYTES = 512 * 1024
+CURL_WAIT = 5  # 拿到连接额度后取 curl 句柄最多等几秒：句柄和额度一样多，正常不用等，要等就是句柄漏了
 
 
 class MediaResponse:
-    def __init__(self, session, curl, metrics, buffer_bytes=BUFFER_BYTES):
+    def __init__(self, session, curl, metrics, buffer_bytes=BUFFER_BYTES, release=None):
         self.session, self.curl, self.metrics = session, curl, metrics
+        self.release = release or session.release_curl
         self.buffer_bytes = buffer_bytes
         self.chunks = deque()
         self.buffered = 0
@@ -74,15 +79,19 @@ class MediaResponse:
             return
         self.closed = True
         self.quit_now.set()
-        if self.task and not self.task.done():
-            self.session.acurl.remove_handle(self.curl)
-            self.task.cancel()
-        if self.task:
-            await asyncio.gather(self.task, return_exceptions=True)
-        self.metrics.gauges["relay_buffer_bytes"] -= self.buffered
-        self.buffered = 0
-        self.chunks.clear()
-        self.session.release_curl(self.curl)
+        try:
+            if self.task and not self.task.done():
+                self.session.acurl.remove_handle(self.curl)
+                self.task.cancel()
+            if self.task:
+                await asyncio.gather(self.task, return_exceptions=True)
+        finally:
+            # 播放器断开时框架会取消收尾，取消落在上面的 await 上也得把 curl 句柄还回池子：
+            # 漏一个少一个，漏光后这个池子的请求都会卡在取句柄上
+            self.metrics.gauges["relay_buffer_bytes"] -= self.buffered
+            self.buffered = 0
+            self.chunks.clear()
+            self.release(self.curl)
 
 
 class ManagedSession:
@@ -113,33 +122,49 @@ class ManagedSession:
             try:
                 with stage(self.metrics, f"pool.{self.kind}.wait"):
                     wait = min(kw.get("timeout", 30), self.wait_timeout or float("inf"))
+                    if self.slots.locked():
+                        trace(f"{self.kind} 连接额度用满（{self.capacity}），排队")
                     try:
                         async with local_queue():
                             await asyncio.wait_for(self.slots.acquire(), wait)
                     except TimeoutError:
                         self.metrics.inc(f"pool_{self.kind}_busy")
+                        trace(f"{self.kind} 连接额度排队超过 {wait:.0f} 秒")
                         raise PoolBusy(f"{self.kind} 连接额度排队超时") from None
             finally:
                 self.metrics.gauges[f"http_waiting_{self.kind}"] -= 1
             acquired = True
             kw["timeout"] = max(.001, budget - time.monotonic())
             self.metrics.gauges[f"http_active_{self.kind}"] += 1
+            started = time.monotonic()
             with stage(self.metrics, f"upstream.{self.kind}"):
-                if kw.pop("stream", False):
-                    resp = await self._stream(url, **kw)
-                    close = resp.aclose
-                    async def release():
-                        if resp.closed:
-                            return
-                        try:
-                            await close()
-                        finally:
-                            self._release(True)
-                    resp.aclose = release
-                    handed_off = True
-                    return resp
-                async with asyncio.timeout(kw.get("timeout", 30)):
-                    return await self.raw.request(method, url, **kw)
+                try:
+                    if kw.pop("stream", False):
+                        resp = await self._stream(url, **kw)
+                        close = resp.aclose
+                        async def release():
+                            if resp.closed:
+                                return
+                            try:
+                                await close()
+                            finally:
+                                self._release(True)
+                        resp.aclose = release
+                        handed_off = True
+                    else:
+                        trace(f"请求上游 {upstream_target(url)}")
+                        async with asyncio.timeout(kw.get("timeout", 30)):
+                            resp = await self.raw.request(method, url, **kw)
+                except PoolBusy:
+                    raise
+                except TimeoutError:
+                    trace(f"上游 {kw.get('timeout', 30):.0f} 秒内没返回响应头")
+                    raise
+                except Exception as e:
+                    trace(f"上游出错：{type(e).__name__}: {str(e)[:200]}")
+                    raise
+                trace(f"上游返回 HTTP {resp.status_code}（{(time.monotonic() - started) * 1000:.0f}ms）")
+                return resp
         finally:
             if not handed_off:
                 self._release(acquired)
@@ -155,9 +180,32 @@ class ManagedSession:
     async def get(self, url, **kw):
         return await self.request("GET", url, **kw)
 
+    def _free_curls(self) -> int:
+        pool = getattr(self.raw, "pool", None)  # curl_cffi 的句柄池（内部属性）
+        return pool.qsize() if pool is not None else -1
+
+    async def _pop_curl(self):
+        if self._free_curls() == 0:
+            trace(f"{self.kind} 的 curl 句柄用光了（容量 {self.capacity}，活动请求 {self.active - 1}），排队等句柄")
+        try:
+            async with asyncio.timeout(CURL_WAIT):
+                curl = await self.raw.pop_curl()
+        except TimeoutError:
+            self.metrics.inc(f"pool_{self.kind}_curl_exhausted")
+            log.warning("%s 连接池的 curl 句柄用光了：容量 %d，活动请求 %d，等了 %d 秒没等到（句柄没还回来，多半是泄漏）",
+                        self.kind, self.capacity, self.active - 1, CURL_WAIT)
+            raise PoolBusy(f"{self.kind} 连接池的 curl 句柄用光了") from None
+        self.metrics.gauges[f"http_curl_free_{self.kind}"] = self._free_curls()
+        return curl
+
+    def _release_curl(self, curl) -> None:
+        self.raw.release_curl(curl)
+        self.metrics.gauges[f"http_curl_free_{self.kind}"] = self._free_curls()
+
     async def _stream(self, url, *, headers=None, timeout=30, **kw):
-        curl = await self.raw.pop_curl()
-        resp = MediaResponse(self.raw, curl, self.metrics, self.buffer_bytes)
+        curl = await self._pop_curl()
+        trace(f"请求上游 {upstream_target(url)}")
+        resp = MediaResponse(self.raw, curl, self.metrics, self.buffer_bytes, release=self._release_curl)
         try:
             _, buffer, header_buffer, _, _, _ = set_curl_options(
                 curl, "GET", url, params_list=[self.raw.params, None],
@@ -167,7 +215,7 @@ class ManagedSession:
                 allow_redirects=True,
             )
         except BaseException:
-            self.raw.release_curl(curl)
+            self._release_curl(curl)
             raise
         curl.setopt(CurlOpt.WRITEFUNCTION, resp.write)
         curl.setopt(CurlOpt.TIMEOUT_MS, 0)

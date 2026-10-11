@@ -12,7 +12,7 @@ from .errors import FetchError, NotFound, ParseError, PoolBusy
 from .cache import AsyncCache
 from .fetcher import close_stream
 from .quality import filter_master
-from .runtime import deadline, traffic
+from .runtime import deadline, traffic, trace
 
 
 def candidate_key(resolved) -> tuple[int, int]:
@@ -99,6 +99,8 @@ class PlaybackSelection:
         # 显式试播指定站点/线路仍允许重试，普通自动选源暂时避开近期坏候选。
         cooling = {key for key, until in self.cooling.items() if until > time.monotonic()} if not options.get("site") else set()
         blocked.update(cooling)
+        if cooling:
+            trace(f"{len(cooling)} 个候选近期预检失败，先避开")
         failures = []
         try:
             async with asyncio.timeout_at(limit):
@@ -122,6 +124,7 @@ class PlaybackSelection:
                         raise
                     except (FetchError, NotFound, ParseError, TimeoutError, OSError, CurlError) as error:
                         message = str(error) or "媒体预检超时"
+                        trace(f"媒体预检失败，换下一个：{resolved.site.label} {resolved.source['key']}：{message}")
                         failures.append(f"{resolved.site.label} {resolved.line['line'] if resolved.line else ''}：{message}")
                         blocked.add(key)
                         cooling.discard(key)
