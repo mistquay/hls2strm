@@ -16,7 +16,7 @@ const GROUPS: { id: string; title: string; keys: string[] }[] = [
   { id: "fetch", title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "domain_cooldown_max", "solver_url", "solver_timeout"] },
   { id: "retry", title: "重试", keys: ["max_attempts", "retry_base_delay"] },
   { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days", "external_restore", "trash_days", "orphan_cleanup"] },
-  { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
+  { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop", "archive_dir"] },
   {
     id: "play",
     title: "播放",
@@ -90,6 +90,7 @@ const LABELS: Record<string, string> = {
   write_nfo: "写 nfo",
   download_cover: "下载封面",
   poster_crop: "裁剪 poster",
+  archive_dir: "归档目录",
   public_base_url: "对外地址",
   play_mode: "普通播放模式",
   proxy_user_agents: "中转 UA 片段",
@@ -163,7 +164,7 @@ export default function Settings() {
             放弃改动
           </Button>
           <span className="ml-auto text-[13px] text-muted">
-            生效的输出目录 <Mono>{data.effective.output_dir}</Mono>，对外地址 <Mono>{data.effective.public_base_url}</Mono>
+            生效的输出目录 <Mono>{data.effective.output_dir}</Mono>，归档目录 <Mono>{data.effective.archive_dir}</Mono>，对外地址 <Mono>{data.effective.public_base_url}</Mono>
           </span>
         </div>
         {needRewrite && (

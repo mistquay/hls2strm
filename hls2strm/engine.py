@@ -29,6 +29,7 @@ from pathlib import Path
 from urllib.parse import urljoin
 from weakref import WeakValueDictionary
 
+from . import archive
 from .codes import work_slug
 from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
@@ -44,10 +45,11 @@ from .sites.hosts import MP4_HOSTS
 from .rules import describe_rule, match_rule, normalize_rule
 from .runtime import log_area
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
+from .source_policy import eligible
 from .strm_manage import StrmManager
 from .subscription_schedule import has_schedule, schedule_anchor, scheduled_after
-from .trash import inside, purge as purge_trash, retire
-from .writer import VERSION_STYLES, OutputWriter, cover_path
+from .trash import inside, prune, purge as purge_trash, retire
+from .writer import VERSION_STYLES, OutputWriter, cover_path, sanitize
 
 log = logging.getLogger(__name__)
 
@@ -415,6 +417,9 @@ class Engine:
                                 settle: bool = False, versions: bool | None = None) -> None:
         """写一部影片在某个库里的输出。versions：要不要对齐多画质版本文件，默认库开了才对齐；
         重写输出时传 True，库关了也清掉以前写的。"""
+        current = await self.db.get_video_by_id(v["id"])
+        if current is None or current["status"] == "removed":
+            return
         lib = self._library(library_id)
         if old_strm is None:
             out = await self.db.get_output(v["id"], library_id)
@@ -459,6 +464,58 @@ class Engine:
             except OSError as e:
                 log.warning("「%s」移出 %s：整理目录 %s 没能移进回收区：%s", lib["name"], slug, p.parent, e)
         self.strm.forget(lib, video_id)
+
+    def archive_root(self) -> Path:
+        root = self.store.archive_dir
+        self.check_archive_dir(root)
+        return root
+
+    def check_archive_dir(self, root: Path) -> None:
+        """归档目录不能和输出根目录、各库目录、外部整理目录互相嵌套：搬进去媒体库还看得到，或者被当成库里的文件。"""
+        root = root.resolve()
+        dirs = [("输出根目录", self.store.output_dir)] + [
+            (f"输出库「{lib['name']}」", d) for lib in self.libs.values()
+            for d in (self.writer.library_root(lib), self.writer.external_root(lib)) if d]
+        for name, d in dirs:
+            if _overlap(root, d.resolve()):
+                raise ValueError(f"归档目录 {root} 和{name}的目录 {d} 重叠，不能互相嵌套")
+
+    async def _archive_files(self, lib: dict, v: dict, strm_path: str) -> None:
+        """影片下架：它在这个库里的文件搬进归档目录（见 archive.py），记下搬到了哪里，恢复时搬回来。
+        外部整理库先按内容找到 strm 现在在哪（外部工具可能在上次同步位置之后又挪过、改过名）。"""
+        ext = self.writer.external_root(lib)
+        if ext is not None:
+            paths = await self.strm.paths_of(lib, v["id"], strm_path)
+        else:
+            paths = [strm_path] if strm_path and await asyncio.to_thread(os.path.isfile, strm_path) else []
+        self.strm.forget(lib, v["id"])
+        if not paths:
+            return
+        keep, dest = self.keep_dirs(), self.archive_root() / sanitize(lib["name"])
+        pairs = await asyncio.to_thread(archive.plan, [Path(p) for p in paths], v["slug"],
+                                        self.writer.library_root(lib), ext, dest)
+        await self.db.add_archive(v["id"], lib["id"], self.strm.pick(lib, paths), pairs)
+
+        def run() -> None:
+            archive.stash(pairs)
+            for src, _ in pairs:
+                if ext is not None and inside(Path(src), ext):
+                    prune(Path(src).parent, ext)
+                else:
+                    self.writer.remove_empty_dirs(Path(src).parent, keep)
+
+        await asyncio.to_thread(run)
+        log.info("「%s」移出 %s：%s", lib["name"], v["slug"], "、".join(f"{a} 搬到 {b}" for a, b in pairs))
+
+    async def _unarchive(self, lib: dict, v: dict) -> str:
+        """把影片在这个库里归档的文件搬回原处，返回搬回来的主 strm；没有归档或者没搬回来返回空串。"""
+        rec = await self.db.get_archive(v["id"], lib["id"])
+        if rec is None:
+            return ""
+        for problem in await asyncio.to_thread(archive.unstash, rec["moves"], self.store.archive_dir):
+            log.warning("「%s」放回 %s：%s", lib["name"], v["slug"], problem)
+        await self.db.delete_archives(v["id"], lib["id"])
+        return rec["strm"] if await asyncio.to_thread(os.path.isfile, rec["strm"]) else ""
 
     # ---- 多画质版本 ----
 
@@ -894,30 +951,47 @@ class Engine:
 
     async def _do_source_restore(self, job: dict, task: dict) -> None:
         video_id = int(task["target"])
-        if await self.restore_sources(video_id) and (v := await self.db.get_video_by_id(video_id)):
+        if (await self.restore_sources(video_id, job["params"].get("sites"))
+                and (v := await self.db.get_video_by_id(video_id))):
             await self._queue_covers(job["id"], v)
 
+    async def _usable(self, sources: list[dict]) -> list[dict]:
+        """能用的源：没删、没下架，所在站点启用，有启用的线路（source_policy.eligible，只看本地记录）。"""
+        lines = await self.db.lines_for([s["id"] for s in sources])
+        return [s for s in sources if eligible(s, self.store.current, lines.get(s["id"], []))]
+
     async def remove_sources(self, video_id: int, sites: list[str]) -> bool:
-        """删掉影片在这些站点的源（以后列表、详情、补源再抓到也不用）。删完没有可用的源了，影片从所有输出库移出
-        （外部整理库删 strm，整理目录进回收区），记下移出了哪些库，恢复时放回去。返回影片是不是移出了。"""
+        """删掉影片在这些站点的源（以后列表、详情、补源再抓到也不用）。删完没有能用的源了（别的源所在站点停用、
+        没有启用的线路也算没有），影片从所有输出库移出，文件搬进归档目录，记下移出了哪些库，恢复时搬回去。
+        返回影片是不是移出了。"""
         v = await self.db.get_video_by_id(video_id)
         if v is None:
             return False
         outputs = await self.db.get_outputs(video_id)
-        if not await self.db.remove_sources(video_id, sites, [(o["library_id"], o["via"]) for o in outputs]):
-            log.info("删源 %s：删掉 %s 的源，还有别的可用源，留在输出库里", v["slug"], "、".join(sites))
+        if outputs:
+            self.archive_root()  # 归档目录不能用时先别动
+        usable = [s["id"] for s in await self._usable(await self.db.get_sources(video_id)) if s["site"] not in sites]
+        if not await self.db.remove_sources(video_id, sites, [(o["library_id"], o["via"]) for o in outputs], usable):
+            log.info("删源 %s：删掉 %s 的源，还有别的能用的源，留在输出库里", v["slug"], "、".join(sites))
             return False
-        for out in outputs:
-            if (lib := self.libs.get(out["library_id"])) and out["strm_path"]:
-                await self._remove_files(lib, video_id, v["slug"], out["strm_path"])
-            await self.db.delete_output(video_id, out["library_id"])
-        log.info("删源 %s：删掉 %s 的源，没有可用的源了，移出%s", v["slug"], "、".join(sites),
+        if v["status"] != "removed":
+            await self.db.delete_archives(video_id)  # 以前下架过又回来的：旧的归档记录不要了，文件留在归档目录里
+        async with self._output_locks.setdefault(video_id, asyncio.Lock()):
+            for out in outputs:
+                if lib := self.libs.get(out["library_id"]):
+                    await self._archive_files(lib, v, out["strm_path"])
+                await self.db.delete_output(video_id, out["library_id"])
+        log.info("删源 %s：删掉 %s 的源，没有能用的源了，移出%s", v["slug"], "、".join(sites),
                  "「" + "」「".join(o["library_name"] for o in outputs) + "」" if outputs else "（本来就不在输出库里）")
         return True
 
-    async def restore_sources(self, video_id: int) -> int:
-        """恢复影片删掉的源；影片因此恢复可用时，放回删源时所在的输出库（已经在排除库里的不放）。返回放回了几个库。"""
-        libs = await self.db.restore_sources(video_id)
+    async def restore_sources(self, video_id: int, sites: list[str] | None = None) -> int:
+        """恢复影片删掉的源（sites 给了只恢复这些站点的）。影片因此有了能用的源时，放回删源时所在的输出库
+        （已经在排除库里的不放）：归档的文件搬回原处，再按现在的设置改一遍 strm 内容；搬不回来的重新写 strm，
+        交给外部工具再整理。返回放回了几个库。"""
+        sources = [{**s, "status": "active"} if s["status"] == "removed" and (not sites or s["site"] in sites) else s
+                   for s in await self.db.get_sources(video_id)]
+        libs = await self.db.restore_sources(video_id, sites, revive=bool(await self._usable(sources)))
         v = await self.db.get_video_by_id(video_id)
         n = 0
         for lib_id, via in libs:
@@ -925,10 +999,11 @@ class Engine:
             if v is None or lib is None or await self.db.in_libraries(video_id, lib["excludes"]):
                 continue
             await self.db.ensure_output(video_id, lib_id, via=via)
-            await self._output_one(v, lib_id, cover=False)
+            await self._output_one(v, lib_id, cover=False, old_strm=await self._unarchive(lib, v) or None)
             n += 1
         if v is not None:
-            log.info("恢复 %s 删掉的源%s", v["slug"], f"，放回 {n} 个输出库" if n else "")
+            log.info("恢复 %s 删掉的源%s", v["slug"], f"，放回 {n} 个输出库" if n else
+                     "，但还是没有能用的源（所在站点停用或没有启用的线路），影片仍然下架" if v["status"] == "removed" else "")
         if n:
             self._settle_wanted = True  # 有排除库的库等归并确认后再写
         return n
@@ -1622,6 +1697,9 @@ class Engine:
             if _overlap(root, ext):
                 raise ValueError("外部整理目录和库目录不能互相嵌套，否则整理好的文件会被外部工具当成新文件再处理一遍")
             mine.append(ext)
+        arch = self.store.archive_dir.resolve()
+        if any(_overlap(m, arch) for m in mine):
+            raise ValueError(f"目录和归档目录 {arch} 重叠，不能互相嵌套")
         for other in self.libs.values():
             if other["id"] == exclude_id:
                 continue

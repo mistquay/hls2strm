@@ -25,11 +25,17 @@ def test_removed_source_stays_removed(make_store, boot):
         v = await db.get_video("ipzz-983")
         strm = [out / "全部" / "IPZZ-983" / "IPZZ-983.strm", out / "fc2" / "IPZZ-983" / "IPZZ-983.strm"]
         assert all(p.is_file() for p in strm)
+        cover = strm[0].with_name("IPZZ-983-fanart.jpg")
+        cover.write_bytes(b"jpg")
 
         job = await wait_job(db, await engine.create_source_removal([v["id"]], ["jable"]))
         assert job["status"] == "done" and job["kind"] == "source_remove"
         v = await db.get_video_by_id(v["id"])
-        assert v["status"] == "removed" and not any(p.exists() for p in strm)
+        assert v["status"] == "removed" and not any(p.exists() for p in strm) and not cover.exists()
+        # 文件搬进归档目录，按库分开，封面一起搬
+        stash = boot.data_dir / "archive"
+        assert (stash / "全部" / "library" / "IPZZ-983" / "IPZZ-983-fanart.jpg").read_bytes() == b"jpg"
+        assert (stash / "FC2" / "library" / "IPZZ-983" / "IPZZ-983.strm").is_file()
         assert await db.get_outputs(v["id"]) == [] and [s["status"] for s in await db.get_sources(v["id"])] == ["removed"]
         items, total = await db.search_videos(VideoQuery(status="removed"))
         assert total == 1 and items[0]["id"] == v["id"]
@@ -40,10 +46,11 @@ def test_removed_source_stays_removed(make_store, boot):
         assert (await db.get_video_by_id(v["id"]))["status"] == "removed" and not any(p.exists() for p in strm)
         assert await db.get_outputs(v["id"]) == []
 
-        # 恢复：源可用，放回原来的两个库
+        # 恢复：源可用，从归档搬回原来的两个库
         await wait_job(db, await engine.create_source_removal([v["id"]]))
         assert (await db.get_video_by_id(v["id"]))["status"] == "active" and all(p.is_file() for p in strm)
         assert {o["library_id"] for o in await db.get_outputs(v["id"])} == {1, fc2}
+        assert cover.read_bytes() == b"jpg" and not any(stash.iterdir())
 
         # 还有别的源：只删这个站的，影片留在库里
         w = await db.get_video("abf-156")

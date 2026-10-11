@@ -50,8 +50,9 @@ def inside(path: Path, ext: Path) -> bool:
     return bool(rel.parts) and rel.parts[0] != TRASH_DIR
 
 
-def exclusive(d: Path) -> bool:
-    """目录里只剩元数据：没有影片文件、软链接和特殊文件，可以整个拿走。读不了也当作不行。"""
+def exclusive(d: Path, own: frozenset[str] = frozenset()) -> bool:
+    """目录里只剩元数据：没有影片文件、软链接和特殊文件，可以整个拿走。读不了也当作不行。
+    own 里的影片文件（同一部片自己的 strm）不算，路径用 os.path.normcase 规整过。"""
     try:
         for dirpath, dirs, files in os.walk(d, onerror=_raise):
             for name in dirs + files:
@@ -59,7 +60,7 @@ def exclusive(d: Path) -> bool:
                 st = os.lstat(p)
                 if _is_link(st) or not (stat.S_ISDIR(st.st_mode) or stat.S_ISREG(st.st_mode)):
                     return False
-                if stat.S_ISREG(st.st_mode) and is_media(p):
+                if stat.S_ISREG(st.st_mode) and is_media(p) and os.path.normcase(p) not in own:
                     return False
     except OSError:
         return False

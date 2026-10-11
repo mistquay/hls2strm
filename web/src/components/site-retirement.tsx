@@ -1,0 +1,117 @@
+import { useQuery } from "@tanstack/react-query";
+import { Archive } from "lucide-react";
+import { useState } from "react";
+import { Button } from "@/components/ui/button";
+import { Mono, Notice } from "@/components/ui/data";
+import { Check, Select } from "@/components/ui/form";
+import { Dialog, DialogContent } from "@/components/ui/overlay";
+import { api } from "@/lib/api";
+import { fmtNum, fmtTime } from "@/lib/format";
+import { useMeta, useRun } from "@/lib/queries";
+import { navigate } from "@/lib/route";
+
+interface Preview {
+  site: string; label: string; total: number; keep: number; remove: number; in_libraries: number;
+  reasons: Record<string, number>; subscriptions: string[]; jobs: string[]; archive_dir: string;
+  samples: { id: number; slug: string; title: string; reason: string; libraries: string[] }[];
+}
+interface Retirement { site: string; job_id: number; created_at: number; status: string | null; tasks: Record<string, number> }
+
+const INVALIDATE = [["site-retirements"], ["jobs"], ["libraries"], ["subscriptions"], ["settings"], ["status"]];
+const STATUS: Record<string, string> = { running: "进行中", paused: "已暂停", done: "已完成", cancelled: "已取消" };
+
+export function SiteRetirement() {
+  const run = useRun();
+  const meta = useMeta();
+  const [open, setOpen] = useState(false);
+  const [site, setSite] = useState("");
+  const [preview, setPreview] = useState<Preview | null>(null);
+  const [checked, setChecked] = useState(false);
+  const [restoring, setRestoring] = useState("");
+  const [busy, setBusy] = useState(false);
+  const records = useQuery({
+    queryKey: ["site-retirements"],
+    queryFn: ({ signal }) => api.get<Retirement[]>("/api/site-retirements", signal),
+    enabled: open, refetchInterval: open ? 5000 : false,
+  });
+  const retired = new Set(records.data?.map(r => r.site));
+  const choices = Object.entries(meta.sites).filter(([key]) => !retired.has(key));
+  const current = site && !retired.has(site) ? site : choices[0]?.[0] ?? "";
+
+  const busyRun = async <T,>(fn: () => Promise<T>, opts: Parameters<typeof run<T>>[1]) => {
+    setBusy(true);
+    try { return await run(fn, opts); } finally { setBusy(false); }
+  };
+  const toJob = (id: number) => { setOpen(false); setPreview(null); navigate("jobs", { job: String(id) }); };
+  const load = async () => {
+    setChecked(false);
+    setPreview(await busyRun(() => api.post<Preview>(`/api/sites/${current}/retirement/preview`), { invalidate: [] }) ?? null);
+  };
+  const retire = async () => {
+    const r = await busyRun(() => api.post<{ job_id: number }>(`/api/sites/${preview!.site}/retirement`),
+      { success: r => `已开始清退，任务 #${r.job_id}`, invalidate: INVALIDATE });
+    if (r) toJob(r.job_id);
+  };
+  const restore = async (name: string) => {
+    const r = await busyRun(() => api.post<{ job_id: number }>(`/api/sites/${name}/retirement/restore`),
+      { success: r => `已开始恢复，任务 #${r.job_id}`, invalidate: INVALIDATE });
+    setRestoring("");
+    if (r) toJob(r.job_id);
+  };
+
+  return <>
+    <Button size="sm" onClick={() => setOpen(true)}><Archive />站点清退</Button>
+    <Dialog open={open} onOpenChange={v => !busy && setOpen(v)}>
+      <DialogContent className="max-w-3xl" title="站点清退" footer={<>
+        <Button disabled={busy} onClick={() => setOpen(false)}>关闭</Button>
+        {preview && <Button variant="danger" disabled={busy || !checked} onClick={retire}>停用站点并清退</Button>}
+      </>}>
+        <div className="space-y-4 text-sm">
+          <p className="text-muted">
+            彻底不用一个站点：停用站点和它的订阅，删掉所有影片在这个站的源。别的站还有能用的源的影片留在库里；没有的下架，
+            它在各输出库里的文件原样搬进归档目录（已刮削的整个影片目录、收件目录里没刮削的 strm），媒体库看不到、刮削器也监控不到。
+            恢复时原样搬回。只看本地记录，不抓源站、不探测播放。
+          </p>
+          {!!records.data?.length && <div className="space-y-2 rounded border border-line p-3">
+            <div className="font-medium">已清退</div>
+            {records.data.map(r => <div key={r.site} className="flex flex-wrap items-center gap-2">
+              <span>{meta.label(r.site)}</span>
+              <span className="text-muted">{fmtTime(r.created_at)} · 任务 #{r.job_id} {STATUS[r.status ?? ""] ?? ""}
+                {r.tasks.failed ? ` · ${r.tasks.failed} 部失败` : ""}</span>
+              <Button size="sm" onClick={() => toJob(r.job_id)}>查看任务</Button>
+              <Button size="sm" disabled={busy || ["running", "paused"].includes(r.status ?? "")}
+                onClick={() => setRestoring(r.site)}>恢复</Button>
+            </div>)}
+          </div>}
+          {restoring && <Notice actions={<>
+            <Button size="sm" disabled={busy} onClick={() => setRestoring("")}>取消</Button>
+            <Button size="sm" variant="primary" disabled={busy} onClick={() => restore(restoring)}>确认恢复</Button>
+          </>}>
+            恢复 {meta.label(restoring)}：重新启用站点和清退时停用的订阅，恢复这些影片在这个站的源，下架的从归档目录搬回原处。
+            原处已经有文件的不覆盖，留在归档目录里。
+          </Notice>}
+          <div className="flex gap-2">
+            <Select value={current} disabled={busy} onChange={e => { setSite(e.target.value); setPreview(null); }}>
+              {choices.map(([key, value]) => <option key={key} value={key}>{value.label}</option>)}
+            </Select>
+            <Button disabled={busy || !current} onClick={load}>{busy ? "处理中…" : "预览"}</Button>
+          </div>
+          {preview && <>
+            <div className="space-y-1">
+              <p>{preview.label} 有源的影片 {fmtNum(preview.total)} 部：留下 {fmtNum(preview.keep)} 部，下架 {fmtNum(preview.remove)} 部（其中 {fmtNum(preview.in_libraries)} 部在输出库里，文件搬到 <Mono>{preview.archive_dir}</Mono>）。</p>
+              {Object.entries(preview.reasons).map(([reason, n]) => <p key={reason} className="text-muted">· {reason}：{fmtNum(n)} 部</p>)}
+              <p>停用订阅：{preview.subscriptions.join("、") || "无"}。取消排队中的子任务：{preview.jobs.join("、") || "无"}。</p>
+            </div>
+            {!!preview.samples.length && <div className="max-h-[40vh] space-y-1 overflow-auto rounded border border-line p-3">
+              <div className="text-muted">下架的前 {preview.samples.length} 部</div>
+              {preview.samples.map(v => <div key={v.id} className="break-all">
+                <b>{v.slug.toUpperCase()}</b> {v.title} <span className="text-muted">· {v.reason}{v.libraries.length ? ` · ${v.libraries.join("、")}` : ""}</span>
+              </div>)}
+            </div>}
+            <Check checked={checked} onChange={setChecked}>确认停用 {preview.label} 和它的订阅，执行清退</Check>
+          </>}
+        </div>
+      </DialogContent>
+    </Dialog>
+  </>;
+}

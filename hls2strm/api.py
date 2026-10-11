@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import time
+from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
@@ -19,6 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
 from . import auth as auth_module
+from . import site_retirement
 from .auth import COOKIE, REMEMBER_TTL, SESSION_TTL
 from .config import Settings
 from .config_transfer import ImportRequest, apply_config, export_config, preview_config
@@ -310,6 +312,8 @@ async def delete_job(job_id: int, request: Request):
         raise HTTPException(400, "先取消任务再删除")
     if (await db.task_counts(job_id)).get("running"):
         raise HTTPException(400, "子任务正在停止，请稍后再删除")
+    if await db._one("SELECT 1 FROM site_retirements WHERE job_id=?", (job_id,)):
+        raise HTTPException(400, "站点清退要按这个任务恢复，先在输出库页恢复清退再删")
     await db.delete_job(job_id)
     return {"ok": True}
 
@@ -467,6 +471,35 @@ class VideoBatch(BaseModel):
     ids: list[int] = Field(min_length=1, max_length=500)
     library_id: int | None = None  # add / remove：哪个输出库
     sites: list[str] = []  # remove_source：删掉哪些站点的源
+
+
+@router.get("/site-retirements")
+async def retirement_list(request: Request):
+    return await site_retirement.records(_ctx(request).engine)
+
+
+@router.post("/sites/{site}/retirement/preview")
+async def retirement_preview(site: str, request: Request):
+    try:
+        return await site_retirement.preview(_ctx(request).engine, site)
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+
+@router.post("/sites/{site}/retirement")
+async def retirement_apply(site: str, request: Request):
+    try:
+        return {"job_id": await site_retirement.apply(_ctx(request).engine, site)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
+
+
+@router.post("/sites/{site}/retirement/restore")
+async def retirement_restore(site: str, request: Request):
+    try:
+        return {"job_id": await site_retirement.restore(_ctx(request).engine, site)}
+    except ValueError as e:
+        raise HTTPException(400, str(e)) from None
 
 
 @router.post("/videos/batch", status_code=202)
@@ -861,27 +894,37 @@ async def configuration_import(body: ImportRequest, request: Request):
         raise HTTPException(400, str(err)) from None
 
 
+def _effective(c) -> dict:
+    return {"output_dir": str(c.store.output_dir), "archive_dir": str(c.store.archive_dir),
+            "public_base_url": c.store.public_base_url}
+
+
 @router.get("/settings")
 async def get_settings(request: Request):
     c = _ctx(request)
     return {
         "values": c.store.current.model_dump(),
         "schema": Settings.model_json_schema()["properties"],
-        "effective": {"output_dir": str(c.store.output_dir), "public_base_url": c.store.public_base_url},
+        "effective": _effective(c),
     }
 
 
 @router.put("/settings")
 async def put_settings(patch: dict, request: Request):
     c = _ctx(request)
+    if "archive_dir" in patch:
+        d = str(patch["archive_dir"] or "").strip()
+        try:
+            c.engine.check_archive_dir(Path(d) if d else c.store.boot.data_dir / "archive")
+        except ValueError as e:
+            raise HTTPException(422, str(e)) from None
     try:
         new = await c.store.update(patch)
     except ValidationError as err:
         msgs = [f"{'.'.join(str(x) for x in e['loc'])}：{e['msg']}" for e in err.errors()]
         raise HTTPException(422, "；".join(msgs)) from None
     c.engine.notify()
-    return {"values": new.model_dump(),
-            "effective": {"output_dir": str(c.store.output_dir), "public_base_url": c.store.public_base_url}}
+    return {"values": new.model_dump(), "effective": _effective(c)}
 
 
 def _line_specs(site) -> list[dict]:

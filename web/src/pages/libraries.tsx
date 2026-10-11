@@ -3,6 +3,7 @@ import { MoreHorizontal, Pencil, Plus } from "lucide-react";
 import { useState } from "react";
 import { ask, confirm } from "@/components/confirm";
 import { ConfigTransfer } from "@/components/config-transfer";
+import { SiteRetirement } from "@/components/site-retirement";
 import { nextSubscriptionTime, SubscriptionSchedule } from "@/components/subscription-schedule";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, Help, Mono, Panel, Table, Td, Th } from "@/components/ui/data";
@@ -90,6 +91,7 @@ function LibrariesPanel() {
             新建输出库
           </Button>
           <ConfigTransfer />
+          <SiteRetirement />
         </>
       }
       bodyClassName="px-4 py-0"

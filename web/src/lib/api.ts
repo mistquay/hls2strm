@@ -505,7 +505,7 @@ export type SettingsValues = Record<string, unknown> & { sites: Record<string, S
 export interface SettingsResponse {
   values: SettingsValues;
   schema: Record<string, SchemaProp>;
-  effective: { output_dir: string; public_base_url: string };
+  effective: { output_dir: string; archive_dir: string; public_base_url: string };
 }
 
 // ---- 日志 ----

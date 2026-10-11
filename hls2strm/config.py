@@ -167,6 +167,12 @@ class Settings(BaseModel):
     write_nfo: bool = Field(True, description="写 nfo（Kodi 格式，Emby/Jellyfin 通用）")
     download_cover: bool = Field(True, description="下载封面 fanart")
     poster_crop: bool = Field(True, description="从封面裁出竖版 poster")
+    archive_dir: str = Field(
+        "",
+        description="归档目录：影片没有可用的源下架（删源、站点清退）时，它在各输出库里的文件（刮削好的整个影片目录、"
+                    "收件目录里的 strm）原样搬到这里，按库分子目录，恢复时搬回原处，不自动清理。不能和输出根目录、"
+                    "库目录、外部整理目录互相嵌套；和外部整理目录在同一个挂载下搬得最快（只改名不复制）。留空使用 数据目录/archive",
+    )
     # 播放
     public_base_url: str = Field("", description="Emby/Jellyfin 访问本服务的地址，写进 strm；留空使用 HLS2STRM_PUBLIC_BASE_URL")
     play_mode: Literal["redirect", "proxy", "direct"] = Field(
@@ -358,6 +364,11 @@ class SettingsStore:
     def output_dir(self) -> Path:
         d = self.current.output_dir or self.boot.default_output_dir
         return Path(d).resolve() if d else self.boot.data_dir / "strm"
+
+    @property
+    def archive_dir(self) -> Path:
+        d = self.current.archive_dir
+        return Path(d).resolve() if d else self.boot.data_dir / "archive"
 
     @property
     def public_base_url(self) -> str:

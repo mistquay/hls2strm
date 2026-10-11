@@ -343,9 +343,18 @@ async def _migrate_v15(conn: aiosqlite.Connection) -> None:
     await conn.execute("ALTER TABLE videos ADD COLUMN removed_from TEXT NOT NULL DEFAULT ''")
 
 
+async def _migrate_v17(conn: aiosqlite.Connection) -> None:
+    # 下架影片搬进归档目录的文件：moves 是 [[原路径, 归档路径]]，strm 是主 strm 的原路径
+    await conn.execute("""CREATE TABLE archives (
+        video_id INTEGER NOT NULL, library_id INTEGER NOT NULL, strm TEXT NOT NULL, moves TEXT NOT NULL,
+        created_at INTEGER NOT NULL, PRIMARY KEY(video_id, library_id))""")
+    # 清退了的站点：job_id 是清退任务（它的子任务就是清退了哪些影片，恢复时按它来）
+    await conn.execute("CREATE TABLE site_retirements(site TEXT PRIMARY KEY, job_id INTEGER NOT NULL, created_at INTEGER NOT NULL)")
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16]
+              _migrate_v15, _migrate_v16, _migrate_v17]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -902,38 +911,69 @@ class Database:
             params.append(library_id)
         return [dict(r) for r in await self._all(sql + " ORDER BY s.video_id DESC", params, bulk=True)]
 
-    async def remove_sources(self, video_id: int, sites: list[str], outputs: list[tuple[int, str]]) -> bool:
-        """删掉作品在这些站点的源（标为 removed）。删完没有可用的源了，作品标为 removed，记下它在哪些库
-        （outputs：[(库 id, via)]，调用方随后移出），返回 True；还有别的可用源返回 False。"""
+    async def remove_sources(self, video_id: int, sites: list[str], outputs: list[tuple[int, str]],
+                             eligible_ids: list[int] | None = None) -> bool:
+        """删掉作品在这些站点的源（标为 removed）。删完没有可用的源了（eligible_ids 给了时只有这些源算可用），
+        作品标为 removed，记下它在哪些库（outputs：[(库 id, via)]，调用方随后移出；已经下架的并进原来的记录，
+        上次移出到一半时不丢），返回 True；还有别的可用源返回 False。"""
         marks = ",".join("?" * len(sites))
         t = now()
         async with self._tx():
             await self.conn.execute(
                 f"UPDATE sources SET status='removed', updated_at=? WHERE video_id=? AND site IN ({marks})",
                 (t, video_id, *sites))
+            eligible_sql = "" if eligible_ids is None else f" AND id IN ({','.join('?' for _ in eligible_ids) or 'NULL'})"
             async with self.conn.execute(
-                    "SELECT 1 FROM sources WHERE video_id=? AND status='active' LIMIT 1", (video_id,)) as cur:
+                    "SELECT 1 FROM sources WHERE video_id=? AND status='active'" + eligible_sql + " LIMIT 1",
+                    (video_id, *(eligible_ids or []))) as cur:
                 if await cur.fetchone() is not None:
                     return False
-            libs = json.dumps([list(o) for o in outputs])
-            await self.conn.execute(
-                """UPDATE videos SET status='removed', updated_at=?,
-                          removed_from=CASE WHEN status='removed' AND ?='[]' THEN removed_from ELSE ? END
-                   WHERE id=?""", (t, libs, libs, video_id))
-        return True
-
-    async def restore_sources(self, video_id: int) -> list[tuple[int, str]]:
-        """恢复作品被删掉的源；作品因此恢复可用时，返回删源时它在哪些库 [(库 id, via)]，调用方放回去。"""
-        async with self._tx():
-            await self.conn.execute("UPDATE sources SET status='active', updated_at=? WHERE video_id=? AND status='removed'",
-                                    (now(), video_id))
             async with self.conn.execute("SELECT status, removed_from FROM videos WHERE id=?", (video_id,)) as cur:
                 row = await cur.fetchone()
-            if row is None or row["status"] != "removed":
+            libs = {int(lib): via for lib, via in json.loads(row["removed_from"] or "[]")} if row["status"] == "removed" else {}
+            libs.update(outputs)
+            await self.conn.execute("UPDATE videos SET status='removed', updated_at=?, removed_from=? WHERE id=?",
+                                    (t, json.dumps([list(o) for o in libs.items()]), video_id))
+        return True
+
+    async def restore_sources(self, video_id: int, sites: list[str] | None = None,
+                              revive: bool = True) -> list[tuple[int, str]]:
+        """恢复作品被删掉的源（sites 给了只恢复这些站点的）；作品因此恢复可用时（revive：调用方判断恢复后有没有
+        能用的源），返回删源时它在哪些库 [(库 id, via)]，调用方放回去。"""
+        cond = f" AND site IN ({','.join('?' * len(sites))})" if sites else ""
+        async with self._tx():
+            await self.conn.execute("UPDATE sources SET status='active', updated_at=? WHERE video_id=? AND status='removed'"
+                                    + cond, (now(), video_id, *(sites or [])))
+            async with self.conn.execute("SELECT status, removed_from FROM videos WHERE id=?", (video_id,)) as cur:
+                row = await cur.fetchone()
+            if row is None or row["status"] != "removed" or not revive:
                 return []
             await self.conn.execute("UPDATE videos SET status='active', removed_from='', updated_at=? WHERE id=?",
                                     (now(), video_id))
         return [(int(lib), via) for lib, via in json.loads(row["removed_from"] or "[]")]
+
+    async def add_archive(self, video_id: int, library_id: int, strm: str, moves: list[tuple[str, str]]) -> None:
+        """记下影片在这个库里搬进归档目录的文件；已经有记录（上次搬到一半）时并进去。"""
+        async with self._tx(invalidate=False):
+            async with self.conn.execute("SELECT moves FROM archives WHERE video_id=? AND library_id=?",
+                                         (video_id, library_id)) as cur:
+                row = await cur.fetchone()
+            merged = dict(json.loads(row["moves"])) if row else {}
+            merged.update(moves)
+            await self.conn.execute(
+                "INSERT INTO archives(video_id, library_id, strm, moves, created_at) VALUES(?, ?, ?, ?, ?) "
+                "ON CONFLICT(video_id, library_id) DO UPDATE SET strm=excluded.strm, moves=excluded.moves",
+                (video_id, library_id, strm, json.dumps(list(merged.items()), ensure_ascii=False), now()))
+
+    async def get_archive(self, video_id: int, library_id: int) -> dict | None:
+        row = await self._one("SELECT * FROM archives WHERE video_id=? AND library_id=?", (video_id, library_id))
+        return {**dict(row), "moves": [tuple(m) for m in json.loads(row["moves"])]} if row else None
+
+    async def delete_archives(self, video_id: int, library_id: int | None = None) -> None:
+        if library_id is None:
+            await self._write("DELETE FROM archives WHERE video_id=?", (video_id,))
+        else:
+            await self._write("DELETE FROM archives WHERE video_id=? AND library_id=?", (video_id, library_id))
 
     async def set_source_check(self, video_id: int, site: str, found: bool) -> None:
         await self._write(
