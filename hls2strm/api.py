@@ -259,9 +259,10 @@ async def create_job(body: JobCreate, request: Request):
 
 
 @router.get("/jobs")
-async def list_jobs(request: Request, limit: int = 50, offset: int = 0):
+async def list_jobs(request: Request, limit: int = 50, offset: int = 0,
+                    status: Literal["", "active", "problem", "done"] = "", kind: str = ""):
     db = _ctx(request).db
-    jobs = await db.list_jobs(limit=min(limit, 200), offset=offset)
+    jobs = await db.list_jobs(limit=min(limit, 200), offset=offset, status=status, kind=kind)
     counts = await db.history.counts([j["id"] for j in jobs])
     for job in jobs:
         job["crawl"] = counts.get(job["id"])
@@ -380,7 +381,7 @@ def _video_view(c, v: dict, sources: list[dict] | None = None, lines: dict[int, 
 async def list_videos(
     request: Request,
     q: str = "",
-    filter: Literal["", "active", "no_detail", "no_output", "gone", "removed"] = "",
+    filter: Literal["", "active", "no_detail", "no_output", "pending", "gone", "removed"] = "",
     library_id: int | None = None,
     has_site: list[str] = Query([]),
     lacks_site: list[str] = Query([]),
@@ -919,7 +920,7 @@ async def put_settings(patch: dict, request: Request):
         try:
             c.engine.check_archive_dir(Path(d) if d else c.store.boot.data_dir / "archive")
         except ValueError as e:
-            raise HTTPException(422, str(e)) from None
+            raise HTTPException(422, f"archive_dir：{e}") from None  # 「字段：原因」，设置页按字段标出来
     try:
         new = await c.store.update(patch)
     except ValidationError as err:

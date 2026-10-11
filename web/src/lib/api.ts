@@ -175,7 +175,7 @@ export interface Status {
   engine: { paused: boolean; blocked: Record<string, number>; blocked_for: number; workers: number; running: RunningTask[] };
   sites: SiteStatus[];
   solver: string;
-  videos: { total: number; with_detail: number; gone: number; with_strm: number; with_cover: number };
+  videos: { total: number; with_detail: number; gone: number; removed: number; with_strm: number; with_cover: number };
   queue: Record<string, QueueCounts>;
   metrics: { uptime: number; requests_per_minute: number; counters: Record<string, number>; gauges: Record<string, number>;
     timings: Record<string, { count: number; p50_ms: number; p95_ms: number; max_ms: number }>; log_dropped: number };

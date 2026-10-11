@@ -21,7 +21,7 @@ class VideoQuery:
     """影片库的筛选和排序。列表类条件组内任一满足即可，不同条件之间都要满足。"""
 
     q: str = ""
-    status: str = ""  # active / no_detail / no_output / gone / removed（删源后没有可用的源）
+    status: str = ""  # active / no_detail / no_output / pending（在输出库里、还没写出 strm）/ gone / removed（删源后没有可用的源）
     library_id: int | None = None
     has_site: list[str] = field(default_factory=list)  # 有其中任一站点的可用源
     lacks_site: list[str] = field(default_factory=list)  # 这些站点都没有源
@@ -53,7 +53,12 @@ class VideoQuery:
             like = f"%{self.q.strip()}%"
             where.append("(slug LIKE ? OR code LIKE ? OR title LIKE ? OR models LIKE ? OR tags LIKE ?)")
             params += [like] * 5
-        if self.library_id:
+        if self.status == "pending":
+            # 等待归入：已经算进输出库、还没写 strm（有排除库的库要等排除库的订阅跑完一轮）；选了库就只看那个库的
+            lib = " AND o.library_id=?" if self.library_id else ""
+            where.append(f"status='active' AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.strm_path=''{lib})")
+            params += [self.library_id] if self.library_id else []
+        elif self.library_id:
             where.append("EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=videos.id AND o.library_id=?)")
             params.append(self.library_id)
         if self.status == "no_detail":

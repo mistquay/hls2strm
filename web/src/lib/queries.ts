@@ -48,8 +48,9 @@ export function useHealth() {
   });
 }
 
-export function useJobs() {
-  return useQuery({ queryKey: ["jobs"], queryFn: ({ signal }) => api.get<Job[]>("/api/jobs?limit=100", signal), refetchInterval: POLL });
+export function useJobs(filter: { status?: string; kind?: string } = {}) {
+  const q = new URLSearchParams({ limit: "100", ...Object.fromEntries(Object.entries(filter).filter(([, v]) => v)) });
+  return useQuery({ queryKey: ["jobs", filter.status ?? "", filter.kind ?? ""], queryFn: ({ signal }) => api.get<Job[]>(`/api/jobs?${q}`, signal), refetchInterval: POLL });
 }
 
 export function useFacet(field: FacetField, q = "", enabled = true) {

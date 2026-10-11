@@ -200,7 +200,13 @@ function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }
                 <Chip tone="accent" className="shrink-0">
                   {o.library_name}
                 </Chip>
-                <Mono className="min-w-0 flex-1">{o.strm_path || "还没写出"}</Mono>
+                {o.strm_path ? (
+                  <Mono className="min-w-0 flex-1">{o.strm_path}</Mono>
+                ) : (
+                  <span className="min-w-0 flex-1 text-[13px] text-muted">
+                    还没写出，等待归入：有排除库的库要等排除库的订阅跑完一轮，确认它不属于排除库才写。卡在哪个订阅见「输出库与订阅」
+                  </span>
+                )}
                 {o.strm_path && <CopyButton text={o.strm_path} size="icon-sm" />}
               </div>
             ))

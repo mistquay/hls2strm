@@ -427,6 +427,7 @@ class Database:
         self.bulk_reader: aiosqlite.Connection | None = None
         self._transaction_owner = None
         self.cache = AsyncCache()
+        self.stats_cache = AsyncCache(16)  # 概览统计：写库时不清，按时间过期（播放时写库很频繁，跟着清就缓存不住）
         self.metrics = None
         self.subscription_schedule_started_at = 0
         self._lock = asyncio.Lock()
@@ -462,6 +463,7 @@ class Database:
 
     async def close(self) -> None:
         await self.cache.close()
+        await self.stats_cache.close()
         for attr in ("reader", "bulk_reader"):
             conn = getattr(self, attr)
             if conn is not None:
@@ -1062,13 +1064,15 @@ class Database:
         return [dict(r) for r in rows]
 
     async def video_stats(self) -> dict:
-        return await self.cache.get("video_stats", self._video_stats, 3)
+        # 全表统计几十万行要几百毫秒，概览每几秒轮询一次：缓存半分钟，数字晚一点没关系
+        return await self.stats_cache.get("video_stats", self._video_stats, 30)
 
     async def _video_stats(self) -> dict:
         row = await self._one(
             """SELECT COUNT(*) AS total,
                       COALESCE(SUM(detail_at IS NOT NULL), 0) AS with_detail,
                       COALESCE(SUM(status='gone'), 0) AS gone,
+                      COALESCE(SUM(status='removed'), 0) AS removed,
                       (SELECT COUNT(DISTINCT video_id) FROM outputs WHERE strm_path != '') AS with_strm,
                       (SELECT COUNT(DISTINCT video_id) FROM outputs WHERE cover_done) AS with_cover
                FROM videos""", bulk=True
@@ -1491,8 +1495,21 @@ class Database:
             fields["state"] = json.dumps(fields["state"], ensure_ascii=False)
         await self._update("jobs", job_id, fields)
 
-    async def list_jobs(self, limit: int = 50, offset: int = 0) -> list[dict]:
-        rows = await self._all("SELECT * FROM jobs ORDER BY id DESC LIMIT ? OFFSET ?", (limit, offset))
+    JOB_FILTERS = {  # 任务列表的状态筛选
+        "active": "status IN ('running', 'paused')",
+        "problem": "(status='cancelled' OR COALESCE(json_extract(state, '$.partial_failure'), 0)=1)",
+        "done": "status='done' AND COALESCE(json_extract(state, '$.partial_failure'), 0)=0",
+    }
+
+    async def list_jobs(self, limit: int = 50, offset: int = 0, status: str = "", kind: str = "") -> list[dict]:
+        where, params = ["1=1"], []
+        if status in self.JOB_FILTERS:
+            where.append(self.JOB_FILTERS[status])
+        if kind:
+            where.append("kind=?")
+            params.append(kind)
+        rows = await self._all(f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ? OFFSET ?",
+                               (*params, limit, offset))
         jobs = [_job_row(r) for r in rows]
         if jobs:
             ids = [j["id"] for j in jobs]

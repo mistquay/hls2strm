@@ -11,7 +11,7 @@ import { Check, Field, Input, Segmented, Select, Textarea } from "@/components/u
 import { Sheet, SheetClose, SheetContent } from "@/components/ui/overlay";
 import { api, type Job, type Task, type TaskStatus } from "@/lib/api";
 import { fmtBytes, fmtDur, fmtNum, fmtTime } from "@/lib/format";
-import { JOB_STATUS, kindName, TASK_STATUS } from "@/lib/labels";
+import { JOB_STATUS, KIND_NAMES, kindName, TASK_STATUS } from "@/lib/labels";
 import { useJobs, useLibraries, useMeta, useRun, useStatus } from "@/lib/queries";
 import { replaceParams, useRoute } from "@/lib/route";
 import { cn } from "@/lib/utils";
@@ -67,7 +67,14 @@ export default function Jobs() {
     else p.delete("job");
     replaceParams(p);
   };
-  const { data: jobs = [] } = useJobs();
+  const filter = { status: params.get("status") ?? "", kind: params.get("kind") ?? "" };
+  const setFilter = (k: "status" | "kind", v: string) => {
+    const p = new URLSearchParams(params);
+    if (v) p.set(k, v);
+    else p.delete(k);
+    replaceParams(p);
+  };
+  const { data: jobs = [] } = useJobs(filter);
   const { data: status } = useStatus();
   const now = status?.now ?? Date.now() / 1000;
   const open = jobs.find(j => j.id === openId) ?? null;
@@ -75,7 +82,25 @@ export default function Jobs() {
   return (
     <>
       <NewJob />
-      <Panel title="任务" bodyClassName="p-0">
+      <Panel
+        title="任务"
+        bodyClassName="p-0"
+        actions={
+          <>
+            <Select value={filter.status} onChange={e => setFilter("status", e.target.value)} aria-label="按状态筛选任务" className="w-32">
+              <option value="">全部状态</option>
+              <option value="active">进行中 / 暂停</option>
+              <option value="problem">有失败或已取消</option>
+              <option value="done">顺利完成</option>
+            </Select>
+            <Select value={filter.kind} onChange={e => setFilter("kind", e.target.value)} aria-label="按类型筛选任务" className="w-36">
+              <option value="">全部类型</option>
+              {Object.entries(KIND_NAMES).map(([k, name]) => <option key={k} value={k}>{name}</option>)}
+            </Select>
+            <span className="text-[13px] text-muted">{filter.status || filter.kind ? `筛出 ${jobs.length}${jobs.length >= 100 ? "+" : ""} 个` : `最近 ${jobs.length} 个`}</span>
+          </>
+        }
+      >
         <Table>
           <thead>
             <tr>
@@ -124,7 +149,7 @@ export default function Jobs() {
                 </tr>
               );
             })}
-            {jobs.length === 0 && <EmptyRow cols={7}>还没有任务。在上面新建一个，或者到「输出库与订阅」建订阅。</EmptyRow>}
+            {jobs.length === 0 && <EmptyRow cols={7}>{filter.status || filter.kind ? "没有符合筛选的任务" : "还没有任务。在上面新建一个，或者到「输出库与订阅」建订阅。"}</EmptyRow>}
           </tbody>
         </Table>
       </Panel>

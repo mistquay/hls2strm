@@ -154,7 +154,11 @@ function LibrariesPanel() {
                 {l.sources.length > 0 && <div>来源：{names(l.sources)}</div>}
                 {l.excludes.length > 0 && <div>排除：{names(l.excludes)}</div>}
                 {!l.rule_text && !l.sources.length && !l.excludes.length && <span className="text-muted">-</span>}
-                {l.pending > 0 && l.excludes.length > 0 && <Chip tone="warn">等待归入 {fmtNum(l.pending)}</Chip>}
+                {l.pending > 0 && (
+                  <button type="button" title="在影片库里看这些片" onClick={() => navigate("videos", { library: String(l.id), filter: "pending" })}>
+                    <Chip tone="warn" className="hover:underline">等待归入 {fmtNum(l.pending)} →</Chip>
+                  </button>
+                )}
                 {l.pending > 0 && l.waiting && <WaitingReason waiting={l.waiting} sub={subs.find(s => s.id === l.waiting?.subscription_id)} />}
               </Td>
               <Td className="text-right">

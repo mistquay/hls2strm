@@ -153,3 +153,27 @@ def test_history_api_auth_validation_and_missing_job(tmp_path):
             assert client.get(f"/api/jobs/999/{path}").status_code == 401
             assert client.get(f"/api/jobs/999/{path}", auth=("admin", "test")).status_code == 404
             assert client.get(f"/api/jobs/999/{path}?limit=-1", auth=("admin", "test")).status_code == 422
+
+
+def test_list_jobs_filters(make_store):
+    """任务列表按状态、类型筛选：进行中含暂停；有问题含部分失败和取消；顺利完成不含部分失败。"""
+    async def run():
+        db, _ = await make_store()
+        running = await db.create_job("crawl", "a", {})
+        paused = await db.create_job("tidy", "b", {}, status="paused")
+        ok = await db.create_job("crawl", "c", {}, status="done")
+        partial = await db.create_job("crawl", "d", {}, status="done")
+        await db.update_job(partial, state={"partial_failure": True})
+        cancelled = await db.create_job("tidy", "e", {}, status="cancelled")
+
+        async def ids(**kw):
+            return [j["id"] for j in await db.list_jobs(**kw)]
+
+        assert await ids(status="active") == [paused, running]
+        assert await ids(status="problem") == [cancelled, partial]
+        assert await ids(status="done") == [ok]
+        assert await ids(kind="tidy") == [cancelled, paused]
+        assert await ids(status="active", kind="crawl") == [running]
+        await db.close()
+
+    asyncio.run(run())

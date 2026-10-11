@@ -1,6 +1,6 @@
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Save, Undo2 } from "lucide-react";
-import { type ReactNode, useEffect, useState } from "react";
+import { ChevronDown, ChevronRight, Save, Search, Undo2 } from "lucide-react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { useReorder } from "@/components/use-reorder";
 import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
@@ -11,41 +11,29 @@ import { DOMAIN_MODES, PLAY_MODES, RESOLVE_MODES, VARIANT_MODES } from "@/lib/la
 import { useMeta, useRun } from "@/lib/queries";
 import { cn } from "@/lib/utils";
 
-const GROUPS: { id: string; title: string; keys: string[] }[] = [
+/** 设置分组；note 是整组的说明，只写一次。 */
+const GROUPS: { id: string; title: string; keys: string[]; note?: ReactNode }[] = [
   { id: "sites", title: "站点", keys: ["sites", "site_priority"] },
-  { id: "fetch", title: "抓取", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "domain_cooldown_max", "solver_url", "solver_timeout"] },
-  { id: "retry", title: "重试", keys: ["max_attempts", "retry_base_delay"] },
-  { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days", "external_restore", "trash_days", "orphan_cleanup"] },
-  { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop", "archive_dir"] },
+  { id: "fetch", title: "抓取与重试", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "domain_cooldown_max", "solver_url", "solver_timeout", "max_attempts", "retry_base_delay"] },
+  { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days"] },
+  { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
+  { id: "external", title: "外部整理与归档", keys: ["external_restore", "trash_days", "orphan_cleanup", "archive_dir"] },
   {
     id: "play",
-    title: "播放",
-    keys: [
-      "public_base_url",
-      "play_mode",
-      "proxy_user_agents",
-      "play_token",
-      "hls_margin",
-      "subtitle_priority",
-      "subtitle_fallback",
-      "quality_first",
-      "quality_max",
-      "quality_unknown",
-      "prefer_direct",
-      "variant_mode",
-      "version_min_height",
-      "quality_capture",
-      "quality_concurrency", "quality_pending",
-      "play_discover",
-      "resolve_timeout",
-      "resolve_attempt_timeout",
-      "resolve_token",
-      "resolve_mode",
-      "resolve_relay_ttl",
-      "resolve_proxy_url",
-      "play_remote",
-    ],
+    title: "播放地址与模式",
+    keys: ["public_base_url", "play_mode", "proxy_user_agents", "play_token", "hls_margin", "play_remote"],
+    note: (
+      <>
+        普通播放模式控制 /play；网关解析策略（见「网关」）控制 /api/resolve。网关的 Relay 只决定需要中转时由谁转发，不会强制全部资源中转。
+        <a href="#/playback-guide" target="_blank" rel="noopener noreferrer" className="ml-1 text-accent underline">配置组合与路径说明（新标签页）</a>
+      </>
+    ),
   },
+  { id: "select", title: "选源偏好", keys: ["subtitle_priority", "subtitle_fallback", "quality_first", "quality_max", "quality_unknown", "prefer_direct", "play_discover"] },
+  { id: "quality", title: "画质与多画质版本", keys: ["variant_mode", "version_min_height", "quality_capture", "quality_concurrency", "quality_pending"] },
+  { id: "timeouts", title: "播放时限", keys: ["resolve_timeout", "resolve_attempt_timeout"],
+    note: "超过总时限还没开始返回，播放器会收到 504，日志里会写明卡在哪一步；调大只会让失败时等得更久，线路本身失败时调大没用。" },
+  { id: "gateway", title: "网关 /api/resolve", keys: ["resolve_token", "resolve_mode", "resolve_relay_ttl", "resolve_proxy_url"] },
   { id: "capacity", title: "连接与缓存", keys: ["play_connections", "background_connections", "hls_connections", "file_connections", "preflight_connections", "speed_connections", "pool_wait_timeout", "relay_buffer_kb", "playlist_cache_entries", "playlist_cache_seconds", "preflight_bytes", "preflight_cache_entries", "preflight_cache_seconds", "preflight_failure_cooldown", "source_failure_cooldown", "source_failure_cooldown_max", "play_session_entries", "play_session_hours"] },
   { id: "speed", title: "线路测速", keys: ["speed_test_bytes", "speed_test_timeout"] },
   { id: "health", title: "连通性", keys: ["health_rank", "health_interval", "health_samples", "health_bytes", "health_slow_kbps"] },
@@ -115,41 +103,117 @@ const LABELS: Record<string, string> = {
 };
 const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
 const SUBTITLE_NAMES: Record<string, string> = { zh: "中文字幕", none: "无字幕", en: "英文字幕" };
+const ENUM_NAMES: Record<string, Record<string, string>> = { play_mode: PLAY_MODES, resolve_mode: RESOLVE_MODES, variant_mode: VARIANT_MODES };
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
+const label = (k: string) => LABELS[k] ?? k;
+const plain = (s: string) => s.replace(/[\s（）()，,。、:：/]/g, "").toLowerCase();
+
+/** 离开设置页时没保存的改动：回来时接着改，不丢。只在这一次打开的页面里有效。 */
+let unsaved: SettingsValues | null = null;
+
+/** 「sites.jable.domains：原因；proxy：原因」→ {sites: "jable.domains：原因", proxy: "原因"} */
+function fieldErrors(message: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const part of message.split("；")) {
+    const m = part.match(/^([a-z_]+)((?:\.[\w-]+)*)：(.+)$/);
+    if (m) out[m[1]] = [out[m[1]], (m[2] ? m[2].slice(1) + "：" : "") + m[3]].filter(Boolean).join("；");
+  }
+  return out;
+}
+
+/** 默认值的写法：开关写开/关，选项写名字，空串写「空」。 */
+function showDefault(k: string, schema: SchemaProp): string {
+  const d = schema.default;
+  if (typeof d === "boolean") return d ? "开" : "关";
+  if (d === "" || d == null) return "空";
+  if (Array.isArray(d)) return d.length ? d.map(x => (k === "subtitle_priority" ? SUBTITLE_NAMES[x] ?? x : String(x))).join("、") : "空";
+  if (typeof d === "object") return "默认配置";
+  return ENUM_NAMES[k]?.[String(d)] ?? String(d);
+}
 
 export default function Settings() {
   const qc = useQueryClient();
   const run = useRun();
+  const meta = useMeta();
   const { data } = useQuery({ queryKey: ["settings"], queryFn: ({ signal }) => api.get<SettingsResponse>("/api/settings", signal), staleTime: Infinity });
   const [draft, setDraft] = useState<SettingsValues | null>(null);
+  const [restored, setRestored] = useState(false);
   const [needRewrite, setNeedRewrite] = useState(false);
+  const [errors, setErrors] = useState<Record<string, string>>({});
+  const [q, setQ] = useState("");
+  const latest = useRef<{ draft: SettingsValues | null; values: SettingsValues | null }>({ draft: null, values: null });
   useEffect(() => {
-    if (data) setDraft(clone(data.values));
+    if (!data) return;
+    setRestored(!!unsaved && !same(unsaved, data.values));
+    setDraft(clone(unsaved && !same(unsaved, data.values) ? unsaved : data.values));
+    unsaved = null;
   }, [data]);
+  latest.current = { draft, values: data?.values ?? null };
+  const dirty = !!draft && !!data && !same(draft, data.values);
+  useEffect(() => () => {
+    const { draft: d, values } = latest.current;
+    unsaved = d && values && !same(d, values) ? d : null;
+  }, []);
+  useEffect(() => {
+    if (!dirty) return;
+    const warn = (e: BeforeUnloadEvent) => e.preventDefault(); // 关页面、刷新前提醒还有没保存的改动
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [dirty]);
   if (!data || !draft) return <div className="py-20 text-center text-sm text-muted">加载中…</div>;
 
   const changed = Object.keys(draft).filter(k => !same(draft[k], data.values[k]));
-  const set = (k: string, v: unknown) => setDraft(d => (d ? { ...d, [k]: v } : d));
+  const set = (k: string, v: unknown) => {
+    setDraft(d => (d ? { ...d, [k]: v } : d));
+    if (errors[k]) setErrors(({ [k]: _, ...rest }) => rest);
+  };
+  const needle = q.trim().toLowerCase();
+  const siteWords = (name: string) => {
+    const cfg = draft.sites[name];
+    return [name, meta.site(name).label, ...cfg.domains, ...meta.site(name).lines.map(l => `${l.name} ${l.host_label}`)].join(" ").toLowerCase();
+  };
+  const matchSites = Object.keys(draft.sites).filter(name => !needle || siteWords(name).includes(needle));
+  const matches = (k: string) => {
+    if (!needle) return true;
+    if (k === "sites") return matchSites.length > 0 || "站点 镜像 域名 线路 限速 并发 解题".includes(needle);
+    return [label(k), k, data.schema[k]?.description ?? ""].join(" ").toLowerCase().includes(needle);
+  };
+  const groups = GROUPS.map(g => ({ ...g, keys: g.keys.filter(k => data.schema[k] && matches(k)) })).filter(g => g.keys.length);
 
   const save = async () => {
     const patch = Object.fromEntries(changed.map(k => [k, draft[k]]));
-    const r = await run(() => api.put<Pick<SettingsResponse, "values" | "effective">>("/api/settings", patch), {
-      success: "设置已保存，马上生效",
-      invalidate: [["status"], ["meta"]],
-    });
+    const r = await run(async () => {
+      try {
+        return await api.put<Pick<SettingsResponse, "values" | "effective">>("/api/settings", patch);
+      } catch (e) {
+        const found = fieldErrors((e as Error).message);
+        setErrors(found);
+        const first = GROUPS.flatMap(g => g.keys).find(k => found[k]);
+        if (first) document.getElementById(`setting-${first}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
+        throw Object.keys(found).length ? new Error(Object.entries(found).map(([k, msg]) => `${label(k)}：${msg}`).join("；")) : e;
+      }
+    }, { success: "设置已保存，马上生效", invalidate: [["status"], ["meta"]] });
     if (!r) return;
+    setErrors({});
+    setRestored(false);
     qc.setQueryData<SettingsResponse>(["settings"], prev => (prev ? { ...prev, values: r.values, effective: r.effective } : prev));
     if (changed.some(k => REWRITE_KEYS.includes(k))) setNeedRewrite(true);
   };
+  const discard = () => {
+    setDraft(clone(data.values));
+    setErrors({});
+    setRestored(false);
+  };
 
   return (
-    <div className="xl:grid xl:grid-cols-[160px_minmax(0,1fr)] xl:gap-6">
+    <div className="xl:grid xl:grid-cols-[170px_minmax(0,1fr)] xl:gap-6">
       <nav className="sticky top-16 hidden h-fit space-y-0.5 xl:block" aria-label="设置分组">
-        {GROUPS.map(g => (
+        {groups.map(g => (
           <a key={g.id} href={`#/settings`} onClick={e => { e.preventDefault(); document.getElementById(`set-${g.id}`)?.scrollIntoView({ behavior: "smooth", block: "start" }); }} className="block rounded-md px-2.5 py-1.5 text-sm text-muted hover:bg-panel-2 hover:text-ink">
             {g.title}
-            {g.keys.some(k => changed.includes(k)) && <span className="ml-1.5 inline-block size-1.5 rounded-full bg-accent align-middle" />}
+            {g.keys.some(k => changed.includes(k)) && <span className="ml-1.5 inline-block size-1.5 rounded-full bg-accent align-middle" title="有没保存的改动" />}
+            {g.keys.some(k => errors[k]) && <span className="ml-1.5 inline-block size-1.5 rounded-full bg-err align-middle" title="有错误" />}
           </a>
         ))}
       </nav>
@@ -159,14 +223,23 @@ export default function Settings() {
             <Save />
             保存{changed.length ? `（${changed.length} 项改动）` : ""}
           </Button>
-          <Button onClick={() => setDraft(clone(data.values))} disabled={!changed.length}>
+          <Button onClick={discard} disabled={!changed.length}>
             <Undo2 />
             放弃改动
           </Button>
+          <div className="relative w-full sm:w-64">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted" />
+            <Input className="w-full pl-8" placeholder="搜设置：名称、说明、站点、域名" value={q} onChange={e => setQ(e.target.value)} aria-label="搜索设置" />
+          </div>
           <span className="ml-auto text-[13px] text-muted">
             生效的输出目录 <Mono>{data.effective.output_dir}</Mono>，归档目录 <Mono>{data.effective.archive_dir}</Mono>，对外地址 <Mono>{data.effective.public_base_url}</Mono>
           </span>
         </div>
+        {restored && (
+          <Notice tone="info" actions={<Button size="sm" onClick={discard}>不要了</Button>}>
+            接着上次没保存的 {changed.length} 项改动，确认后点「保存」。
+          </Notice>
+        )}
         {needRewrite && (
           <Notice
             actions={
@@ -178,19 +251,17 @@ export default function Settings() {
             改了影响 strm 内容或位置的设置，已有的文件要按新设置重写。
           </Notice>
         )}
-        <Notice>
-          普通播放模式控制 /play；网关解析策略控制 /api/resolve。网关的 Relay 只决定需要中转时由谁转发，不会强制全部资源中转。
-          <a href="#/playback-guide" target="_blank" rel="noopener noreferrer" className="ml-1 text-accent underline">查看配置组合与路径说明（新标签页）</a>
-        </Notice>
-        {GROUPS.map(g => (
+        {!groups.length && <div className="py-16 text-center text-sm text-muted">没有和「{q}」相关的设置</div>}
+        {groups.map(g => (
           <Panel key={g.id} id={`set-${g.id}`} title={g.title} bodyClassName="divide-y divide-line py-0" className="scroll-mt-28">
-            {g.keys
-              .filter(k => data.schema[k])
-              .map(k => (
-                <Setting key={k} k={k} schema={data.schema[k]} changed={changed.includes(k)}>
-                  <Control k={k} schema={data.schema[k]} value={draft[k]} draft={draft} set={set} />
-                </Setting>
-              ))}
+            {g.note && <p className="py-3 text-[13px] leading-relaxed text-muted">{g.note}</p>}
+            {g.keys.map(k => (
+              <Setting key={k} k={k} schema={data.schema[k]} value={draft[k]} saved={data.values[k]} error={errors[k]}
+                onRevert={() => set(k, clone(data.values[k]))} onDefault={() => set(k, clone(data.schema[k].default))}>
+                <Control k={k} schema={data.schema[k]} value={draft[k]} draft={draft} saved={data.values} set={set}
+                  only={needle ? matchSites : undefined} />
+              </Setting>
+            ))}
           </Panel>
         ))}
       </div>
@@ -198,25 +269,45 @@ export default function Settings() {
   );
 }
 
-function Setting({ k, schema, changed, children }: { k: string; schema: SchemaProp; changed: boolean; children: ReactNode }) {
+function Setting({ k, schema, value, saved, error, onRevert, onDefault, children }: {
+  k: string; schema: SchemaProp; value: unknown; saved: unknown; error?: string;
+  onRevert: () => void; onDefault: () => void; children: ReactNode;
+}) {
   const wide = k === "sites";
+  const changed = !same(value, saved);
+  const hasDefault = Array.isArray(schema.default) || (schema.default !== undefined && typeof schema.default !== "object");
+  const notDefault = hasDefault && !same(value, schema.default);
+  const desc = schema.description && plain(schema.description) !== plain(label(k)) ? schema.description : ""; // 和标题一字不差的说明不显示
   return (
-    <div className={cn("grid gap-x-6 gap-y-2 py-4", !wide && "md:grid-cols-[240px_minmax(0,1fr)]")}>
-      <div className={cn("min-w-0", changed && "border-l-2 border-accent pl-2.5")}>
-        <div className="text-sm font-medium">{LABELS[k] ?? k}</div>
-        <code className="text-xs text-muted">{k}</code>
+    <div id={`setting-${k}`} className={cn("grid scroll-mt-32 gap-x-6 gap-y-2 py-4", !wide && "md:grid-cols-[240px_minmax(0,1fr)]")}>
+      <div className={cn("min-w-0", changed && "border-l-2 border-accent pl-2.5", error && "border-l-2 border-err pl-2.5")}>
+        <div className="text-sm font-medium" title={`配置键 ${k}`}>{label(k)}</div>
+        {!wide && (changed || notDefault) && (
+          <div className="mt-1 flex flex-wrap gap-x-3 text-xs">
+            {changed && <button type="button" className="text-accent hover:underline" onClick={onRevert}>撤销改动</button>}
+            {notDefault && (
+              <button type="button" className="text-muted hover:text-ink hover:underline" onClick={onDefault} title={`恢复成默认值：${showDefault(k, schema)}`}>
+                恢复默认（{showDefault(k, schema)}）
+              </button>
+            )}
+          </div>
+        )}
       </div>
       <div className="min-w-0 space-y-1.5">
         {children}
-        {schema.description && <p className="max-w-[80ch] text-[13px] leading-relaxed text-muted">{schema.description}</p>}
+        {error && <p className="text-[13px] text-err">{error}</p>}
+        {desc && <p className="max-w-[80ch] text-[13px] leading-relaxed text-muted">{desc}</p>}
       </div>
     </div>
   );
 }
 
-function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaProp; value: unknown; draft: SettingsValues; set: (k: string, v: unknown) => void }) {
+function Control({ k, schema, value, draft, saved, set, only }: {
+  k: string; schema: SchemaProp; value: unknown; draft: SettingsValues; saved: SettingsValues;
+  set: (k: string, v: unknown) => void; only?: string[];
+}) {
   const meta = useMeta();
-  if (k === "sites") return <SitesEditor sites={draft.sites} onChange={v => set("sites", v)} />;
+  if (k === "sites") return <SitesEditor sites={draft.sites} saved={saved.sites} only={only} onChange={v => set("sites", v)} />;
   if (k === "site_priority") return <OrderList items={value as string[]} label={meta.label} onChange={v => set(k, v)} />;
   if (k === "subtitle_priority") return <OrderList items={value as string[]} label={x => SUBTITLE_NAMES[x] ?? x} onChange={v => set(k, v)} />;
   if (k === "auto_probe_sites") {
@@ -233,10 +324,10 @@ function Control({ k, schema, value, draft, set }: { k: string; schema: SchemaPr
   }
   if (schema.enum)
     return (
-      <Select value={String(value)} aria-label={LABELS[k] ?? k} onChange={e => set(k, e.target.value)} className="w-full max-w-md">
+      <Select value={String(value)} aria-label={label(k)} onChange={e => set(k, e.target.value)} className="w-full max-w-md">
         {schema.enum.map(o => (
           <option key={o} value={o}>
-            {(k === "play_mode" ? PLAY_MODES : k === "resolve_mode" ? RESOLVE_MODES : k === "variant_mode" ? VARIANT_MODES : {})[o] ?? o}
+            {ENUM_NAMES[k]?.[o] ?? o}
           </option>
         ))}
       </Select>
@@ -302,53 +393,104 @@ function OrderList({ items, label, onChange }: { items: string[]; label: (x: str
   );
 }
 
-function SitesEditor({ sites, onChange }: { sites: Record<string, SiteConfig>; onChange: (v: Record<string, SiteConfig>) => void }) {
+const OPEN_KEY = "settings.sites.open";
+const loadOpen = (): string[] => {
+  try {
+    return JSON.parse(localStorage.getItem(OPEN_KEY) ?? "[]");
+  } catch {
+    return [];
+  }
+};
+
+/** 各站点：默认收起，标题行显示摘要和常用开关；展开的站点记在本浏览器里。搜索时只显示匹配的站点并展开。 */
+function SitesEditor({ sites, saved, only, onChange }: {
+  sites: Record<string, SiteConfig>; saved: Record<string, SiteConfig>; only?: string[];
+  onChange: (v: Record<string, SiteConfig>) => void;
+}) {
   const meta = useMeta();
+  const [open, setOpen] = useState<string[]>(loadOpen);
+  const keep = (v: string[]) => {
+    setOpen(v);
+    try {
+      localStorage.setItem(OPEN_KEY, JSON.stringify(v));
+    } catch {
+      /* 存不了就只在这次有效 */
+    }
+  };
   const update = (name: string, patch: Partial<SiteConfig>) => onChange({ ...sites, [name]: { ...sites[name], ...patch } });
+  const names = Object.keys(sites).filter(name => !only || only.includes(name));
   return (
-    <div className="grid min-w-0 grid-cols-1 gap-3 2xl:grid-cols-2">
-      {Object.entries(sites).map(([name, cfg]) => {
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-start gap-2">
+        <p className="max-w-[90ch] flex-1 text-xs leading-relaxed text-muted">
+          镜像域名是站点页面的镜像，抓取和播放解析共用所选的域名策略；站点总并发和限速不变，视频流量走哪个 CDN 由线路决定，只填同一站点的有效镜像。
+          线路是外部客户端的播放策略：中转经过本服务、保持原媒体编码；「允许外部直连」要自己验证，解除不了 CDN 的出口限制。
+        </p>
+        <Button size="sm" variant="ghost" onClick={() => keep(names)}>全部展开</Button>
+        <Button size="sm" variant="ghost" onClick={() => keep([])}>全部收起</Button>
+      </div>
+      {names.map(name => {
+        const cfg = sites[name];
         const m = meta.site(name);
+        const expanded = !!only || open.includes(name);
+        const lineNames = cfg.line_order.length ? cfg.line_order : m.lines.map(l => l.name);
+        const usable = lineNames.filter(n => (cfg.lines[n]?.enabled ?? true) && (m.lines.find(l => l.name === n)?.supported ?? true)).length;
+        const summary = [
+          `${cfg.domains.length} 个镜像`,
+          DOMAIN_MODES[cfg.domain_mode]?.replace(/（.*）/, ""),
+          `限速 ${cfg.rate_per_sec}/秒`,
+          `抓取并发 ${cfg.concurrency}，播放并发 ${cfg.play_concurrency}`,
+          m.lines.length ? `线路 ${usable}/${lineNames.length} 可用` : "",
+        ].filter(Boolean).join(" · ");
         return (
-          <div key={name} className={cn("min-w-0 rounded-md border border-line p-3", !cfg.enabled && "bg-panel-2/60")}>
-            <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-2">
-              <b className="text-[15px]">{m.label}</b>
-              <Chip>{m.lines.length ? "按线路策略播放" : m.direct ? (m.ip_bound ? "302（直链绑出口 IP，网关不用它）" : "可以 302") : "必须中转"}</Chip>
-              <label className="ml-auto flex cursor-pointer items-center gap-2 text-[13px]">
-                <Switch checked={cfg.enabled} onCheckedChange={v => update(name, { enabled: v })} />
+          <div key={name} className={cn("min-w-0 rounded-md border border-line", !cfg.enabled && "bg-panel-2/60")}>
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-2 px-3 py-2.5">
+              <button type="button" className="flex min-w-0 flex-1 items-center gap-2 text-left" onClick={() => keep(expanded ? open.filter(x => x !== name) : [...open, name])}
+                aria-expanded={expanded} aria-label={`${expanded ? "收起" : "展开"} ${m.label}`}>
+                {expanded ? <ChevronDown className="size-4 shrink-0 text-muted" /> : <ChevronRight className="size-4 shrink-0 text-muted" />}
+                <b className="text-[15px]">{m.label}</b>
+                <Chip>{m.lines.length ? "按线路策略播放" : m.direct ? (m.ip_bound ? "302（直链绑出口 IP，网关不用它）" : "可以 302") : "必须中转"}</Chip>
+                {!same(cfg, saved[name]) && <span className="size-1.5 shrink-0 rounded-full bg-accent" title="有没保存的改动" />}
+                {!expanded && <span className="min-w-0 truncate text-xs text-muted">{summary}</span>}
+              </button>
+              <label className="flex cursor-pointer items-center gap-2 text-[13px]">
+                <Switch checked={cfg.enabled} onCheckedChange={v => update(name, { enabled: v })} aria-label={`启用 ${m.label}`} />
                 启用
               </label>
               <label className="flex cursor-pointer items-center gap-2 text-[13px]">
-                <Switch checked={cfg.solver} onCheckedChange={v => update(name, { solver: v })} />
+                <Switch checked={cfg.solver} onCheckedChange={v => update(name, { solver: v })} aria-label={`${m.label} 被拦时用解题服务`} />
                 被拦时用解题服务
               </label>
             </div>
-            <div className="mb-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
-              <Field label="域名选择策略">
-                <Select value={cfg.domain_mode} aria-label={`${m.label} 域名选择策略`} onChange={e => update(name, { domain_mode: e.target.value as SiteConfig["domain_mode"] })}>
-                  {Object.entries(DOMAIN_MODES).map(([value, label]) => <option key={value} value={value}>{label}</option>)}
-                </Select>
-              </Field>
-              <Field label="网络错误冷却（秒）" hint="轮询 / 均衡模式生效，0 关闭">
-                <Input type="number" min={0} aria-label={`${m.label} 网络错误冷却（秒）`} disabled={cfg.domain_mode === "priority"} value={cfg.domain_error_cooldown} onChange={e => update(name, { domain_error_cooldown: Number(e.target.value) })} />
-              </Field>
-            </div>
-            <p className="mb-2 text-xs leading-relaxed text-muted">选择的是站点页面镜像，抓取与播放解析共用此策略；站点总并发和限速不变，中转仍由实际 CDN 线路决定。仅配置同一站点的有效镜像。</p>
-            <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_100px_100px_100px]">
-              <Field label="镜像域名（每行一个，顺序作为优先 / 平局依据）">
-                <Lines value={cfg.domains} onChange={v => update(name, { domains: v })} />
-              </Field>
-              <Field label="限速（次/秒）">
-                <Input type="number" step={0.1} min={0.05} value={cfg.rate_per_sec} onChange={e => update(name, { rate_per_sec: Number(e.target.value) })} />
-              </Field>
-              <Field label="后台抓取并发">
-                <Input type="number" min={1} value={cfg.concurrency} onChange={e => update(name, { concurrency: Number(e.target.value) })} />
-              </Field>
-              <Field label="播放页面并发">
-                <Input type="number" min={1} value={cfg.play_concurrency} onChange={e => update(name, { play_concurrency: Number(e.target.value) })} />
-              </Field>
-            </div>
-            {m.lines.length > 0 && <LinesTable specs={m.lines} cfg={cfg} onChange={patch => update(name, patch)} />}
+            {expanded && (
+              <div className="border-t border-line p-3">
+                <div className="mb-3 grid gap-3 sm:grid-cols-[minmax(0,1fr)_160px]">
+                  <Field label="域名选择策略">
+                    <Select value={cfg.domain_mode} aria-label={`${m.label} 域名选择策略`} onChange={e => update(name, { domain_mode: e.target.value as SiteConfig["domain_mode"] })}>
+                      {Object.entries(DOMAIN_MODES).map(([value, text]) => <option key={value} value={value}>{text}</option>)}
+                    </Select>
+                  </Field>
+                  <Field label="网络错误冷却（秒）" hint={cfg.domain_mode === "priority" ? "按顺序优先时不用" : "0 关闭"}>
+                    <Input type="number" min={0} aria-label={`${m.label} 网络错误冷却（秒）`} disabled={cfg.domain_mode === "priority"} value={cfg.domain_error_cooldown} onChange={e => update(name, { domain_error_cooldown: Number(e.target.value) })} />
+                  </Field>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_100px_100px_100px]">
+                  <Field label="镜像域名（每行一个，顺序作为优先 / 平局依据）">
+                    <Lines value={cfg.domains} onChange={v => update(name, { domains: v })} />
+                  </Field>
+                  <Field label="限速（次/秒）">
+                    <Input type="number" step={0.1} min={0.05} value={cfg.rate_per_sec} onChange={e => update(name, { rate_per_sec: Number(e.target.value) })} />
+                  </Field>
+                  <Field label="后台抓取并发">
+                    <Input type="number" min={1} value={cfg.concurrency} onChange={e => update(name, { concurrency: Number(e.target.value) })} />
+                  </Field>
+                  <Field label="播放页面并发">
+                    <Input type="number" min={1} value={cfg.play_concurrency} onChange={e => update(name, { play_concurrency: Number(e.target.value) })} />
+                  </Field>
+                </div>
+                {m.lines.length > 0 && <LinesTable specs={m.lines} cfg={cfg} onChange={patch => update(name, patch)} />}
+              </div>
+            )}
           </div>
         );
       })}
@@ -367,7 +509,6 @@ function LinesTable({ specs, cfg, onChange }: { specs: LineSpecMeta[]; cfg: Site
   return (
     <div className="mt-3" ref={reorder.root}>
       <div className="mb-1 text-[13px] text-muted">线路（拖动手柄调整尝试顺序，保存后生效）</div>
-      <p className="mb-2 text-xs text-muted">以下为外部客户端的播放策略；中转会经过本服务，保持原媒体编码。“允许外部直连”需自行验证，不会解除 CDN 的出口限制。</p>
       <Table className="text-[13px]">
         <thead>
           <tr>

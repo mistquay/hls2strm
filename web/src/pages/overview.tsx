@@ -30,6 +30,12 @@ export default function Overview() {
   if (!s) return <div className="py-20 text-center text-sm text-muted">正在连接服务…</div>;
 
   const queueSum = (k: "pending" | "running" | "failed") => Object.values(s.queue).reduce((a, q) => a + (q[k] ?? 0), 0);
+  // 概览只看启用的订阅里正在跑的和最近要跑的，全部订阅到「输出库与订阅」管理
+  const enabledSubs = s.subscriptions.filter(sub => sub.enabled || sub.listing_job_id || sub.active_job_id);
+  const upcoming = [...enabledSubs]
+    .sort((a, b) => Number(!(a.listing_job_id || a.active_job_id)) - Number(!(b.listing_job_id || b.active_job_id))
+      || (a.next_run_at ?? Infinity) - (b.next_run_at ?? Infinity))
+    .slice(0, 8);
   const c = (k: string) => s.metrics.counters[k] ?? 0;
   const blocked = Object.entries(s.engine.blocked);
 
@@ -125,6 +131,9 @@ export default function Overview() {
           title="订阅"
           actions={
             <>
+              <span className="text-[13px] text-muted">
+                启用 {enabledSubs.length} / 共 {s.subscriptions.length}{upcoming.length < enabledSubs.length ? `，下面是最近要跑的 ${upcoming.length} 个` : ""}
+              </span>
               <Button size="sm" variant="ghost" onClick={() => navigate("libraries")}>
                 管理订阅
               </Button>
@@ -143,7 +152,7 @@ export default function Overview() {
               </tr>
             </thead>
             <tbody>
-              {s.subscriptions.map(sub => {
+              {upcoming.map(sub => {
                 const st = subState(sub);
                 return (
                   <tr key={sub.id}>
@@ -178,6 +187,7 @@ export default function Overview() {
                 );
               })}
               {s.subscriptions.length === 0 && <EmptyRow cols={6}>还没有订阅。到「输出库与订阅」新建一个，用 cron 自动跟进站点更新。</EmptyRow>}
+              {s.subscriptions.length > 0 && upcoming.length === 0 && <EmptyRow cols={6}>没有启用的订阅。</EmptyRow>}
             </tbody>
           </Table>
           <div className="mt-4 flex flex-wrap gap-2">
@@ -273,7 +283,7 @@ function Metrics({ s, queueSum, c }: { s: Status; queueSum: (k: "pending" | "run
     .map(x => `${x.label} ${x.rate.current}/${x.rate.limit}`)
     .join("，");
   const items: { label: string; value: string; sub: string; tone?: string; title?: string }[] = [
-    { label: "影片", value: fmtNum(s.videos.total), sub: `下架 ${fmtNum(s.videos.gone)}` },
+    { label: "影片", value: fmtNum(s.videos.total), sub: `站点下架 ${fmtNum(s.videos.gone)}，删源 / 清退下架 ${fmtNum(s.videos.removed ?? 0)}` },
     { label: "已补详情", value: fmtNum(s.videos.with_detail), sub: pct(s.videos.with_detail, s.videos.total) },
     { label: "已写 strm", value: fmtNum(s.videos.with_strm), sub: `有封面 ${fmtNum(s.videos.with_cover)}` },
     { label: "待处理子任务", value: fmtNum(queueSum("pending")), sub: `运行中 ${queueSum("running")}` },

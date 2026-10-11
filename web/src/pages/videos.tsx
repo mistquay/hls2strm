@@ -53,7 +53,7 @@ const SORTS: Record<string, string> = {
   views: "观看数",
   updated: "更新时间",
 };
-const STATUS: Record<string, string> = { "": "全部影片", active: "可用的", no_detail: "缺详情", no_output: "没输出", gone: "已下架", removed: "已删源" };
+const STATUS: Record<string, string> = { "": "全部影片", active: "可用的", no_detail: "缺详情", no_output: "没输出", pending: "待归入", gone: "已下架", removed: "已删源" };
 const SOURCES: Record<string, string> = { "": "不限", single: "只有一个", multi: "多个", failing: "有失败的", none: "没有可用的" };
 const SUBTITLE: Record<string, string> = { "": "不限", zh: "中字", en: "英字", none: "无字幕" };
 // 用数组：对象里 "1" 这类数字键会排到 "" 前面
@@ -628,8 +628,9 @@ function VideoRow({
       <Td>
         <div className="flex flex-wrap gap-1">
           {v.outputs.map(o => (
-            <Chip key={o.library_id} tone={o.strm_path ? "neutral" : "warn"} title={o.strm_path || "还没写出 strm"}>
+            <Chip key={o.library_id} tone={o.strm_path ? "neutral" : "warn"} title={o.strm_path || "已算进这个库，还没写出 strm（等待归入）"}>
               {o.library_name}
+              {!o.strm_path && " · 待归入"}
             </Chip>
           ))}
         </div>

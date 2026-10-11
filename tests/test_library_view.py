@@ -53,6 +53,16 @@ def test_video_filters_sort_and_facets(make_store):
         assert await slugs(sort="release") == ["bbb-002", "aaa-001", "ccc-003"]
         assert [f["item"] for f in await db.facet("models", q="二")] == ["m2"]
         assert {f["item"] for f in await db.facet("makers")} == {"S1", "IP"}
+        # 待归入：算进了库、还没写 strm；选了库就只看那个库里没写的
+        other = await db.create_library("asia", "asia")
+        ids = {v["slug"]: v["id"] for v in (await db.search_videos(VideoQuery()))[0]}
+        await db.ensure_output(ids["aaa-001"], 1)
+        await db.set_output(ids["aaa-001"], 1, "/strm/aaa-001.strm")
+        await db.ensure_output(ids["aaa-001"], other)
+        await db.ensure_output(ids["bbb-002"], 1)
+        assert await slugs(status="pending") == ["bbb-002", "aaa-001"]
+        assert await slugs(status="pending", library_id=1) == ["bbb-002"]
+        assert await slugs(status="pending", library_id=other) == ["aaa-001"]
         await db.close()
 
     asyncio.run(run())

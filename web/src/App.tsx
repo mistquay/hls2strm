@@ -61,6 +61,7 @@ function Console({ user }: { user: string | null }) {
   const route = useRoute();
   const current = pages.find(p => p.id === route.page) ?? pages[0];
   const [navOpen, setNavOpen] = useState(false);
+  useEffect(() => setNavOpen(false), [route.page]); // 不是从侧栏换的页（页面里的链接、浏览器后退）也收起抽屉
   const [navCollapsed, setNavCollapsed] = useState(() => {
     try {
       return localStorage.getItem("hls2strm.sidebar-collapsed") === "true";
