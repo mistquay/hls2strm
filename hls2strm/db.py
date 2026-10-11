@@ -24,7 +24,7 @@ import aiosqlite
 from .codes import code_key
 from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
 from .cache import AsyncCache
-from .database_indexes import migrate_v12 as _migrate_v12
+from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18
 from .job_history import JobHistory, migrate_v13 as _migrate_v13
 from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
 from .runtime import stage
@@ -354,7 +354,7 @@ async def _migrate_v17(conn: aiosqlite.Connection) -> None:
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16, _migrate_v17]
+              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -475,10 +475,10 @@ class Database:
 
     # ---- 基础 ----
 
-    async def _write(self, sql: str, params: Iterable[Any] = ()) -> aiosqlite.Cursor:
+    async def _write(self, sql: str, params: Iterable[Any] = (), *, invalidate: bool = True) -> aiosqlite.Cursor:
         async with self._lock:
             result = await self.conn.execute(sql, tuple(params))
-            if any(name in sql.lower() for name in ("videos", "outputs", "sources")):
+            if invalidate and any(name in sql.lower() for name in ("videos", "outputs", "sources")):
                 self.cache.clear()
             return result
 
@@ -702,7 +702,7 @@ class Database:
         )
 
     async def set_lines(self, source_id: int, lines: list[tuple[str, str]]) -> None:
-        async with self._tx():
+        async with self._tx(invalidate=False):
             await self._set_lines(source_id, lines)
 
     async def get_lines(self, source_id: int) -> list[dict]:
@@ -724,7 +724,7 @@ class Database:
         """线路取到直链：记下直链（和中转时要带的 Referer）；use 时设成这个源当前在用的线路
         （探测画质时不切：正在中转的播放只认当前线路）。"""
         t = now()
-        async with self._tx():
+        async with self._tx(invalidate=False):
             await self.conn.execute(
                 """UPDATE source_lines SET stream_url=?, stream_expires=?, host=?, referer=?, fail_streak=0,
                           last_ok_at=?, last_error='', updated_at=? WHERE id=?""",
@@ -744,7 +744,7 @@ class Database:
         线路的画质变了，源上跟着记各线路里最好的那份（挑源时用）。返回源上的各档画质变了没有（多画质版本要跟着改）。"""
         t = now()
         table, row_id = ("source_lines", line_id) if line_id else ("sources", source_id)
-        async with self._tx():
+        async with self._tx(invalidate=False):
             async with self.conn.execute(f"SELECT quality_src FROM {table} WHERE id=?", (row_id,)) as cur:
                 row = await cur.fetchone()
             async with self.conn.execute("SELECT heights FROM sources WHERE id=?", (source_id,)) as cur:
@@ -776,7 +776,7 @@ class Database:
     async def use_line(self, source_id: int, line: dict) -> None:
         """改用这条线路已缓存的直链。"""
         await self._write("UPDATE sources SET stream_url=?, stream_expires=?, line=? WHERE id=?",
-                          (line["stream_url"], line["stream_expires"], line["line"], source_id))
+                          (line["stream_url"], line["stream_expires"], line["line"], source_id), invalidate=False)
 
     async def line_failed(self, line_id: int, error: str) -> None:
         await self._write(
@@ -814,12 +814,14 @@ class Database:
             f"""UPDATE sources SET stream_url=?, stream_expires=?, {REVIVE}, fail_streak=0, last_ok_at=?,
                       last_error='', updated_at=? WHERE id=?""",
             (url, expires, t, t, source_id),
+            invalidate=False,
         )
 
     async def source_failed(self, source_id: int, error: str) -> None:
         await self._write(
             "UPDATE sources SET fail_streak=fail_streak+1, last_fail_at=?, last_error=? WHERE id=?",
             (now(), error[:500], source_id),
+            invalidate=False,
         )
 
     async def update_source(self, source_id: int, **fields) -> None:
@@ -855,17 +857,32 @@ class Database:
     async def sources_missing_detail(self, rank: Callable[[str], int],
                                      library_ids: list[int] | None = None) -> list[tuple[str, str]]:
         """没有详情的作品（给了 library_ids 就只要在这些库里的），各取优先级最高的可用源，返回 [(站点, key)]。"""
-        sql = """SELECT s.video_id, s.site, s.key FROM sources s JOIN videos v ON v.id=s.video_id
-                 WHERE v.detail_at IS NULL AND v.status='active' AND s.status='active'"""
+        return [(r["site"], r["key"]) for r in await self.detail_candidates(rank, library_ids)]
+
+    async def detail_candidates(self, rank: Callable[[str], int], library_ids: list[int] | None = None,
+                                *, before: int | None = None, limit: int | None = None) -> list[dict]:
+        """按作品分页后择源，同一作品的多个源不会被分页截断。"""
+        scope = """FROM sources s JOIN videos v ON v.id=s.video_id
+                   WHERE v.detail_at IS NULL AND v.status='active' AND s.status='active'"""
+        params = list(library_ids or ())
         if library_ids:
-            sql += (" AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id IN (%s))"
-                    % ",".join("?" * len(library_ids)))
-        rows = await self._all(sql + " ORDER BY s.video_id DESC", library_ids or (), bulk=True)
-        best: dict[int, tuple[str, str]] = {}
+            scope += (" AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id IN (%s))"
+                      % ",".join("?" * len(library_ids)))
+        if before is not None:
+            scope += " AND s.video_id<?"
+            params.append(before)
+        sql = "SELECT s.video_id,s.site,s.key " + scope
+        if limit is not None:
+            videos = "SELECT DISTINCT s.video_id " + scope
+            sql = ("SELECT s.video_id,s.site,s.key FROM sources s WHERE s.status='active' "
+                   f"AND s.video_id IN ({videos} ORDER BY s.video_id DESC LIMIT ?)")
+            params.append(limit)
+        rows = await self._all(sql + " ORDER BY s.video_id DESC", params, bulk=True)
+        best: dict[int, dict] = {}
         for r in rows:
             cur = best.get(r["video_id"])
-            if cur is None or rank(r["site"]) < rank(cur[0]):
-                best[r["video_id"]] = (r["site"], r["key"])
+            if cur is None or rank(r["site"]) < rank(cur["site"]):
+                best[r["video_id"]] = dict(r)
         return list(best.values())
 
     async def load_health(self) -> list[dict]:
@@ -886,13 +903,13 @@ class Database:
             rows = await self._all(
                 """SELECT s.* FROM sources s JOIN videos v ON v.id=s.video_id
                    WHERE s.site=? AND s.status='active' AND v.status='active'
-                   ORDER BY s.last_ok_at IS NULL, s.last_ok_at DESC, s.id DESC LIMIT ?""", (site, limit))
+                   ORDER BY s.last_ok_at IS NULL, s.last_ok_at DESC, s.id DESC LIMIT ?""", (site, limit), bulk=True)
             return [dict(r) for r in rows]
         rows = await self._all(
             """SELECT s.id AS sid, l.id AS lid FROM source_lines l JOIN sources s ON s.id=l.source_id
                  JOIN videos v ON v.id=s.video_id
                WHERE s.site=? AND l.line=? AND s.status='active' AND v.status='active'
-               ORDER BY l.last_ok_at IS NULL, l.last_ok_at DESC, l.id DESC LIMIT ?""", (site, line, limit))
+               ORDER BY l.last_ok_at IS NULL, l.last_ok_at DESC, l.id DESC LIMIT ?""", (site, line, limit), bulk=True)
         out = []
         for r in rows:
             src = await self.get_source(r["sid"])
@@ -900,7 +917,8 @@ class Database:
             out.append({**src, "line_row": ln})
         return out
 
-    async def sources_needing_quality(self, tried_before: int, library_id: int | None = None) -> list[dict]:
+    async def sources_needing_quality(self, tried_before: int, library_id: int | None = None,
+                                      *, before: int | None = None, limit: int | None = None) -> list[dict]:
         """还不知道画质的可用源（源本身或它的某条线路只有站点标注、或者什么都没有），tried_before 之后试过的跳过。"""
         sql = """SELECT s.id, s.site FROM sources s JOIN videos v ON v.id=s.video_id
                  WHERE s.status='active' AND v.status='active'
@@ -911,7 +929,14 @@ class Database:
         if library_id:
             sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
             params.append(library_id)
-        return [dict(r) for r in await self._all(sql + " ORDER BY s.video_id DESC", params, bulk=True)]
+        if before is not None:
+            sql += " AND s.id<?"
+            params.append(before)
+        sql += " ORDER BY s.id DESC" if limit is not None else " ORDER BY s.video_id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [dict(r) for r in await self._all(sql, params, bulk=True)]
 
     async def remove_sources(self, video_id: int, sites: list[str], outputs: list[tuple[int, str]],
                              eligible_ids: list[int] | None = None) -> bool:
@@ -988,7 +1013,8 @@ class Database:
         row = await self._one("SELECT * FROM source_checks WHERE video_id=? AND site=?", (video_id, site))
         return dict(row) if row else None
 
-    async def works_to_probe(self, site: str, checked_before: int, library_id: int | None = None) -> list[int]:
+    async def works_to_probe(self, site: str, checked_before: int, library_id: int | None = None,
+                              *, before: int | None = None, limit: int | None = None) -> list[int]:
         """在这个站还没有源、且 checked_before 之后没查过的作品（下架的也算：别的站可能还有）。"""
         sql = """SELECT v.id FROM videos v
                  WHERE NOT EXISTS (SELECT 1 FROM sources s WHERE s.video_id=v.id AND s.site=?)
@@ -997,13 +1023,21 @@ class Database:
         if library_id:
             sql += " AND EXISTS (SELECT 1 FROM outputs o WHERE o.video_id=v.id AND o.library_id=?)"
             params.append(library_id)
-        return [r["id"] for r in await self._all(sql + " ORDER BY v.id DESC", params, bulk=True)]
+        if before is not None:
+            sql += " AND v.id<?"
+            params.append(before)
+        sql += " ORDER BY v.id DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        return [r["id"] for r in await self._all(sql, params, bulk=True)]
 
     async def cdn_video_map(self, site: str = "jable") -> dict[int, str]:
         """站内数字 id -> 作品 slug（strm 扫描时把 CDN 直链认回作品）。"""
         rows = await self._all(
             "SELECT s.site_vid, v.slug FROM sources s JOIN videos v ON v.id=s.video_id WHERE s.site=? AND s.site_vid!=''",
             (site,),
+            bulk=True,
         )
         return {int(r["site_vid"]): r["slug"] for r in rows if r["site_vid"].isdigit()}
 
@@ -1025,7 +1059,7 @@ class Database:
         last = after
         while True:
             rows = await self._all(
-                "SELECT * FROM videos WHERE status='active' AND id>? ORDER BY id LIMIT ?", (last, batch)
+                "SELECT * FROM videos WHERE status='active' AND id>? ORDER BY id LIMIT ?", (last, batch), bulk=True,
             )
             if not rows:
                 return
@@ -1087,7 +1121,7 @@ class Database:
                       (SELECT COUNT(*) FROM outputs o JOIN videos v ON v.id=o.video_id
                         WHERE o.library_id=l.id AND o.strm_path='' AND v.status='active') AS pending,
                       (SELECT COUNT(*) FROM subscriptions s WHERE s.library_id=l.id) AS subscriptions
-               FROM libraries l ORDER BY l.id"""
+               FROM libraries l ORDER BY l.id""", bulk=True,
         )
         return [_library_row(r) for r in rows]
 
@@ -1199,7 +1233,7 @@ class Database:
                            o.cover_done AS out_cover_done, v.*
                     FROM outputs o JOIN videos v ON v.id=o.video_id
                     WHERE o.rowid>? {cond} ORDER BY o.rowid LIMIT ?""",
-                params,
+                params, bulk=True,
             )
             if not rows:
                 return
@@ -1234,7 +1268,7 @@ class Database:
         params += sources
         rows = await self._all(
             f"""SELECT o.video_id, o.strm_path, v.slug FROM outputs o JOIN videos v ON v.id=o.video_id
-                WHERE o.library_id=? AND ({' OR '.join(conds)})""", params
+                WHERE o.library_id=? AND ({' OR '.join(conds)})""", params, bulk=True,
         )
         return [dict(r) for r in rows]
 
@@ -1258,11 +1292,12 @@ class Database:
             """SELECT v.* FROM outputs o JOIN videos v ON v.id=o.video_id
                WHERE o.library_id=? AND o.strm_path='' AND v.status='active' AND v.created_at<? ORDER BY v.id""",
             (library_id, seen_before),
+            bulk=True,
         )
         return [_video_row(r) for r in rows]
 
     async def libraries_with_source_outputs(self) -> set[int]:
-        rows = await self._all("SELECT DISTINCT library_id FROM outputs WHERE via='source'")
+        rows = await self._all("SELECT DISTINCT library_id FROM outputs WHERE via='source'", bulk=True)
         return {r["library_id"] for r in rows}
 
     async def subscription_last_done(self) -> dict[int, int]:
@@ -1270,16 +1305,16 @@ class Database:
         rows = await self._all(
             """SELECT json_extract(params, '$.subscription_id') AS sub_id, MAX(COALESCE(started_at,created_at)) AS t FROM jobs
                WHERE json_extract(state, '$.list_complete')=1
-                 AND json_extract(params, '$.subscription_id') IS NOT NULL GROUP BY sub_id"""
+                 AND json_extract(params, '$.subscription_id') IS NOT NULL GROUP BY sub_id""", bulk=True,
         )
         return {r["sub_id"]: r["t"] for r in rows}
 
     async def all_output_paths(self) -> list[str]:
-        rows = await self._all("SELECT strm_path FROM outputs WHERE strm_path != ''")
+        rows = await self._all("SELECT strm_path FROM outputs WHERE strm_path != ''", bulk=True)
         return [r["strm_path"] for r in rows]
 
     async def video_keys(self) -> list[tuple[int, str]]:
-        rows = await self._all("SELECT id, slug FROM videos")
+        rows = await self._all("SELECT id, slug FROM videos", bulk=True)
         return [(r["id"], r["slug"]) for r in rows]
 
     # ---- strm 扫描 ----
@@ -1304,17 +1339,17 @@ class Database:
 
     async def strm_summary(self, scan_id: int) -> dict:
         kinds = await self._all(
-            "SELECT kind, managed, COUNT(*) AS n FROM strm_files WHERE scan_id=? GROUP BY kind, managed", (scan_id,)
+            "SELECT kind, managed, COUNT(*) AS n FROM strm_files WHERE scan_id=? GROUP BY kind, managed", (scan_id,), bulk=True,
         )
         prefixes = await self._all(
             """SELECT prefix, COUNT(*) AS n, SUM(managed) AS managed, MIN(path) AS sample_path, MIN(url) AS sample_url
                FROM strm_files WHERE scan_id=? GROUP BY prefix ORDER BY n DESC LIMIT 100""",
-            (scan_id,),
+            (scan_id,), bulk=True,
         )
         adoptable = await self._one(
             """SELECT COUNT(*) AS n, COALESCE(SUM(video_id IS NULL), 0) AS unknown FROM strm_files
                WHERE scan_id=? AND managed=0 AND kind IN ('ours', 'cdn', 'named') AND slug != ''""",
-            (scan_id,),
+            (scan_id,), bulk=True,
         )
         by_kind: dict[str, dict] = {}
         for r in kinds:
@@ -1341,9 +1376,9 @@ class Database:
             where.append("(path LIKE ? OR url LIKE ? OR slug LIKE ? OR note LIKE ?)")
             params += [f"%{q}%"] * 4
         cond = " AND ".join(where)
-        total = (await self._one(f"SELECT COUNT(*) AS n FROM strm_files WHERE {cond}", params))["n"]
+        total = (await self._one(f"SELECT COUNT(*) AS n FROM strm_files WHERE {cond}", params, bulk=True))["n"]
         rows = await self._all(f"SELECT * FROM strm_files WHERE {cond} ORDER BY path LIMIT ? OFFSET ?",
-                               params + [limit, offset])
+                               params + [limit, offset], bulk=True)
         return [dict(r) for r in rows], total
 
     async def adopt_candidates(self, scan_id: int, kinds: tuple[str, ...], prefix: str = "") -> list[str]:
@@ -1353,7 +1388,7 @@ class Database:
         if prefix:
             sql += " AND prefix=?"
             params.append(prefix)
-        rows = await self._all(sql + " ORDER BY path", params)
+        rows = await self._all(sql + " ORDER BY path", params, bulk=True)
         return [r["path"] for r in rows]
 
     async def get_strm_file(self, path: str) -> dict | None:
@@ -1370,13 +1405,14 @@ class Database:
         if limit:
             sql += " LIMIT ?"
             params.append(limit)
-        return [dict(r) for r in await self._all(sql, params)]
+        return [dict(r) for r in await self._all(sql, params, bulk=True)]
 
     async def count_strm_prefix(self, scan_id: int, prefix: str) -> dict:
         row = await self._one(
             "SELECT COUNT(*) AS n, COALESCE(SUM(managed), 0) AS managed FROM strm_files "
             "WHERE scan_id=? AND substr(url, 1, ?)=?",
             (scan_id, len(prefix), prefix),
+            bulk=True,
         )
         return dict(row)
 
@@ -1385,12 +1421,12 @@ class Database:
         cond = """o.strm_path >= ? AND o.strm_path < ?
                   AND NOT EXISTS (SELECT 1 FROM strm_files f WHERE f.path=o.strm_path)"""
         params = [dir_prefix, dir_prefix + "\U0010ffff"]
-        total = (await self._one(f"SELECT COUNT(*) AS n FROM outputs o WHERE {cond}", params))["n"]
+        total = (await self._one(f"SELECT COUNT(*) AS n FROM outputs o WHERE {cond}", params, bulk=True))["n"]
         rows = await self._all(
             f"""SELECT o.video_id, o.library_id, o.strm_path, v.slug, l.name AS library_name
                 FROM outputs o JOIN videos v ON v.id=o.video_id JOIN libraries l ON l.id=o.library_id
                 WHERE {cond} ORDER BY o.strm_path LIMIT ? OFFSET ?""",
-            params + [limit, offset],
+            params + [limit, offset], bulk=True,
         )
         return [dict(r) for r in rows], total
 
@@ -1402,7 +1438,7 @@ class Database:
 
     async def strm_changes(self, change_set: int, only_active: bool = True) -> list[dict]:
         cond = "AND reverted=0" if only_active else ""
-        rows = await self._all(f"SELECT * FROM strm_changes WHERE change_set=? {cond} ORDER BY id", (change_set,))
+        rows = await self._all(f"SELECT * FROM strm_changes WHERE change_set=? {cond} ORDER BY id", (change_set,), bulk=True)
         return [dict(r) for r in rows]
 
     async def mark_change_reverted(self, change_id: int) -> None:
@@ -1413,7 +1449,7 @@ class Database:
             """SELECT c.change_set, COUNT(*) AS files, SUM(c.reverted) AS reverted, MIN(c.created_at) AS created_at,
                       j.params, j.status
                FROM strm_changes c LEFT JOIN jobs j ON j.id=c.change_set
-               GROUP BY c.change_set ORDER BY c.change_set DESC LIMIT 100"""
+               GROUP BY c.change_set ORDER BY c.change_set DESC LIMIT 100""", bulk=True,
         )
         out = []
         for r in rows:
@@ -1509,14 +1545,14 @@ class Database:
             where.append("kind=?")
             params.append(kind)
         rows = await self._all(f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ? OFFSET ?",
-                               (*params, limit, offset))
+                               (*params, limit, offset), bulk=True)
         jobs = [_job_row(r) for r in rows]
         if jobs:
             ids = [j["id"] for j in jobs]
             marks = ",".join("?" * len(ids))
             counts = await self._all(
                 f"SELECT job_id, status, COUNT(*) AS n FROM tasks WHERE job_id IN ({marks}) GROUP BY job_id, status",
-                ids,
+                ids, bulk=True,
             )
             by_job: dict[int, dict] = {i: {} for i in ids}
             for c in counts:
@@ -1591,12 +1627,19 @@ class Database:
 
     async def open_task_count(self, job_id: int) -> int:
         row = await self._one(
-            "SELECT COUNT(*) AS n FROM tasks WHERE job_id=? AND status IN ('pending', 'running')", (job_id,)
+            "SELECT COUNT(*) AS n FROM tasks WHERE job_id=? AND status IN ('pending', 'running')", (job_id,), bulk=True,
         )
         return row["n"]
 
+    async def has_open_tasks(self, job_id: int) -> bool:
+        """完成子任务时只需确认还有任务，避免每次重新数完整个队列。"""
+        return await self._one(
+            "SELECT 1 FROM tasks WHERE job_id=? AND status IN ('pending','running') LIMIT 1",
+            (job_id,), bulk=True,
+        ) is not None
+
     async def task_counts(self, job_id: int) -> dict:
-        rows = await self._all("SELECT status, COUNT(*) AS n FROM tasks WHERE job_id=? GROUP BY status", (job_id,))
+        rows = await self._all("SELECT status, COUNT(*) AS n FROM tasks WHERE job_id=? GROUP BY status", (job_id,), bulk=True)
         return {r["status"]: r["n"] for r in rows}
 
     async def list_tasks(self, job_id: int, status: str = "", limit: int = 100, offset: int = 0) -> list[dict]:
@@ -1604,11 +1647,13 @@ class Database:
             rows = await self._all(
                 "SELECT * FROM tasks WHERE job_id=? AND status=? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
                 (job_id, status, limit, offset),
+                bulk=True,
             )
         else:
             rows = await self._all(
                 "SELECT * FROM tasks WHERE job_id=? ORDER BY updated_at DESC, id DESC LIMIT ? OFFSET ?",
                 (job_id, limit, offset),
+                bulk=True,
             )
         return [dict(r) for r in rows]
 
@@ -1627,8 +1672,9 @@ class Database:
 
     async def queue_stats(self) -> dict:
         rows = await self._all(
-            """SELECT t.kind, t.status, COUNT(*) AS n FROM tasks t JOIN jobs j ON j.id=t.job_id
-               WHERE j.status IN ('running', 'paused') GROUP BY t.kind, t.status"""
+            """SELECT kind, status, COUNT(*) AS n FROM tasks
+               WHERE job_id IN (SELECT id FROM jobs WHERE status IN ('running','paused'))
+               GROUP BY kind, status""", bulk=True,
         )
         out: dict[str, dict] = {}
         for r in rows:

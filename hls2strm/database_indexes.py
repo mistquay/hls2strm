@@ -2,6 +2,15 @@
 
 import aiosqlite
 
+async def migrate_v18(conn: aiosqlite.Connection) -> None:
+    """补齐空值最后的双向排序索引，以及大库统计/源筛选的覆盖索引。"""
+    for name, col in (("duration", "duration"), ("code", "code_key"), ("views", "views"), ("updated", "updated_at")):
+        for direction in ("ASC", "DESC"):
+            await conn.execute(f"CREATE INDEX videos_sort_{name}_{direction.lower()} "
+                               f"ON videos(({col} IS NULL OR {col}='') ASC,{col} {direction},id {direction})")
+    await conn.execute("CREATE INDEX sources_filter ON sources(video_id,status,site,subtitle)")
+    await conn.execute("CREATE INDEX outputs_pending ON outputs(library_id,video_id) WHERE strm_path=''")
+
 async def migrate_v12(conn: aiosqlite.Connection) -> None:
     """候选和关联筛选使用索引；原 JSON 元数据保持兼容。"""
     await conn.execute("CREATE TABLE video_facets (video_id INTEGER NOT NULL, kind TEXT NOT NULL, item TEXT NOT NULL, name TEXT NOT NULL, active INTEGER NOT NULL, PRIMARY KEY(video_id, kind, item))")

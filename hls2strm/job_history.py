@@ -65,17 +65,17 @@ class JobHistory:
         rows = await self.db._all(
             f"SELECT job_id,COUNT(*) AS seen,SUM(is_new) AS new,SUM(1-is_new) AS existing,"
             f"SUM(added) AS added,SUM(excluded) AS excluded FROM crawl_items "
-            f"WHERE job_id IN ({marks}) GROUP BY job_id", job_ids,
+            f"WHERE job_id IN ({marks}) GROUP BY job_id", job_ids, bulk=True,
         )
         return {r["job_id"]: dict(r) for r in rows}
 
     async def items(self, job_id, status="", limit=50, offset=0):
         condition = {"": "", "new": " AND is_new=1", "existing": " AND is_new=0", "excluded": " AND excluded=1"}[status]
         where = "job_id=?" + condition
-        total = await self.db._one(f"SELECT COUNT(*) AS n FROM crawl_items WHERE {where}", (job_id,))
+        total = await self.db._one(f"SELECT COUNT(*) AS n FROM crawl_items WHERE {where}", (job_id,), bulk=True)
         rows = await self.db._all(
             f"SELECT * FROM crawl_items WHERE {where} ORDER BY page,video_id LIMIT ? OFFSET ?",
-            (job_id, limit, offset),
+            (job_id, limit, offset), bulk=True,
         )
         return {"items": [dict(r) for r in rows], "total": total["n"]}
 

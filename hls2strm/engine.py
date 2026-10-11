@@ -352,7 +352,7 @@ class Engine:
         job = await self.db.get_job(job_id)
         if job is None or job["status"] != "running":
             return
-        if await self.db.open_task_count(job_id):
+        if await self.db.has_open_tasks(job_id):
             await self._log_progress(job)
             return
         counts = await self.db.task_counts(job_id)
@@ -1512,30 +1512,45 @@ class Engine:
         return job
 
     async def _do_prepare(self, job: dict, task: dict) -> None:
-        from itertools import islice
         p, cfg = job["params"], self.store.current.sites
         kind = p["prepare"]
-        if kind == "backfill":
-            rows = ((site, key) for site, key in await self.db.sources_missing_detail(self._rank))
-            task_kind = "detail"
-        elif kind == "quality":
-            rows = ((r["site"], str(r["id"])) for r in await self.db.sources_needing_quality(int(time.time())-QUALITY_RETRY_AFTER, p.get("library_id"))
-                    if r["site"] in cfg and cfg[r["site"]].enabled)
-            task_kind = "quality"
-        else:
-            site = p["site"]
-            ids = await self.db.works_to_probe(site, int(time.time())-self.store.current.probe_recheck_days*86400, p.get("library_id"))
-            rows = ((site, f"{site}:{vid}") for vid in ids)
-            task_kind = "probe"
-        queued = job["state"].get("queued", 0)
-        while chunk := list(islice(rows, 256)):
+        state = dict(job["state"])
+        # 批次已经入队但游标尚未保存时可能中断；恢复时以实际任务数校正进度。
+        queued = (await self.db._one("SELECT COUNT(*) AS n FROM tasks WHERE job_id=? AND kind!='prepare'",
+                                     (job["id"],), bulk=True))["n"]
+        before = state.get("prepare_before")
+        cutoff = state.get("prepare_cutoff", int(time.time()) - (
+            QUALITY_RETRY_AFTER if kind == "quality" else self.store.current.probe_recheck_days * 86400))
+        state["prepare_cutoff"] = cutoff
+        await self.db.update_job(job["id"], state=state)
+        while True:
             await self.checkpoint(job["id"])
+            if kind == "backfill":
+                batch = await self.db.detail_candidates(self._rank, before=before, limit=256)
+                rows = [(r["site"], r["key"]) for r in batch]
+                cursor = batch[-1]["video_id"] if batch else None
+                task_kind = "detail"
+            elif kind == "quality":
+                batch = await self.db.sources_needing_quality(cutoff, p.get("library_id"), before=before, limit=256)
+                rows = [(r["site"], str(r["id"])) for r in batch if r["site"] in cfg and cfg[r["site"]].enabled]
+                cursor = batch[-1]["id"] if batch else None
+                task_kind = "quality"
+            else:
+                site = p["site"]
+                batch = await self.db.works_to_probe(site, cutoff, p.get("library_id"), before=before, limit=256)
+                rows = [(site, f"{site}:{vid}") for vid in batch]
+                cursor = batch[-1] if batch else None
+                task_kind = "probe"
+            if not batch:
+                break
             by_site = {}
-            for site, target in chunk:
+            for site, target in rows:
                 by_site.setdefault(site, []).append(target)
             for site, targets in by_site.items():
                 queued += await self.db.add_tasks(job["id"], task_kind, targets, PRIORITY_DETAIL, site)
-            await self.db.update_job(job["id"], state={"queued": queued})
+            before = cursor
+            state.update(queued=queued, prepare_before=before)
+            await self.db.update_job(job["id"], state=state)
 
     # ---- 画质探测 ----
 
