@@ -69,7 +69,7 @@ export function SiteRetirement() {
         <div className="space-y-4 text-sm">
           <p className="text-muted">
             彻底不用一个站点：停用站点和它的订阅，删掉所有影片在这个站的源。别的站还有能用的源的影片留在库里；没有的下架，
-            它在各输出库里的文件原样搬进归档目录（已刮削的整个影片目录、收件目录里没刮削的 strm），媒体库看不到、刮削器也监控不到。
+            它在各输出库里的文件原样搬进归档目录，按库分开，已刮削的整个影片目录放「已刮削」、收件目录里没刮削的 strm 放「未刮削」，媒体库看不到、刮削器也监控不到。
             恢复时原样搬回。只看本地记录，不抓源站、不探测播放。
           </p>
           {!!records.data?.length && <div className="space-y-2 rounded border border-line p-3">

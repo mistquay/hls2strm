@@ -34,8 +34,8 @@ def test_removed_source_stays_removed(make_store, boot):
         assert v["status"] == "removed" and not any(p.exists() for p in strm) and not cover.exists()
         # 文件搬进归档目录，按库分开，封面一起搬
         stash = boot.data_dir / "archive"
-        assert (stash / "全部" / "library" / "IPZZ-983" / "IPZZ-983-fanart.jpg").read_bytes() == b"jpg"
-        assert (stash / "FC2" / "library" / "IPZZ-983" / "IPZZ-983.strm").is_file()
+        assert (stash / "全部" / "未刮削" / "IPZZ-983" / "IPZZ-983-fanart.jpg").read_bytes() == b"jpg"
+        assert (stash / "FC2" / "未刮削" / "IPZZ-983" / "IPZZ-983.strm").is_file()
         assert await db.get_outputs(v["id"]) == [] and [s["status"] for s in await db.get_sources(v["id"])] == ["removed"]
         items, total = await db.search_videos(VideoQuery(status="removed"))
         assert total == 1 and items[0]["id"] == v["id"]

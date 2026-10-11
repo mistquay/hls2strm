@@ -54,10 +54,10 @@ def test_retire_site_archives_and_restores(make_store, boot, tmp_path):
         assert job["status"] == "done", await db.task_counts(job["id"])
         assert not store.current.site("jable").enabled and not (await db.get_subscription(sub))["enabled"]
         stash = boot.data_dir / "archive" / "整理"
-        assert (stash / "external" / "演员" / "IPZZ-983" / "IPZZ-983.nfo").read_text(encoding="utf-8") == "metadata"
-        assert (stash / "external" / "演员" / "IPZZ-983" / "IPZZ-983.strm").exists()
+        assert (stash / "已刮削" / "演员" / "IPZZ-983" / "IPZZ-983.nfo").read_text(encoding="utf-8") == "metadata"
+        assert (stash / "已刮削" / "演员" / "IPZZ-983" / "IPZZ-983.strm").exists()
         assert not strm.parent.exists() and not unscraped.exists()
-        assert (stash / "library" / unscraped.relative_to(inbox)).exists()
+        assert (stash / "未刮削" / unscraped.relative_to(inbox)).exists()
         assert (ext / "演员" / "ABF-156" / "ABF-156.strm").exists()
         assert (await db.get_video_by_id(kept["id"]))["status"] == "active"
         assert (await db.get_video_by_id(scraped["id"]))["status"] == "removed"
@@ -94,7 +94,7 @@ def test_archive_plan_shared_dir(tmp_path):
     (shared / "AAA-001.nfo").write_text("nfo", encoding="utf-8")
     (shared / "BBB-002.strm").write_text("http://x/play/bbb-002.m3u8\n", encoding="utf-8")
     pairs = archive.plan([shared / "AAA-001.strm"], "aaa-001", root, ext, dest)
-    assert sorted(pairs) == sorted([(str(shared / n), str(dest / "external" / "合集" / n))
+    assert sorted(pairs) == sorted([(str(shared / n), str(dest / "已刮削" / "合集" / n))
                                     for n in ("AAA-001.strm", "AAA-001-720p.strm")])
     assert archive.stash(pairs) == 2
     assert (shared / "AAA-001.nfo").exists() and (shared / "BBB-002.strm").exists()
@@ -106,7 +106,7 @@ def test_archive_plan_shared_dir(tmp_path):
     (shared / "BBB-002.strm").rename(own / "BBB-002.strm")
     (own / "BBB-002.nfo").write_text("nfo", encoding="utf-8")
     assert archive.plan([own / "BBB-002.strm"], "bbb-002", root, ext, dest) == [
-        (str(own), str(dest / "external" / "BBB-002"))]
+        (str(own), str(dest / "已刮削" / "BBB-002"))]
 
 
 def test_archive_dir_must_not_overlap(make_store, boot, tmp_path):

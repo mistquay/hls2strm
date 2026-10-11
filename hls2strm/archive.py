@@ -6,8 +6,10 @@
 - 收件目录里还没整理的 strm 搬走，外部刮削器就监控不到了；
 - 和别的片共用的目录只搬这部片的 strm（和多画质版本），自管库再带上本程序写的 nfo、封面。
 
-归档目录在输出根目录、各库目录和外部整理目录之外，不自动清理；里面按 <库名>/library|external/<原相对路径> 存放，
-手工也能搬回去。跨文件系统时复制再删。都是同步函数，调用方放到线程里跑。
+归档目录在输出根目录、各库目录和外部整理目录之外，不自动清理。里面先按库分，再按刮削过没有分：
+外部整理目录里的放 <库名>/已刮削/<相对整理目录的路径>，收件目录（没设外部整理目录的库就是库目录）里的放
+<库名>/未刮削/<相对库目录的路径>。以后想重新刮削，把「未刮削」里的 strm 放回收件目录就行；手工也能搬回原处。
+跨文件系统时复制再删。都是同步函数，调用方放到线程里跑。
 """
 
 from __future__ import annotations
@@ -19,6 +21,8 @@ from pathlib import Path
 
 from .trash import exclusive, inside, prune
 from .writer import OUTPUT_SUFFIXES, OutputWriter
+
+SCRAPED, UNSCRAPED = "已刮削", "未刮削"  # 归档目录里每个库下面的两个子目录
 
 
 def plan(strms: list[Path], slug: str, root: Path, ext: Path | None, dest: Path) -> list[tuple[str, str]]:
@@ -42,7 +46,7 @@ def plan(strms: list[Path], slug: str, root: Path, ext: Path | None, dest: Path)
         sources += list(dict.fromkeys(files))
     pairs, taken = [], set()
     for src in sources:
-        base, area = (ext, "external") if ext is not None and inside(src, ext) else (root, "library")
+        base, area = (ext, SCRAPED) if ext is not None and inside(src, ext) else (root, UNSCRAPED)
         try:
             rel = src.relative_to(base)
         except ValueError:  # 记录的路径不在库目录里（手工挪过）
