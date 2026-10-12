@@ -97,6 +97,22 @@ def test_playlist_cache_rewrites_each_session_and_head_reports_get_length():
     asyncio.run(run())
 
 
+def test_playlist_uses_gateway_prefix_as_absolute_path():
+    async def run():
+        upstream = Response(200, {}, b"#EXTM3U\n#EXTINF:4,\nvideo0.jpeg\n#EXT-X-ENDLIST\n")
+        app, calls, _ = relay_app([upstream])
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app), base_url="http://test") as client:
+            prefixed = await client.get("/hls/1/1080p/video.m3u8?s=first",
+                                        headers={"X-Forwarded-Prefix": "/stream/http_resolver/tok/"})
+            assert "\n/stream/http_resolver/tok/hls/1/1080p/video0.jpeg.ts?s=first\n" in prefixed.text
+            # 格式不对的前缀（跨主机、带 ..）不用，退回相对地址
+            for bad in ("//evil.invalid", "http://evil.invalid", "/a/../b"):
+                response = await client.get("/hls/1/1080p/video.m3u8?s=first", headers={"X-Forwarded-Prefix": bad})
+                assert "\n../1080p/video0.jpeg.ts?s=first\n" in response.text
+            assert len(calls) == 1
+    asyncio.run(run())
+
+
 def test_fake_header_segment_keeps_full_fetch_and_does_not_advertise_wrong_length():
     async def run():
         ts = (b"\x47" + b"\0" * 187) * 5

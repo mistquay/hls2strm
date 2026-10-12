@@ -48,6 +48,8 @@ SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 HLS_PATH_RE = re.compile(
     r"^(?:_x/[0-9a-f]{16}/[A-Za-z0-9_-]+(?:\.[a-z0-9]{1,5})?|[A-Za-z0-9._~-]+(?:/[A-Za-z0-9._~-]+){0,5})$")
 _EXT_RE = re.compile(r"\.([a-z0-9]{1,5})$")
+# 反向代理挂载本服务的路径前缀：每段都不以点开头，排除 .. 和 //host 这类写法
+_PREFIX_RE = re.compile(r"^(?:/[A-Za-z0-9_~-][A-Za-z0-9._~-]*){1,8}$")
 DISGUISE_EXTS = (".jpeg", ".jpg", ".png", ".gif", ".webp", ".html", ".txt", ".js", ".css", ".woff2", ".woff", ".svg",
                  ".xml", ".json", ".vtt", ".srt")
 SUBTITLE_CODES = {"zh": "zh", "none": "", "en": "en"}
@@ -615,6 +617,15 @@ CORS_HEADERS = {
 }
 
 
+def _public_prefix(request: Request) -> str:
+    """网关中转时带来的 X-Forwarded-Prefix（如 /stream/http_resolver/{令牌}），格式不对当没有。
+
+    有前缀时播放列表写绝对路径：有的播放器（Hills）按 302 之前的地址解析相对路径，../hls/ 会落到 Emby 的路径下。
+    """
+    prefix = request.headers.get("x-forwarded-prefix", "").rstrip("/")
+    return prefix if _PREFIX_RE.fullmatch(prefix) else ""
+
+
 def _check_token(request: Request, t: str) -> None:
     token = _ctx(request).store.current.play_token
     if token and not secrets.compare_digest(t.encode(), token.encode()):
@@ -884,7 +895,7 @@ def rewrite_playlist(text: str, playlist_url: str, root: str, up: str, q: str, d
     """把播放列表里的地址改成本服务的相对地址。
 
     playlist_url：这个播放列表在上游的地址；root：源的播放地址所在目录，它下面的文件按相对路径中转；
-    up：从当前播放列表的位置回到 /hls/{源 id}/ 的相对前缀；q：附加的查询串（播放令牌）。
+    up：从当前播放列表的位置回到 /hls/{源 id}/ 的相对前缀（网关给了前缀时是绝对路径）；q：附加的查询串（播放令牌）。
     """
 
     def local(ref: str, segment: bool) -> str:
@@ -953,7 +964,7 @@ async def _media_location(request: Request, r: Resolved, want: int | None = None
             query[key] = value
     if want is not None:
         query["want"] = str(want)
-    return f"../media/{r.source['id']}?{urlencode(query)}"
+    return f"{_public_prefix(request) or '..'}/media/{r.source['id']}?{urlencode(query)}"
 
 
 def playback_source(r: Resolved) -> dict:
@@ -1079,8 +1090,9 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
                or request.query_params.get("variants") == "highest")
     if (want is not None or highest) and (picked := filter_master(body, want)):
         body = picked[0]  # 只给要的那一档（没指定就最高档）
-    # /play/{slug}.m3u8 回到 /hls/{源 id}/：相对地址解析，不依赖对外地址的写法
-    text = rewrite_playlist(body, r.url, root, f"../hls/{r.source['id']}/", q, r.traits.disguised_segments)
+    # /play/{slug}.m3u8 回到 /hls/{源 id}/：相对地址解析，不依赖对外地址的写法；网关给了前缀就写绝对路径
+    up = f"{_public_prefix(request) or '..'}/hls/{r.source['id']}/"
+    text = rewrite_playlist(body, r.url, root, up, q, r.traits.disguised_segments)
     return Response(text, media_type="application/vnd.apple.mpegurl")
 
 
@@ -1157,7 +1169,9 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = "", s: 
         ctx.resolver.health.record(r.host, True)
         if playlist:
             q = (f"?s={s}" + (f"&t={quote(t)}" if t else "")) if s else (f"?t={quote(t)}" if t else "")
-            up = "../" * path.count("/")  # 从当前子清单的位置回到 /hls/{源 id}/
+            prefix = _public_prefix(request)
+            # 从当前子清单的位置回到 /hls/{源 id}/
+            up = f"{prefix}/hls/{source_id}/" if prefix else "../" * path.count("/")
             root = r.url.rsplit("/", 1)[0] + "/"
             text = rewrite_playlist(body.decode("utf-8", "replace"), url, root, up, q, r.traits.disguised_segments)
             response = Response(text, media_type="application/vnd.apple.mpegurl", headers=cors)

@@ -359,6 +359,9 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
                                              之后的播放列表、分片都经网关转发到本服务，计入网关的统计
 ```
 
+经网关转发时，网关用 `X-Forwarded-Prefix` 告诉本服务令牌前缀（`/stream/http_resolver/{令牌}`），播放列表里写带前缀的绝对路径。
+有的播放器（如 Hills）按 302 之前的 `/emby/Videos/…` 地址解析相对路径，写 `../hls/…` 会落到 Emby 下 404。没有这个头时仍写相对地址。
+
 需要知道的两点 CDN 限制（有中转可用时，这两种客户端会自动改走中转）：
 
 - 它只对 `https://jable.tv` 返回 CORS 头。浏览器用原生 `<video>` 播放（新版 Chrome、Safari）不受影响；网页播放器用 hls.js 发请求会跨域失败。

@@ -30,6 +30,10 @@ def test_play_and_resolve(tmp_path):
             r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Lavf/61.7.100"})
             src_id = c.get("/api/videos", params={"q": "ipzz-983"}).json()["items"][0]["sources"][0]["id"]
             assert r.status_code == 200 and f"../hls/{src_id}/a.ts" in r.text
+            # 经网关中转（带 X-Forwarded-Prefix）：写绝对路径，按 302 之前的地址解析相对路径的播放器也能用
+            r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Lavf/61.7.100",
+                                                       "X-Forwarded-Prefix": "/stream/http_resolver/tok"})
+            assert r.status_code == 200 and f"\n/stream/http_resolver/tok/hls/{src_id}/a.ts" in r.text
             # 浏览器跨域：中转 + CORS
             r = c.get("/play/ipzz-983.m3u8", headers={"User-Agent": "Mozilla/5.0", "Origin": "http://emby:8096"})
             assert r.status_code == 200 and r.headers["access-control-allow-origin"] == "*"
