@@ -140,7 +140,7 @@ class ManagedSession:
             with stage(self.metrics, f"upstream.{self.kind}"):
                 try:
                     if kw.pop("stream", False):
-                        resp = await self._stream(url, **kw)
+                        resp = await self._stream(method, url, **kw)
                         close = resp.aclose
                         async def release():
                             if resp.closed:
@@ -202,13 +202,13 @@ class ManagedSession:
         self.raw.release_curl(curl)
         self.metrics.gauges[f"http_curl_free_{self.kind}"] = self._free_curls()
 
-    async def _stream(self, url, *, headers=None, timeout=30, **kw):
+    async def _stream(self, method, url, *, headers=None, timeout=30, **kw):
         curl = await self._pop_curl()
         trace(f"请求上游 {upstream_target(url)}")
         resp = MediaResponse(self.raw, curl, self.metrics, self.buffer_bytes, release=self._release_curl)
         try:
             _, buffer, header_buffer, _, _, _ = set_curl_options(
-                curl, "GET", url, params_list=[self.raw.params, None],
+                curl, method, url, params_list=[self.raw.params, None],
                 headers_list=[self.raw.headers, headers], cookies_list=[self.raw.cookies, None],
                 proxies_list=[self.raw.proxies, None], verify_list=[self.raw.verify, None], impersonate=self.raw.impersonate,
                 timeout=timeout, stream=True, queue_class=asyncio.Queue, event_class=asyncio.Event,

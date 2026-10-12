@@ -38,6 +38,7 @@ from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_si
 from .runtime import deadline as request_deadline, traffic, stage, measured_lock, attempt_wait_state, trace
 from .playback import PlaybackSessions
 from .playback_selection import PlaybackSelection
+from .hls_relay import HLSUpstreamStatus, playlist_bytes
 from .play_history import attempt as history_attempt, delivery as history_delivery
 
 log = logging.getLogger(__name__)
@@ -1083,7 +1084,7 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
     return Response(text, media_type="application/vnd.apple.mpegurl")
 
 
-@router.get("/hls/{source_id}/{path:path}")
+@router.api_route("/hls/{source_id}/{path:path}", methods=["GET", "HEAD"])
 async def hls_file(source_id: int, path: str, request: Request, t: str = "", s: str = ""):
     """中转模式：转发子清单、分片和 key；遇到 403 自动换新地址重试一次。"""
     ctx = _ctx(request)
@@ -1103,44 +1104,80 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = "", s: 
         raise HTTPException(502, f"解析播放地址失败：{e}") from None
     trace(f"源 #{source_id} {r.site.label} {r.source['key']}" + (f" 线路 {r.line['line']}" if r.line else "")
           + f"，取 {path}")
-    headers_up = r.traits.headers or None
+    playlist = path.endswith(".m3u8")
     for attempt in range(2):
         url = _upstream(r, path)
         if url is None:
             raise HTTPException(404)
+        headers_up = {**r.traits.headers, "Accept-Encoding": "identity"}
+        if not playlist and not r.traits.fake_header and request.method == "GET":
+            for name in ("Range", "If-Range"):
+                if value := request.headers.get(name):
+                    headers_up[name] = value
+        resp = None
         try:
-            resp = await getattr(ctx.fetcher, "hls_session", ctx.fetcher.session).get(url, stream=True, timeout=ctx.store.current.request_timeout,
-                                                 headers=headers_up)
+            if playlist:
+                body = await playlist_bytes(ctx, url, headers_up)
+                status = 200
+            else:
+                session = getattr(ctx.fetcher, "hls_session", ctx.fetcher.session)
+                if request.method == "HEAD":
+                    resp = await session.request("HEAD", url, stream=True,
+                                                 timeout=ctx.store.current.request_timeout, headers=headers_up)
+                else:
+                    resp = await session.get(url, stream=True, timeout=ctx.store.current.request_timeout,
+                                             headers=headers_up)
+                status = resp.status_code
+        except HLSUpstreamStatus as e:
+            status = e.status
         except PoolBusy as e:
             raise HTTPException(503, str(e), headers={"Retry-After": "1"}) from None
         except Exception as e:
             raise _cdn_error(request, r, f"CDN 请求失败：{e}") from None
-        if resp.status_code in (403, 410) and attempt == 0 and not path.startswith("_x/"):
-            await close_stream(resp)
+        if status in (403, 410) and attempt == 0 and not path.startswith("_x/"):
+            if resp is not None:
+                await close_stream(resp)
             ctx.metrics.inc("play_token_expired")
-            trace(f"CDN 返回 HTTP {resp.status_code}，换新地址重试")
+            trace(f"CDN 返回 HTTP {status}，换新地址重试")
             try:
                 r = await (ctx.resolver.session_source(source_id, s, stale=r.url) if s else ctx.resolver.ensure_source(source_id, stale=r.url))
             except (NotFound, VideoGone, Blocked, FetchError, ParseError) as e:
                 raise HTTPException(502, f"CDN 地址失效，换新失败：{e}") from None
             continue
-        if resp.status_code != 200:
-            await close_stream(resp)
-            raise _cdn_error(request, r, f"CDN 返回 HTTP {resp.status_code}")
-        ctx.resolver.health.record(r.host, True)
         cors = dict(CORS_HEADERS) if request.headers.get("origin") else {}
-        if path.endswith(".m3u8"):
-            try:
-                body = b"".join([chunk async for chunk in resp.aiter_content()])
-            finally:
+        if status == 416 and resp is not None:
+            if value := resp.headers.get("content-range"):
+                cors["Content-Range"] = value
+            await close_stream(resp)
+            return Response(status_code=416, headers=cors)
+        if status not in (200, 206):
+            if resp is not None:
                 await close_stream(resp)
+            raise _cdn_error(request, r, f"CDN 返回 HTTP {status}")
+        ctx.resolver.health.record(r.host, True)
+        if playlist:
             q = (f"?s={s}" + (f"&t={quote(t)}" if t else "")) if s else (f"?t={quote(t)}" if t else "")
             up = "../" * path.count("/")  # 从当前子清单的位置回到 /hls/{源 id}/
             root = r.url.rsplit("/", 1)[0] + "/"
             text = rewrite_playlist(body.decode("utf-8", "replace"), url, root, up, q, r.traits.disguised_segments)
-            return Response(text, media_type="application/vnd.apple.mpegurl", headers=cors)
+            response = Response(text, media_type="application/vnd.apple.mpegurl", headers=cors)
+            if request.method == "HEAD":
+                response.body = b""
+            return response
 
         strip = r.traits.fake_header
+        headers = cors
+        if not strip:
+            for name in ("Content-Length", "Content-Range", "Accept-Ranges"):
+                if value := resp.headers.get(name.lower()):
+                    headers[name] = value
+        media = "video/mp2t" if path.endswith(".ts") else (resp.headers.get("content-type") or "video/mp2t")
+        if request.method == "HEAD":
+            await close_stream(resp)
+            response = Response(status_code=status, media_type=media, headers=headers)
+            if strip and "content-length" in response.headers:
+                del response.headers["content-length"]
+            return response
 
         async def stream(resp=resp, r=r):
             sent = 0
@@ -1168,11 +1205,5 @@ async def hls_file(source_id: int, path: str, request: Request, t: str = "", s: 
             finally:
                 await close_stream(resp)
 
-        headers = cors
-        if (cl := resp.headers.get("content-length")) and not strip:
-            headers["Content-Length"] = cl
-        media = resp.headers.get("content-type") or "video/mp2t"
-        if path.endswith(".ts"):
-            media = "video/mp2t"
-        return StreamingResponse(stream(), media_type=media, headers=headers)
+        return StreamingResponse(stream(), status_code=status, media_type=media, headers=headers)
     raise HTTPException(502, "CDN 地址刷新后仍不可用")
