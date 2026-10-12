@@ -144,15 +144,19 @@ async def health_list(request: Request):
     """各播放站的连通性；checking：正在检测；next_at：下次定时检测的时间（关了为 0）。"""
     c = _ctx(request)
     e = c.engine
-    interval = c.store.current.health_interval * 60
+    next_at = await e.scheduler.next_at(await e.scheduler.plan("system:health"))
     return {"hosts": c.resolver.health.view(), "checking": e._health_task is not None and not e._health_task.done(),
-            "next_at": int(e._health_at + interval) if interval else 0}
+            "next_at": next_at or 0}
 
 
 @router.post("/health/check")
 async def health_check(request: Request):
     """立即在后台检测一轮（不等结果，结果看 GET /api/health）。"""
-    return {"started": _ctx(request).engine.start_health_check()}
+    try:
+        await _ctx(request).engine.scheduler.run("system:health")
+        return {"started": True}
+    except ValueError:
+        return {"started": False}
 
 
 @router.post("/fetcher/test")
@@ -693,7 +697,10 @@ async def reclassify_library(lib_id: int, request: Request):
 @router.post("/libraries/{lib_id}/locate")
 async def locate_library(lib_id: int, request: Request):
     try:
-        return {"job_id": await _ctx(request).engine.strm.create_locate(lib_id)}
+        e = _ctx(request).engine
+        job_id = await e.strm.create_locate(lib_id)
+        await e.scheduler.track_job("system:external_locate", job_id)
+        return {"job_id": job_id}
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
 
@@ -702,7 +709,10 @@ async def locate_library(lib_id: int, request: Request):
 async def tidy_library(lib_id: int, request: Request, apply: bool = True):
     """外部整理库清理残留：只剩 nfo、图片的影片目录移进回收区；apply=false 只列出来。"""
     try:
-        return {"job_id": await _ctx(request).engine.strm.create_tidy(lib_id, apply=apply)}
+        e = _ctx(request).engine
+        job_id = await e.strm.create_tidy(lib_id, apply=apply)
+        await e.scheduler.track_job("system:orphans", job_id)
+        return {"job_id": job_id}
     except ValueError as err:
         raise HTTPException(400, str(err)) from None
 
@@ -821,7 +831,9 @@ async def delete_subscription(sub_id: int, request: Request):
 @router.post("/subscriptions/{sub_id}/run")
 async def run_subscription(sub_id: int, request: Request, mode: Literal["auto", "full", "incremental"] = "auto"):
     try:
-        return {"job_id": await _ctx(request).engine.run_subscription(sub_id, mode)}
+        result = await _ctx(request).engine.scheduler.run(f"subscription:{sub_id}", mode=mode,
+                                                         request_key=request.headers.get("Idempotency-Key"))
+        return {"job_id": result["job_id"]}
     except KeyError:
         raise HTTPException(404, "订阅不存在") from None
     except ValueError as err:
@@ -1077,3 +1089,7 @@ async def logs_stream(request: Request, after: int = 0, instance: str = ""):
             ring.unsubscribe(q)
 
     return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+from .schedule_api import router as schedule_router
+router.include_router(schedule_router)

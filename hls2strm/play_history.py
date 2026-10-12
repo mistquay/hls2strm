@@ -110,11 +110,15 @@ class PlaybackHistory:
 
     async def cleanup(self):
         settings = self.store.current
+        removed = 0
         async with self.db._tx(invalidate=False) as conn:
             if settings.play_history_days:
-                await conn.execute("DELETE FROM play_history WHERE created_at<?",(int(time.time())-settings.play_history_days*86400,))
+                cur = await conn.execute("DELETE FROM play_history WHERE created_at<?",(int(time.time())-settings.play_history_days*86400,))
+                removed += cur.rowcount
             if settings.play_history_max_entries:
-                await conn.execute("DELETE FROM play_history WHERE id IN (SELECT id FROM play_history ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?)",(settings.play_history_max_entries,))
+                cur = await conn.execute("DELETE FROM play_history WHERE id IN (SELECT id FROM play_history ORDER BY created_at DESC,id DESC LIMIT -1 OFFSET ?)",(settings.play_history_max_entries,))
+                removed += cur.rowcount
+        return {"removed": removed}
 
     async def page(self, *, mode="",site="",state="",q="",since=None,until=None,limit=50,offset=0):
         where,params = ["1=1"],[]

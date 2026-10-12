@@ -176,6 +176,20 @@ export interface Subscription {
   created_at: number;
 }
 
+export interface SchedulePlan { cron: string | null; interval: number; timezone: string }
+export interface ScheduleRun {
+  id: number; schedule_key: string; trigger: string; planned_at: number | null; dispatched_at: number;
+  started_at: number | null; finished_at: number | null; status: string; job_id: number | null;
+  result: Record<string, unknown>; error: string;
+}
+export interface ScheduledTask extends SchedulePlan {
+  key: string; kind: "system" | "subscription"; name: string; target: string; enabled: boolean;
+  state: string; reason: string; next_run_at: number | null; last_run: ScheduleRun | null;
+  last_job_id: number | null; subscription_id: number | null; library_id: number | null;
+  follows_pause: boolean; destructive: boolean; note: string; startup: boolean;
+  can_run: boolean; run_blocked_reason: string;
+}
+
 export interface Failure {
   id: number;
   job_id: number;

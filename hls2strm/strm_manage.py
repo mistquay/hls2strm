@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -407,15 +408,20 @@ class StrmManager:
 
     # ---- 外部整理库：同步位置 ----
 
-    async def create_locate(self, library_id: int | None = None) -> int:
+    async def create_locate(self, library_id: int | None = None, *, automatic: bool = False, priority: int = 20) -> int:
         """library_id 为空时同步所有外部整理库。"""
         libs = [self.e._library(library_id)] if library_id else list(self.e.libs.values())
         libs = [lib for lib in libs if lib["external_dir"]]
+        if automatic:
+            libs = [lib for lib in libs if not lib.get("operation_pending")]
         if not libs:
             raise ValueError("没有设置外部整理目录的输出库")
-        job_id = await self.db.create_job("locate", "同步位置：" + "、".join(lib["name"] for lib in libs),
-                                          {"library_id": library_id})
-        await self.db.add_tasks(job_id, "locate", [lib["id"] for lib in libs], 20)
+        params = {"library_id": library_id}
+        if automatic:
+            params["automatic"] = True
+        job_id = await self.db.create_job("locate", ("自动同步位置：" if automatic else "同步位置：") +
+                                          "、".join(lib["name"] for lib in libs), params)
+        await self.db.add_tasks(job_id, "locate", [lib["id"] for lib in libs], priority)
         self.e.notify()
         return job_id
 
@@ -423,11 +429,15 @@ class StrmManager:
         lib = self.e.libs.get(int(task["target"]))
         if lib is None or not lib["external_dir"]:
             return
+        if job["params"].get("automatic") and lib.get("operation_pending"):
+            return
         result = await self.locate(lib)
-        state = (await self.db.get_job(job["id"]))["state"]
-        for k, n in result.items():
-            state[k] = state.get(k, 0) + n
-        await self.db.update_job(job["id"], state=state)
+        self.e.missing[lib["id"]] = result["missing"]
+        async with self.db._tx(invalidate=False) as conn:
+            state = (await self.db.get_job(job["id"]))["state"]
+            for k, n in result.items():
+                state[k] = state.get(k, 0) + n
+            await conn.execute("UPDATE jobs SET state=? WHERE id=?", (json.dumps(state), job["id"]))
 
     @guarded
     async def locate(self, lib: dict) -> dict:
@@ -468,15 +478,20 @@ class StrmManager:
 
     # ---- 外部整理库：清理残留 ----
 
-    async def create_tidy(self, library_id: int | None = None, *, apply: bool = True) -> int:
+    async def create_tidy(self, library_id: int | None = None, *, apply: bool = True, automatic: bool = False, priority: int = 20) -> int:
         """library_id 为空时清理所有外部整理库；apply 为 False 只列出残留目录，不动文件。"""
         libs = [self.e._library(library_id)] if library_id else list(self.e.libs.values())
         libs = [lib for lib in libs if lib["external_dir"]]
+        if automatic:
+            libs = [lib for lib in libs if not lib.get("operation_pending")]
         if not libs:
             raise ValueError("没有设置外部整理目录的输出库")
         name = "清理残留：" + "、".join(lib["name"] for lib in libs) + ("" if apply else "（只检查）")
-        job_id = await self.db.create_job("tidy", name, {"library_id": library_id, "apply": apply})
-        await self.db.add_tasks(job_id, "tidy", [lib["id"] for lib in libs], 20)
+        params = {"library_id": library_id, "apply": apply}
+        if automatic:
+            params["automatic"] = True
+        job_id = await self.db.create_job("tidy", name, params)
+        await self.db.add_tasks(job_id, "tidy", [lib["id"] for lib in libs], priority)
         self.e.notify()
         return job_id
 
@@ -485,6 +500,8 @@ class StrmManager:
         """外部整理目录里已经没有 strm、只剩 nfo 和图片的影片目录移进回收区（以前移出库时留下的）。"""
         lib = self.e.libs.get(int(task["target"]))
         if lib is None or not lib["external_dir"]:
+            return
+        if job["params"].get("automatic") and lib.get("operation_pending"):
             return
         ext = self.e.writer.external_root(lib)
         if not await asyncio.to_thread(ext.is_dir):
@@ -506,11 +523,12 @@ class StrmManager:
                 log.warning("残留目录 %s 没能移走：%s", d, e)
         if len(orphans) > TIDY_LOG_LIMIT:
             log.info("…另外还有 %d 个残留目录没列出", len(orphans) - TIDY_LOG_LIMIT)
-        state = (await self.db.get_job(job["id"]))["state"]
         total = sum(size for _, size in orphans)
-        for k, n in {"orphans": len(orphans), "bytes": total, "moved": moved, "failed": failed}.items():
-            state[k] = state.get(k, 0) + n
-        await self.db.update_job(job["id"], state=state)
+        async with self.db._tx(invalidate=False) as conn:
+            state = (await self.db.get_job(job["id"]))["state"]
+            for k, n in {"orphans": len(orphans), "bytes": total, "moved": moved, "failed": failed}.items():
+                state[k] = state.get(k, 0) + n
+            await conn.execute("UPDATE jobs SET state=? WHERE id=?", (json.dumps(state), job["id"]))
         log.info("清理残留「%s」：找到 %d 个只剩 nfo、图片的目录，共 %s%s", lib["name"], len(orphans), _fmt_bytes(total),
                  (f"，{'直接删掉' if days <= 0 else '移进回收区'} {moved} 个" + (f"，失败 {failed} 个" if failed else ""))
                  if apply else "（只检查，没动文件）")

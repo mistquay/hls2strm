@@ -142,6 +142,11 @@ class Settings(BaseModel):
         description="新片自动补源：列表任务、订阅收进新影片时，到这些站点按番号找备用源（填站点名，如 missav）；留空不自动找",
     )
     probe_recheck_days: int = Field(30, ge=1, le=3650, description="补源时某个站没有这部影片，多少天内不再去查")
+    external_sync_interval: int = Field(
+        10, ge=0,
+        description="外部整理库自动同步位置的间隔（分钟），0 关闭。启动后同步一次，之后定时按 strm 内容找回"
+                    "外部工具移动、改名后的文件路径；不补回丢失文件，不改 nfo、图片。开启多画质版本的库会在新位置补齐版本文件",
+    )
     external_restore: bool = Field(
         True,
         description="外部整理库的 strm 在收件目录和外部整理目录里都找不到时（按内容找，外部工具改名、加后缀也认得出），"
@@ -365,10 +370,12 @@ class SettingsStore:
         from . import output_sync
         old = self.current
         sync = await output_sync.changed(self._db, old, new)
+        from .schedule_store import legacy_settings
         async with self._db._tx(invalidate=False) as conn:
             await conn.execute("INSERT INTO settings(key,value) VALUES('settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (new.model_dump_json(),))
             if sync:
                 await conn.execute("INSERT INTO settings(key,value) VALUES('output_sync',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(sync),))
+            await legacy_settings(conn, patch)
         self.current = new
         for fn in self._listeners:
             fn(old, new)

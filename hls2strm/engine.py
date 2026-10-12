@@ -48,8 +48,8 @@ from .runtime import log_area
 from .sites import SITES, Site, SourceDetail, SourceItem, find_by_code, get_site
 from .source_policy import eligible
 from .strm_manage import StrmManager
-from .subscription_schedule import has_schedule, schedule_anchor, scheduled_after
-from .trash import inside, prune, purge as purge_trash, retire
+from .subscription_schedule import has_schedule
+from .trash import inside, prune, retire
 from .writer import VERSION_STYLES, OutputWriter, cover_path, sanitize
 
 log = logging.getLogger(__name__)
@@ -66,9 +66,6 @@ TASK_STATUS_NAMES = {"done": "完成", "failed": "失败", "gone": "下架", "ca
                      "pending": "待处理"}
 PROBE_STATUS_NAMES = {"found": "找到", "none": "没有", "failed": "失败", "timeout": "超时"}
 DEFAULT_MAX_PAGES = 20
-SETTLE_INTERVAL = 600
-HOUSEKEEP_INTERVAL = 3600  # 每小时清一次回收区里放满天数的
-TIDY_INTERVAL = 86400  # 开了自动清理残留时，每天排一次清理残留任务
 
 
 class TaskStopped(Exception):
@@ -114,13 +111,14 @@ class Engine:
         self._settle_lock = asyncio.Lock()
         self._settle_wanted = True
         self._settled_at = 0.0
-        self._housekept_at = 0.0
-        self.missing: dict[int, int] = {}  # 库 id -> 有记录但磁盘上找不到的 strm 数（启动时、核对后统计）
+        self.missing: dict[int, int] = {}  # 库 id -> 有记录但磁盘上找不到的 strm 数（启动时、核对后、同步位置后统计）
         self._missing_task: asyncio.Task | None = None
         self._progress_at: dict[int, float] = {}  # 任务 id -> 上次在日志里报进度的时间
         self._health_task: asyncio.Task | None = None
         self._health_at = 0.0  # 上次定时检测连通性的时间
         self._output_locks = WeakValueDictionary()
+        from .scheduler import Scheduler
+        self.scheduler = Scheduler(self)
 
     # ---- 生命周期 ----
 
@@ -135,6 +133,7 @@ class Engine:
             if job["status"] == "running":
                 await self._update_list_completion(job["id"])
                 await self._maybe_finish_job(job["id"])
+        await self.scheduler.start()
         self._resize_workers()
         self.store.on_change(lambda old, new: self._on_settings())
         self._scheduler = asyncio.create_task(self._schedule_loop(), name="scheduler")
@@ -153,6 +152,7 @@ class Engine:
         for t in tasks:
             t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        await self.scheduler.stop()
         await self.resolver.quality.close()
         await self.resolver.selection.close()
         await self._save_health()
@@ -381,6 +381,7 @@ class Engine:
             if not state["list_complete"]:
                 state["partial_failure"] = True
         await self.db.update_job(job_id, status="done", finished_at=finished, state=state)
+        await self.scheduler.store.reconcile(job_id)
         from . import output_sync
         await output_sync.finish(self.db,await self.db.get_job(job_id))
         self._progress_at.pop(job_id, None)
@@ -1903,57 +1904,24 @@ class Engine:
         while True:
             await asyncio.sleep(30)
             try:
-                await self._run_due_subscriptions()
+                await self.scheduler.tick()
             except Exception:
-                log.exception("订阅调度出错")
-            interval = self.store.current.health_interval * 60
-            if interval and not self.paused and time.time() - self._health_at >= interval:
-                self.start_health_check()
+                log.exception("定时任务调度出错")
             try:
                 await self._save_health()
             except Exception:
                 log.exception("保存连通性出错")
-            if time.time() - self._housekept_at >= HOUSEKEEP_INTERVAL:
-                self._housekept_at = time.time()
-                try:
-                    await self._housekeep()
-                except Exception:
-                    log.exception("清理回收区出错")
-            if self.paused or not (self._settle_wanted or time.time() - self._settled_at > SETTLE_INTERVAL):
-                continue
-            try:
-                await self.settle()
-            except Exception:
-                log.exception("归并出错")
-
-    async def _housekeep(self) -> None:
-        """外部整理库：删掉回收区里放满天数的；开了自动清理残留时，每天排一次清理残留任务。"""
-        from .play_history import PlaybackHistory
-        await PlaybackHistory(self.db,self.store).cleanup()
-        days = self.store.current.trash_days
-        external = [lib for lib in list(self.libs.values()) if lib["external_dir"]]
-        for lib in external:
-            if n := await asyncio.to_thread(purge_trash, self.writer.external_root(lib), days):
-                log.info("回收区「%s」：删掉放满 %d 天的 %d 批", lib["name"], days, n)
-        if self.paused or not self.store.current.orphan_cleanup or not external:
-            return
-        last = await self.db.last_tidy_job()
-        if last and (last["status"] in ("running", "paused") or time.time() - last["created_at"] < TIDY_INTERVAL):
-            return
-        await self.strm.create_tidy()
 
     async def _run_due_subscriptions(self) -> None:
-        if self.paused:
-            return
-        t = time.time()
-        for sub in await self.db.list_subscriptions():
-            if not (sub["enabled"] and sub["initialized"] and has_schedule(sub)) or sub["listing_job_id"]:
-                continue
-            # 重启不补跑停机期间的 cron；存活期间延迟的调度最多补一次。
-            anchor = schedule_anchor(sub, self._subscription_schedule_started_at)
-            if scheduled_after(sub, anchor) > t:
-                continue
-            await self.run_subscription(sub["id"], "incremental")
+        await self.scheduler.due_subscriptions()
+
+    async def _run_due_locate(self) -> None:
+        await self.scheduler.due_system("external_locate")
+
+    async def _housekeep(self) -> None:
+        for key in ("trash", "play_history", "orphans"):
+            await self.scheduler.due_system(key)
+        await asyncio.gather(*list(self.scheduler._tasks.values()))
 
 
 async def playlist_duration(fetcher: Fetcher, url: str, headers: dict | None = None) -> int | None:

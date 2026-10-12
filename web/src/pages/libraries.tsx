@@ -1,12 +1,13 @@
 import { useQuery } from "@tanstack/react-query";
 import { MoreHorizontal, Pencil, Plus } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ask, confirm } from "@/components/confirm";
 import { ConfigTransfer } from "@/components/config-transfer";
 import { SiteRetirement } from "@/components/site-retirement";
 import { OperationPreview } from "@/components/operation-preview";
 import { QueryNotice } from "@/components/common";
-import { nextSubscriptionTime, SubscriptionSchedule } from "@/components/subscription-schedule";
+import { nextSubscriptionTime } from "@/components/subscription-schedule";
+import { ScheduleEditor } from "@/components/schedule-editor";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, Help, Mono, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Segmented, Select, Switch } from "@/components/ui/form";
@@ -16,7 +17,7 @@ import { api, type FacetItem, type FacetField, type Library, type Subscription }
 import { fmtNum, fmtTime } from "@/lib/format";
 import { useLibraries, useMeta, useRun, useStatus, useSubscriptions } from "@/lib/queries";
 import { VERSION_STYLES } from "@/lib/labels";
-import { navigate } from "@/lib/route";
+import { navigate, replaceParams, useRoute } from "@/lib/route";
 import { subState } from "./overview";
 
 const TRASH_DIR = ".hls2strm-trash";
@@ -107,6 +108,7 @@ function LibrariesPanel() {
             <Plus />
             新建输出库
           </Button>
+          <Button size="sm" onClick={() => navigate("schedules")}>定时任务</Button>
           <ConfigTransfer />
           <SiteRetirement />
         </>
@@ -221,8 +223,8 @@ function LibrariesPanel() {
       <div className="py-3">
         <Help summary="输出库、外部整理库、来源库和排除库怎么用">
           <p>库目录不能互相嵌套。改目录或模板会自动排一个重写任务，把已有文件搬到新位置；改规则会自动排一个重新归库任务，不再符合规则的影片会从库里移除（只移除规则加入的，任务和订阅加入的保留）。组内多个值满足任一即可；分类、标签按站点上的名称或 slug 匹配。</p>
-          <p>外部整理库：strm 只在影片第一次入库时写进库目录（不写 nfo、封面），之后由外部工具移走、改名、刮削，本服务不再在库目录补写，也不搬文件。「同步位置」按 strm 内容在库目录和外部整理目录里找回每部影片的文件；重写输出会先同步位置，再原地改 strm 内容；删除库时只删 strm。清空外部整理目录就改回由本服务管理。</p>
-          <p>影片移出外部整理库（被排除库分走、不再符合规则、手动移出）时，删掉 strm，它独占的整理目录（外部工具生成的 nfo、图片）整个移进整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除。以前留下的只剩 nfo、图片的目录，用「清理残留目录」处理，设置里也可以每天自动清理。目录里还有别的影片文件（多部片放一个目录）时不动。</p>
+          <p>外部整理库：strm 只在影片第一次入库时写进库目录（不写 nfo、封面），之后由外部工具移走、改名、刮削，本服务不再在库目录补写，也不搬文件。默认每 10 分钟自动同步位置，启动后也同步一次；可在「定时任务」调整间隔、改为 cron 或停用，需要立即更新时点「同步位置」。同步按 strm 内容在库目录和外部整理目录里找回每部影片的文件；开启多画质版本的库会在新位置补齐版本文件。重写输出会先同步位置，再原地改 strm 内容；删除库时只删 strm。清空外部整理目录就改回由本服务管理。</p>
+          <p>影片移出外部整理库（被排除库分走、不再符合规则、手动移出）时，删掉 strm，它独占的整理目录（外部工具生成的 nfo、图片）整个移进整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除。以前留下的只剩 nfo、图片的目录，用「清理残留目录」处理，可在「定时任务」调整自动清理计划。目录里还有别的影片文件（多部片放一个目录）时不动。</p>
           <p>来源库、排除库：比如「其他」的来源选「全部」、排除「中文字幕」「无码」，就得到剩下的影片，每部只在一个库里，外部工具不会重复刮削。有排除库的库收到新片后先不写文件，等排除库的定时订阅都跑完一轮、确认它不属于排除库再写（最多晚一个订阅周期）。排除库的订阅请按「最近更新」排序。</p>
         </Help>
       </div>
@@ -420,7 +422,16 @@ function SubscriptionsPanel() {
   const run = useRun();
   const [editing, setEditing] = useState<Subscription | "new" | null>(null);
   const [filter, setFilter] = useState({ q: "", site: "", library: "", state: "" });
-  const done = { invalidate: [["subscriptions"], ["status"], ["jobs"]] };
+  const done = { invalidate: [["subscriptions"], ["schedules"], ["status"], ["jobs"]] };
+  const { params } = useRoute();
+  const selected = params.get("subscription");
+  useEffect(() => {
+    const sub = subscriptionsQuery.data?.find(s => String(s.id) === selected);
+    if (sub) {
+      setEditing(sub);
+      const next = new URLSearchParams(params); next.delete("subscription"); replaceParams(next);
+    }
+  }, [selected, subscriptionsQuery.data, params]);
   const retiredSites = new Set(retired.map(r => r.site));
   const siteOff = (site: string) => retiredSites.has(site) || status?.sites.find(s => s.name === site)?.enabled === false;
   const shown = subs.filter(sub =>
@@ -496,7 +507,7 @@ function SubscriptionsPanel() {
                 </Td>
                 <Td className="text-[13px]">{sub.library_name}</Td>
                 <Td className="whitespace-nowrap text-[13px]">
-                  <Mono>{sub.cron ?? (sub.interval ? `每 ${sub.interval} 分钟（旧配置）` : "仅手动")}</Mono>
+                  <Mono>{sub.cron ?? (sub.interval ? `每 ${sub.interval} 分钟` : "仅手动")}</Mono>
                   {sub.cron === "" && "仅手动"}
                   {!!sub.cron && <div className="text-xs text-muted">{sub.timezone}</div>}
                 </Td>
@@ -559,11 +570,11 @@ function SubscriptionsPanel() {
               </tr>
             );
           })}
-          {subs.length === 0 && !subscriptionsQuery.error && !subscriptionsQuery.isPending && <EmptyRow cols={8}>还没有订阅。新建一个，用 cron 自动跟进站点上的更新。</EmptyRow>}
+          {subs.length === 0 && !subscriptionsQuery.error && !subscriptionsQuery.isPending && <EmptyRow cols={8}>还没有订阅。新建一个，用固定间隔或 cron 自动跟进站点上的更新。</EmptyRow>}
         </tbody>
       </Table>
       <p className="py-3 text-[13px] text-muted">
-        首轮全量会翻完来源的全部页；之后按 cron 增量：从第 1 页往后翻，连续遇到这么多部已在该库里的影片就停。不勾「首轮全量」只跟进以后的更新。下次执行时间按订阅时区显示；停机期间的 cron 不补跑。
+        首轮全量会翻完来源的全部页；之后按固定间隔或 cron 增量：从第 1 页往后翻，连续遇到这么多部已在该库里的影片就停。不勾「首轮全量」只跟进以后的更新。下次执行时间按订阅时区显示；停机期间的 cron 不补跑。
       </p>
       <Dialog open={!!editing} onOpenChange={o => !o && setEditing(null)}>
         {editing && <SubscriptionForm sub={editing === "new" ? null : editing} onDone={() => setEditing(null)} />}
@@ -583,7 +594,8 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
     source: sub?.source ?? "",
     sort: sub?.sort ?? meta.site("jable").default_sort,
     library_id: sub?.library_id ?? 1,
-    cron: sub?.cron ?? (sub?.interval === 0 ? "" : "0 3 * * *"),
+    cron: sub ? sub.cron : "0 3 * * *",
+    interval: sub?.interval ?? 0,
     timezone: sub?.timezone ?? "Asia/Shanghai",
     stop_after_known: sub?.stop_after_known ?? 48,
     max_pages: sub?.max_pages ?? 20,
@@ -595,7 +607,7 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
   const save = async () => {
     const r = await run(() => (sub ? api.put(`/api/subscriptions/${sub.id}`, f) : api.post("/api/subscriptions", f)), {
       success: sub ? "订阅已保存" : "订阅已新建",
-      invalidate: [["subscriptions"], ["status"]],
+      invalidate: [["subscriptions"], ["schedules"], ["status"]],
     });
     if (r) onDone();
   };
@@ -653,11 +665,8 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
             ))}
           </datalist>
         </Field>
-        {sub?.cron === null && sub.interval > 0 && <p className="text-xs text-muted sm:col-span-2">
-          当前使用旧周期：每 {sub.interval} 分钟。保存后切换为下方 cron，请先确认执行时间。
-        </p>}
-        <SubscriptionSchedule cron={f.cron} timezone={f.timezone} onValidity={setScheduleValid}
-          onChange={(cron, timezone) => { setScheduleValid(false); setF({ ...f, cron, timezone }); }} />
+        <ScheduleEditor plan={{ cron: f.cron, interval: f.interval, timezone: f.timezone }} onValidity={setScheduleValid}
+          onChange={plan => { setScheduleValid(false); setF({ ...f, ...plan }); }} />
         <Field label="连续多少部已在库就停">
           <Input type="number" min={1} value={f.stop_after_known} onChange={e => setF({ ...f, stop_after_known: Number(e.target.value) })} />
         </Field>

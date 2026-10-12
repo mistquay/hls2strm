@@ -1,4 +1,4 @@
-import { FileVideo, Film, FolderTree, History, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, PanelLeftClose, PanelLeftOpen, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
+import { CalendarClock, FileVideo, Film, FolderTree, History, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, PanelLeftClose, PanelLeftOpen, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
 import { type ComponentType, lazy, Suspense, useEffect, useState } from "react";
 import { ConfirmHost } from "./components/confirm";
 import { PlayerHost } from "./components/player";
@@ -18,6 +18,7 @@ import Overview from "./pages/overview";
 const pages: { id: string; name: string; icon: ComponentType<{ className?: string }>; Page: ComponentType }[] = [
   { id: "overview", name: "概览", icon: LayoutDashboard, Page: Overview },
   { id: "jobs", name: "任务", icon: ListChecks, Page: lazy(() => import("./pages/jobs")) },
+  { id: "schedules", name: "定时任务", icon: CalendarClock, Page: lazy(() => import("./pages/schedules")) },
   { id: "videos", name: "影片库", icon: Film, Page: lazy(() => import("./pages/videos")) },
   { id: "play-history", name: "播放记录", icon: History, Page: lazy(() => import("./pages/play-history")) },
   { id: "libraries", name: "输出库与订阅", icon: FolderTree, Page: lazy(() => import("./pages/libraries")) },

@@ -135,7 +135,7 @@ def test_leaving_external_library_retires_scraped_dir(make_store, boot, tmp_path
         await db._write("UPDATE jobs SET created_at=created_at-86400 WHERE kind='tidy'")
         await engine._housekeep()
         auto = await wait_job(db, (await db.list_jobs())[0]["id"])
-        assert auto["kind"] == "tidy" and auto["params"] == {"library_id": None, "apply": True}
+        assert auto["kind"] == "tidy" and auto["params"] == {"library_id": None, "apply": True, "automatic": True}
 
         # 保留 0 天：手动移出时直接删掉整理目录
         await store.update({"trash_days": 0})

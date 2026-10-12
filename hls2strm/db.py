@@ -28,6 +28,7 @@ from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migra
 from .job_history import JobHistory, migrate_v13 as _migrate_v13
 from .play_history import migrate_v20 as _migrate_v20
 from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
+from .schedule_store import migrate_v21 as _migrate_v21
 from .runtime import stage
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
@@ -355,7 +356,7 @@ async def _migrate_v17(conn: aiosqlite.Connection) -> None:
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20]
+              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -1487,7 +1488,7 @@ class Database:
         return cur.lastrowid
 
     async def update_subscription(self, sub_id: int, **fields) -> None:
-        schedule_fields = {"cron", "timezone", "enabled", "initialized"} & fields.keys()
+        schedule_fields = {"cron", "interval", "timezone", "enabled", "initialized"} & fields.keys()
         if schedule_fields:
             old = await self.get_subscription(sub_id)
             if old and any(old[k] != fields[k] for k in schedule_fields):
@@ -1570,6 +1571,8 @@ class Database:
         return jobs
 
     async def delete_job(self, job_id: int) -> None:
+        from .schedule_store import ScheduleStore
+        await ScheduleStore(self).reconcile(job_id)
         async with self._tx(invalidate=False):
             await self.conn.execute("DELETE FROM job_logs WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM crawl_items WHERE job_id=?", (job_id,))
