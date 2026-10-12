@@ -38,6 +38,7 @@ from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_si
 from .runtime import deadline as request_deadline, traffic, stage, measured_lock, attempt_wait_state, trace
 from .playback import PlaybackSessions
 from .playback_selection import PlaybackSelection
+from .play_history import attempt as history_attempt, delivery as history_delivery
 
 log = logging.getLogger(__name__)
 
@@ -702,6 +703,7 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
     ctx = _ctx(request)
     _check_token(request, t)
     slug, want = _parse_name(name)
+    history_attempt(request,slug)
     ctx.metrics.inc("play_requests")
     s = ctx.store.current
     ua = request.headers.get("user-agent", "")
@@ -717,6 +719,7 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
     r = await _resolve_or_http(request, slug, site=src or None, line=line or None, want=want,
                                 relay=forced, remote=s.play_remote, excluded=frozenset(excluded))
     if prepare:
+        request.scope["skip_play_history"] = True
         return JSONResponse({**playback_source(r), "url": await _media_location(request, r, want)},
                             headers={"Cache-Control": "no-store"})
     blocked_uas = s.proxy_user_agents if r.traits.ua_block else []
@@ -725,10 +728,12 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
     log.info("播放 %s%s：%s %s（%s，客户端 %s，UA %s）", slug, f"（要 {quality_label(want)}）" if want else "", _label(r),
              "中转" if proxied else "302", _left(r), request.client.host if request.client else "?", ua[:60])
     if proxied:
+        history_delivery(request,r,mode="proxy")
         ctx.metrics.inc("play_proxy")
         resp = await (_proxy_playlist(request, r, t, want, all_variants=variants == "all") if _is_hls(r.url)
                       else _proxy_file(request, r))
     else:
+        history_delivery(request,r,mode="redirect")
         ctx.metrics.inc("play_redirect")
         resp = RedirectResponse(await _pick_variant(ctx, r, want), status_code=302)
     if origin:
@@ -770,6 +775,7 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     if not secrets.compare_digest(given.encode(), s.resolve_token.encode()):
         raise HTTPException(401, "resolve_token 错误")
     slug, want = _parse_name(name.rsplit("/", 1)[-1])
+    history_attempt(request,slug)
     mode = mode or s.resolve_mode
     if mode == "continuous":  # 兼容旧网关请求，只做原样中转。
         mode = "proxy"
@@ -781,10 +787,11 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
     relay_url = _relay_url(s, base, slug, want) if base else ""
 
     def relayed(why: str, duration: int | None = None, bound: bool = False) -> dict:
+        key = history_delivery(request,mode="proxy")
         log.info("resolve %s：%s，返回%s中转地址（%s%s）", slug, why, "经网关转发的" if relay == "gateway" else "公网",
                  mode, extra)
         ttl = min(s.resolve_relay_ttl, (duration or 0)+3600) if bound else s.resolve_relay_ttl
-        return {"slug": slug, "url": relay_url, "relay": True, "expires_at": 0, "ttl": ttl, "duration": duration}
+        return {"slug": slug, "url": relay_url+"&ph="+key, "relay": True, "expires_at": 0, "ttl": ttl, "duration": duration}
 
     if mode == "proxy":
         if not relay_url:
@@ -795,7 +802,7 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
         if mode == "auto" and relay_url:
             r = await resolver.selection.choose(slug, min_remaining=min_remaining, remote=True, want=want)
             if not (r.traits.direct and not r.traits.ip_bound):
-                location = await _bound_relay_url(ctx, s, base, r, want)
+                location = await _bound_relay_url(ctx, s, base, r, want,request=request)
                 return {**relayed(f"挑中 {_label(r)} 要中转", r.video.get("duration"), bound=True), "url": location,
                         "source": playback_source(r)}
         else:
@@ -823,10 +830,11 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
         if mode == "strict_redirect":
             raise HTTPException(409, f"只允许直连，但当前客户端需要中转：{why}")
         if relay_url:
-            location = await _bound_relay_url(ctx, s, base, r, want)
+            location = await _bound_relay_url(ctx, s, base, r, want,request=request)
             return {**relayed(f"{_label(r)} 能直连，但{why}", r.video.get("duration"), bound=True), "url": location,
                     "source": playback_source(r)}
     expires = r.expires or 0
+    history_delivery(request,r,mode="redirect")
     log.info("resolve %s：返回 %s 的 CDN 地址（%s，%s%s）", slug, _label(r), _left(r), mode, extra)
     return {"slug": slug, "url": await _pick_variant(ctx, r, want), "relay": False, "expires_at": expires,
             "source": playback_source(r), "state": "redirect_issued",
@@ -838,8 +846,10 @@ def _relay_url(s, base: str, slug: str, want: int | None = None) -> str:
     return url + (f"&t={quote(s.play_token)}" if s.play_token else "")
 
 
-async def _bound_relay_url(ctx, settings, base, resolved, want):
+async def _bound_relay_url(ctx, settings, base, resolved, want, *, request=None):
     session = await ctx.resolver.sessions.persist(ctx.db, resolved)
+    if request:
+        history_delivery(request,resolved,session=session)
     query = {"s": session}
     if settings.play_token:
         query["t"] = settings.play_token
@@ -957,6 +967,7 @@ def playback_source(r: Resolved) -> dict:
 async def _proxy_file(request: Request, r: Resolved) -> Response:
     """直链是 mp4 这类单文件（如 streamtape）：原样转发，带上 Range，支持拖动。"""
     ctx = _ctx(request)
+    history_delivery(request,r)
     headers = dict(r.traits.headers)
     if rng := request.headers.get("range"):
         headers["Range"] = rng
@@ -1004,6 +1015,7 @@ async def media_file(source_id: int, request: Request, s: str, t: str = "", want
                      variants: str = ""):
     """网页播放：清单、Range/拖动保持源、线路和地址快照一致。"""
     _check_token(request, t)
+    history_attempt(request,"")
     try:
         r = await _ctx(request).resolver.session_source(source_id, s)
     except (NotFound, VideoGone):
@@ -1012,6 +1024,7 @@ async def media_file(source_id: int, request: Request, s: str, t: str = "", want
         raise HTTPException(503, str(e), headers={"Retry-After": "1"}) from None
     except (Blocked, FetchError, ParseError) as e:
         raise HTTPException(502, f"刷新播放地址失败：{e}") from None
+    history_delivery(request,r)
     if _is_hls(r.url):
         response = await _proxy_playlist(request, r, t, want, all_variants=variants == "all")
     else:
@@ -1039,6 +1052,7 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
     if not r.site.multi_line and r.traits.expires and (r.expires or 0)-time.time() < required and unsafe:
         r = await _resolve_or_http(request, r.video["slug"], min_remaining=required,
                                    site=request.query_params.get("src") or None, line=request.query_params.get("line") or None, want=want)
+        history_delivery(request,r)
         if not _is_hls(r.url):
             return await _proxy_file(request, r)
         try:
@@ -1052,6 +1066,7 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
         return Response(media_type="application/vnd.apple.mpegurl",
                         headers={"Content-Location": await _media_location(request, r, want)})
     session = await ctx.resolver.sessions.persist(ctx.db, r)
+    history_delivery(request,r,session=session)
     q = f"?s={session}" + (f"&t={quote(t)}" if t else "")
     root = r.url.rsplit("/", 1)[0] + "/"
     body = raw.decode("utf-8", "replace")

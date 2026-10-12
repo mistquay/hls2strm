@@ -8,6 +8,15 @@ import { Button } from "./ui/button";
 import type { Tone } from "./ui/data";
 import { Select } from "./ui/form";
 
+export function QueryNotice({ query, label }: { query: { isPending?: boolean; error?: Error | null; data?: unknown; refetch:()=>unknown }; label:string }) {
+  if (query.error) return <div role="alert" className="flex flex-wrap items-center gap-2 p-3 text-sm text-err">
+    <span>{label}读取失败：{query.error.message}{query.data ? "；当前保留上次读取的内容" : ""}</span>
+    <Button size="sm" onClick={()=>query.refetch()}>重试</Button>
+  </div>;
+  if (query.isPending) return <p role="status" className="p-3 text-sm text-muted">正在读取{label}…</p>;
+  return null;
+}
+
 export function CopyButton({ text, label = "复制", size = "sm" }: { text: string; label?: string; size?: "sm" | "icon-sm" }) {
   const [done, setDone] = useState(false);
   const onClick = async () => {

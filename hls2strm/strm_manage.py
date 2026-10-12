@@ -27,6 +27,7 @@ from typing import TYPE_CHECKING
 from urllib.parse import urlsplit
 
 from .fetcher import NotFound
+from .file_changes import guarded
 from .parser import VideoGone, hls_expires
 from .trash import find_orphans, retire
 from .writer import VERSION_PATH_RE, write_atomic
@@ -230,6 +231,7 @@ def _check_prefixes(old: str, new: str) -> tuple[str, str]:
 class StrmManager:
     def __init__(self, engine: Engine) -> None:
         self.e = engine
+        self.file_changes = engine.file_changes
         self.db = engine.db
         self._index: dict[int, tuple[float, dict[int, list[str]], int]] = {}  # 库 id -> (时间, 文件, 外部整理目录 strm 数)
 
@@ -357,6 +359,7 @@ class StrmManager:
         self.e.notify()
         return job_id
 
+    @guarded
     async def do_adopt(self, job: dict, task: dict) -> None:
         p = job["params"]
         path = task["target"]
@@ -426,6 +429,7 @@ class StrmManager:
             state[k] = state.get(k, 0) + n
         await self.db.update_job(job["id"], state=state)
 
+    @guarded
     async def locate(self, lib: dict) -> dict:
         """在库目录和外部整理目录里找回这个库每部影片的 strm，更新记录的路径；不移动、不改任何文件。
 
@@ -476,6 +480,7 @@ class StrmManager:
         self.e.notify()
         return job_id
 
+    @guarded
     async def do_tidy(self, job: dict, task: dict) -> None:
         """外部整理目录里已经没有 strm、只剩 nfo 和图片的影片目录移进回收区（以前移出库时留下的）。"""
         lib = self.e.libs.get(int(task["target"]))
@@ -537,6 +542,7 @@ class StrmManager:
         self.e.notify()
         return job_id
 
+    @guarded
     async def do_prefix(self, job: dict, task: dict) -> None:
         p = job["params"]
         old, new = p["old"], p["new"]
@@ -571,6 +577,7 @@ class StrmManager:
         self.e.notify()
         return job_id
 
+    @guarded
     async def do_revert(self, job: dict, task: dict) -> None:
         change_set = job["params"]["change_set"]
         restored = skipped = 0

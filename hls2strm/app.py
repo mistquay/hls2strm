@@ -8,11 +8,11 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import Depends, FastAPI
 from fastapi.responses import FileResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
-from . import api, play
+from . import api, play, operation_api
 from .auth import Auth, load_secret
 from .config import BootConfig, SettingsStore
 from .db import Database
@@ -20,6 +20,7 @@ from .engine import Engine
 from .fetcher import Fetcher
 from .observability import Metrics, ring, setup_logging, shutdown_logging
 from .play import Resolver
+from .play_history import PlaybackHistory, PlaybackHistoryMiddleware
 from .writer import OutputWriter
 from .runtime import RequestTelemetry, JsonCompression
 
@@ -48,6 +49,7 @@ class Context:
     writer: OutputWriter
     resolver: Resolver
     engine: Engine
+    play_history: PlaybackHistory
 
 
 def database_path(data_dir: Path) -> Path:
@@ -77,15 +79,18 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
         secret = await load_secret(db)
         play.set_signing_key(secret)
         auth = Auth(boot, secret)
-        app.state.ctx = Context(boot, auth, db, store, metrics, fetcher, writer, resolver, engine)
+        history = PlaybackHistory(db,store)
+        app.state.ctx = Context(boot, auth, db, store, metrics, fetcher, writer, resolver, engine,history)
         log.info("启动：数据目录 %s，输出目录 %s，对外地址 %s", boot.data_dir, store.output_dir, store.public_base_url)
         if not boot.ui_password:
             log.warning("未设置 HLS2STRM_UI_PASSWORD，Web 控制台没有登录保护")
         await engine.start()
+        history.start()
         try:
             yield
         finally:
             await engine.stop()
+            await app.state.ctx.play_history.stop()
             await fetcher.close()
             await db.close()
             log.info("已退出")
@@ -93,7 +98,9 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
 
     app = FastAPI(title="hls2strm", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     app.add_middleware(RequestTelemetry)
+    app.add_middleware(PlaybackHistoryMiddleware)
     app.add_middleware(JsonCompression)
+    app.include_router(operation_api.router,prefix="/api",dependencies=[Depends(api.require_auth)])
     app.include_router(play.router)
     app.include_router(api.public)
     app.include_router(api.router)

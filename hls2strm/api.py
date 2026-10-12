@@ -20,7 +20,7 @@ from pydantic import BaseModel, Field, ValidationError
 
 from . import __version__
 from . import auth as auth_module
-from . import site_retirement
+from . import site_retirement, job_views, output_sync
 from .auth import COOKIE, REMEMBER_TTL, SESSION_TTL
 from .config import Settings
 from .config_transfer import ImportRequest, apply_config, export_config, preview_config
@@ -190,6 +190,21 @@ async def solver_test(body: SolverTestBody, request: Request):
 # ---- job ----
 
 
+@router.get("/play-history")
+async def playback_history(request:Request,mode:Literal["","proxy","redirect"]="",site:str="",
+                           state:Literal["","issued","delivered","failed","interrupted"]="",q:str="",
+                           since:int|None=Query(None,ge=0),until:int|None=Query(None,ge=0),
+                           limit:int=Query(50,ge=1,le=200),offset:int=Query(0,ge=0)):
+    if site and site not in SITES:
+        raise HTTPException(422,"未知站点")
+    if since is not None and until is not None and since>=until:
+        raise HTTPException(422,"结束时间应晚于开始时间")
+    c = _ctx(request)
+    page = await c.play_history.page(mode=mode,site=site,state=state,q=q,since=since,until=until,limit=limit,offset=offset)
+    return {**page,"enabled":c.store.current.play_history_enabled,"dropped":c.play_history.dropped,
+            "retention_days":c.store.current.play_history_days,"max_entries":c.store.current.play_history_max_entries}
+
+
 class JobCreate(BaseModel):
     kind: Literal["list", "videos", "backfill", "rewrite", "probe", "verify", "quality"]
     site: str = "jable"
@@ -234,6 +249,11 @@ def _parse_videos(c, text: str, default_site: str) -> list[tuple[str, str]]:
 
 @router.post("/jobs")
 async def create_job(body: JobCreate, request: Request):
+    from .request_jobs import execute
+    return await execute(request,body.model_dump(),lambda:_create_job(body,request),"id")
+
+
+async def _create_job(body: JobCreate, request: Request):
     e = _ctx(request).engine
     try:
         lib_id = body.library_id or DEFAULT_LIBRARY_ID
@@ -260,13 +280,18 @@ async def create_job(body: JobCreate, request: Request):
 
 @router.get("/jobs")
 async def list_jobs(request: Request, limit: int = 50, offset: int = 0,
-                    status: Literal["", "active", "problem", "done"] = "", kind: str = ""):
+                    status: Literal["", "active", "problem", "done"] = "", kind: str = "", q: str = "", paged: bool = False):
     db = _ctx(request).db
-    jobs = await db.list_jobs(limit=min(limit, 200), offset=offset, status=status, kind=kind)
+    jobs = await db.list_jobs(limit=max(1,min(limit, 200)), offset=max(0,offset), status=status, kind=kind, q=q)
     counts = await db.history.counts([j["id"] for j in jobs])
     for job in jobs:
         job["crawl"] = counts.get(job["id"])
-    return jobs
+        await job_views.describe(_ctx(request).engine, job)
+    if not paged:
+        return jobs
+    condition, params = job_views.job_condition(db,status,kind,q)
+    total = (await db._one(f"SELECT COUNT(*) AS n FROM jobs WHERE {condition}",params,bulk=True))["n"]
+    return {"items":jobs,"total":total}
 
 
 @router.get("/jobs/{job_id}/logs")
@@ -288,8 +313,9 @@ async def job_items(job_id: int, request: Request, status: Literal["", "new", "e
 
 
 @router.get("/jobs/{job_id}/tasks")
-async def job_tasks(job_id: int, request: Request, status: str = "", limit: int = 100, offset: int = 0):
-    return await _ctx(request).db.list_tasks(job_id, status, min(limit, 500), offset)
+async def job_tasks(job_id: int, request: Request, status: str = "", limit: int = 100, offset: int = 0, q: str = "", paged: bool = False):
+    page = await job_views.task_page(_ctx(request).db,job_id,status,q,max(1,min(limit,500)),max(0,offset))
+    return page if paged else page["items"]
 
 
 @router.post("/jobs/{job_id}/{action}")
@@ -315,6 +341,12 @@ async def delete_job(job_id: int, request: Request):
         raise HTTPException(400, "子任务正在停止，请稍后再删除")
     if await db._one("SELECT 1 FROM site_retirements WHERE job_id=?", (job_id,)):
         raise HTTPException(400, "站点清退要按这个任务恢复，先在输出库页恢复清退再删")
+    if job["state"].get("child_job_id") and not job["state"].get("completed") and await db._one("SELECT 1 FROM site_retirements WHERE job_id=?",(job["state"]["child_job_id"],)):
+        raise HTTPException(400,"清退设置尚未完成，先重试执行任务或恢复清退再删除")
+    if await db._one("SELECT 1 FROM jobs WHERE json_extract(params,'$.preview_id')=? LIMIT 1",(job_id,),bulk=True):
+        raise HTTPException(400,"预览仍被执行任务引用，先处理并删除关联执行任务")
+    if await db._one("SELECT 1 FROM libraries WHERE operation_job_id=? AND operation_pending=1 LIMIT 1",(job_id,)):
+        raise HTTPException(400,"输出库仍有未完成的变更，先完成或重新预览后处理")
     await db.delete_job(job_id)
     return {"ok": True}
 
@@ -462,9 +494,7 @@ async def job_detail(job_id: int, request: Request):
     job = await db.get_job(job_id)
     if job is None:
         raise HTTPException(404, "任务不存在")
-    job["tasks"] = await db.task_counts(job_id)
-    job["crawl"] = (await db.history.counts([job_id])).get(job_id)
-    return job
+    return await job_views.details(_ctx(request).engine,job)
 
 
 class VideoBatch(BaseModel):
@@ -479,18 +509,28 @@ async def retirement_list(request: Request):
     return await site_retirement.records(_ctx(request).engine)
 
 
-@router.post("/sites/{site}/retirement/preview")
+@router.post("/sites/{site}/retirement/preview",status_code=202)
 async def retirement_preview(site: str, request: Request):
     try:
-        return await site_retirement.preview(_ctx(request).engine, site)
+        return {"job_id":await _ctx(request).engine.operations.create({"kind":"retirement","payload":{"site":site}})}
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
 
 
-@router.post("/sites/{site}/retirement")
-async def retirement_apply(site: str, request: Request):
+class PreviewConfirmation(BaseModel):
+    preview_id: int
+    preview_token: str
+
+
+@router.post("/sites/{site}/retirement",status_code=202)
+async def retirement_apply(site: str, request: Request, body:PreviewConfirmation | None=None):
+    if body is None:
+        raise HTTPException(409,"请先计算影响预览，传入 preview_id 和 preview_token 后执行")
+    preview = await _ctx(request).db.get_job(body.preview_id)
+    if not preview or preview["params"].get("operation")!={"kind":"retirement","payload":{"site":site}}:
+        raise HTTPException(409,"预览与清退站点不匹配")
     try:
-        return {"job_id": await site_retirement.apply(_ctx(request).engine, site)}
+        return {"job_id": await _ctx(request).engine.operations.approve(body.preview_id,body.preview_token)}
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
 
@@ -498,7 +538,9 @@ async def retirement_apply(site: str, request: Request):
 @router.post("/sites/{site}/retirement/restore")
 async def retirement_restore(site: str, request: Request):
     try:
-        return {"job_id": await site_retirement.restore(_ctx(request).engine, site)}
+        engine = _ctx(request).engine
+        async with engine.file_changes.normal():
+            return {"job_id": await site_retirement.restore(engine, site)}
     except ValueError as e:
         raise HTTPException(400, str(e)) from None
 
@@ -564,6 +606,8 @@ async def speed_test(slug: str, body: SpeedTestBody, request: Request):
 
 
 class LibraryBody(BaseModel):
+    preview_id: int | None = None
+    preview_token: str = ""
     name: str
     dir: str
     path_template: str = ""
@@ -572,6 +616,22 @@ class LibraryBody(BaseModel):
     sources: list[int] = []
     excludes: list[int] = []
     versions: str = ""  # 多画质版本文件：空 = 不写，emby / suffix 是命名方式
+
+
+async def library_confirmation(c,body,lib_id=None):
+    from .operation_plans import digest,library_body
+    values = library_body(c.engine,{"library_id":lib_id,"values":body.model_dump(exclude={"preview_id","preview_token"})},validate=not bool(body.preview_id))
+    old = c.engine._library(lib_id) if lib_id else None
+    needs = bool(old and old.get("operation_pending")) or (any(values[k]!=old[k] for k in values if k!="name") if old else bool(values["rule"] or values["sources"] or values["excludes"]))
+    if body.preview_id:
+        preview = await c.db.get_job(body.preview_id)
+        operation = preview["params"].get("operation") if preview else None
+        if not operation or operation["kind"]!="library" or operation["payload"].get("library_id")!=lib_id or digest(operation["payload"]["values"])!=digest(values):
+            raise HTTPException(409,"预览与输出库配置不匹配")
+        return {"job_id":await c.engine.operations.approve(body.preview_id,body.preview_token)}
+    if needs:
+        raise HTTPException(409,"归库、目录或版本变更需先计算影响预览，确认范围后执行")
+    return None
 
 
 @router.get("/libraries")
@@ -591,7 +651,12 @@ async def list_libraries(request: Request):
 @router.post("/libraries")
 async def create_library(body: LibraryBody, request: Request):
     try:
-        return await _ctx(request).engine.create_library(body.name, body.dir, body.path_template, body.rule,
+        c = _ctx(request)
+        async with c.engine.file_changes.normal():
+            confirmed = await library_confirmation(c,body)
+            if confirmed:
+                return confirmed
+            return await c.engine.create_library(body.name, body.dir, body.path_template, body.rule,
                                                          body.external_dir, body.sources, body.excludes,
                                                          body.versions)
     except ValueError as err:
@@ -603,7 +668,12 @@ async def create_library(body: LibraryBody, request: Request):
 @router.put("/libraries/{lib_id}")
 async def update_library(lib_id: int, body: LibraryBody, request: Request):
     try:
-        return await _ctx(request).engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule,
+        c = _ctx(request)
+        async with c.engine.file_changes.normal():
+            confirmed = await library_confirmation(c,body,lib_id)
+            if confirmed:
+                return confirmed
+            return await c.engine.update_library(lib_id, body.name, body.dir, body.path_template, body.rule,
                                                          body.external_dir, body.sources, body.excludes,
                                                          body.versions)
     except ValueError as err:
@@ -892,7 +962,9 @@ async def configuration_preview(body: ImportRequest, request: Request):
 @router.post("/configuration/import")
 async def configuration_import(body: ImportRequest, request: Request):
     try:
-        return await apply_config(_ctx(request).engine, body)
+        engine = _ctx(request).engine
+        async with engine.file_changes.normal():
+            return await apply_config(engine, body)
     except (ValueError, sqlite3.IntegrityError) as err:
         raise HTTPException(400, str(err)) from None
 
@@ -909,6 +981,7 @@ async def get_settings(request: Request):
         "values": c.store.current.model_dump(),
         "schema": Settings.model_json_schema()["properties"],
         "effective": _effective(c),
+        "output_sync": await output_sync.view(c.db),
     }
 
 
@@ -922,12 +995,13 @@ async def put_settings(patch: dict, request: Request):
         except ValueError as e:
             raise HTTPException(422, f"archive_dir：{e}") from None  # 「字段：原因」，设置页按字段标出来
     try:
-        new = await c.store.update(patch)
+        async with c.engine.file_changes.normal():
+            new = await c.store.update(patch)
     except ValidationError as err:
         msgs = [f"{'.'.join(str(x) for x in e['loc'])}：{e['msg']}" for e in err.errors()]
         raise HTTPException(422, "；".join(msgs)) from None
     c.engine.notify()
-    return {"values": new.model_dump(), "effective": _effective(c)}
+    return {"values": new.model_dump(), "effective": _effective(c), "output_sync": await output_sync.view(c.db)}
 
 
 def _line_specs(site) -> list[dict]:

@@ -18,7 +18,6 @@ import {
 } from "lucide-react";
 import { type ReactNode, useEffect, useMemo, useState } from "react";
 import { Pager, streamState } from "@/components/common";
-import { ask } from "@/components/confirm";
 import { FacetSelect, facetName, rememberFacet, useFacetNames } from "@/components/facet-select";
 import { playVideo } from "@/components/player";
 import { Button } from "@/components/ui/button";
@@ -26,6 +25,9 @@ import { Chip, Code, EmptyRow, Panel, Table, Td, Th } from "@/components/ui/data
 import { Field, Input, Segmented, Select } from "@/components/ui/form";
 import { Menu, MenuContent, MenuItem, MenuLabel, MenuSeparator, MenuTrigger } from "@/components/ui/overlay";
 import { openDetail } from "@/components/video-detail";
+import { OperationPreview, type OperationRequest } from "@/components/operation-preview";
+import { Dialog, DialogContent } from "@/components/ui/overlay";
+import { selectionFilter } from "@/lib/video-selection";
 import { api, type FacetField, type Page, type Video, qs } from "@/lib/api";
 import { fmtClockDur } from "@/lib/format";
 import { subtitleTag } from "@/lib/labels";
@@ -129,7 +131,9 @@ export default function Videos() {
   const items = data?.items ?? [];
 
   const [selected, setSelected] = useState<Set<number>>(new Set());
-  useEffect(() => setSelected(new Set()), [apiQuery]);
+  const [allMatching,setAllMatching] = useState(false);
+  const selectionQuery = JSON.stringify(selectionFilter(apiQuery));
+  useEffect(() => {setSelected(new Set());setAllMatching(false);}, [selectionQuery]);
   const toggle = (id: number) =>
     setSelected(prev => {
       const next = new Set(prev);
@@ -208,7 +212,8 @@ export default function Videos() {
 
       <ActiveFilters params={params} update={update} libraries={libraries} siteLabel={meta.label} />
 
-      {selected.size > 0 && <BatchBar ids={[...selected]} onDone={() => setSelected(new Set())} />}
+      <Button size="sm" disabled={isFetching || isError || !data?.total} onClick={()=>setAllMatching(true)}>按当前筛选的全部 {data?.total ?? 0} 部批量处理</Button>
+      {(selected.size > 0 || allMatching) && <BatchBar ids={[...selected]} filter={selectionFilter(apiQuery)} allMatching={allMatching} total={data?.total ?? 0} onDone={() => {setSelected(new Set());setAllMatching(false);}} />}
 
       {isError && <p className="text-sm text-err">加载失败：{(error as Error).message}</p>}
 
@@ -222,7 +227,7 @@ export default function Videos() {
                     type="checkbox"
                     aria-label="选中本页"
                     checked={allOnPage}
-                    onChange={() => setSelected(allOnPage ? new Set() : new Set(items.map(v => v.id)))}
+                    onChange={() => setSelected(prev=>{const next=new Set(prev);items.forEach(v=>allOnPage ? next.delete(v.id) : next.add(v.id));return next;})}
                   />
                 </Th>
                 <Th className="w-[104px]" />
@@ -427,45 +432,38 @@ function ActiveFilters({
   );
 }
 
-function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
-  const run = useRun();
+function BatchBar({ ids, onDone,filter,allMatching,total }: { ids: number[]; onDone: () => void;filter:Record<string,unknown>;allMatching:boolean;total:number }) {
   const qc = useQueryClient();
   const { data: libraries = [] } = useLibraries();
   const meta = useMeta();
-  const batch = async (body: Record<string, unknown>, success: (r: Record<string, number>) => string) => {
-    const r = await run(() => api.post<Record<string, number>>("/api/videos/batch", { ids, ...body }), {
-      success,
-      invalidate: [["status"], ["jobs"], ["libraries"]],
-    });
-    if (r) {
-      qc.invalidateQueries({ queryKey: ["videos"] });
-      onDone();
-    }
+  const [operation,setOperation] = useState<OperationRequest|null>(null);
+  const batch = (body: Record<string, unknown>) => {
+    setOperation({kind:"selection",payload:{...body,ids:allMatching ? null : ids,query:allMatching ? filter : {}}});
   };
   return (
     <div className="sticky top-14 z-20 flex flex-wrap items-center gap-2 rounded-lg border border-accent/40 bg-panel px-3 py-2 shadow-[0_8px_24px_-12px_rgb(0_0_0/0.3)]">
       <span className="text-sm">
-        已选 <b>{ids.length}</b> 部
+        {allMatching ? "当前筛选全部" : "跨页已选"} <b>{allMatching ? total : ids.length}</b> 部
       </span>
       <div className="mx-1 h-4 w-px bg-line" />
-      <Button size="sm" onClick={() => batch({ action: "probe" }, r => `已创建补源任务 #${r.job_id}，到各站按番号找`)}>
+      <Button size="sm" onClick={() => batch({ action: "probe" })}>
         <Search />
         查找其他源
       </Button>
-      <Button size="sm" onClick={() => batch({ action: "refresh" }, r => `已创建刷新任务 #${r.job_id}`)}>
+      <Button size="sm" onClick={() => batch({ action: "refresh" })}>
         <RefreshCw />
         刷新详情
       </Button>
       <Menu>
         <MenuTrigger asChild>
-          <Button size="sm">
+            <Button size="sm">
             <FolderPlus />
             加入输出库
           </Button>
         </MenuTrigger>
         <MenuContent align="start">
           {libraries.map(l => (
-            <MenuItem key={l.id} onSelect={() => batch({ action: "add", library_id: l.id }, r => `已排队加入「${l.name}」，任务 #${r.job_id}`)}>
+            <MenuItem key={l.id} onSelect={() => batch({ action: "add", library_id: l.id })}>
               {l.name}
             </MenuItem>
           ))}
@@ -473,8 +471,8 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
       </Menu>
       <Menu>
         <MenuTrigger asChild>
-          <Button size="sm">
-            <FolderMinus />
+            <Button size="sm" disabled={allMatching} title={allMatching ? "移出输出库请显式选择影片" : undefined}>
+              <FolderMinus />
             移出输出库
           </Button>
         </MenuTrigger>
@@ -482,16 +480,7 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
           {libraries.map(l => (
             <MenuItem
               key={l.id}
-              onSelect={async () => {
-                const ok = await ask(
-                  `把选中的 ${ids.length} 部移出「${l.name}」？`,
-                  l.external_dir
-                    ? "会删掉它们在这个库里的 strm，外部工具整理好的目录（nfo、图片）移进回收区。"
-                    : "会删掉它们在这个库里的 strm、nfo 和封面。规则库、有来源库的库之后会按规则把符合的再加回来。",
-                  { confirmText: "移出并删除文件", danger: true },
-                );
-                if (ok) batch({ action: "remove", library_id: l.id }, r => `已排队从「${l.name}」移出，任务 #${r.job_id}`);
-              }}
+              onSelect={() => batch({ action: "remove", library_id: l.id })}
             >
               {l.name}
             </MenuItem>
@@ -500,8 +489,8 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
       </Menu>
       <Menu>
         <MenuTrigger asChild>
-          <Button size="sm">
-            <Trash2 />
+            <Button size="sm" disabled={allMatching} title={allMatching ? "删除源请显式选择影片" : undefined}>
+              <Trash2 />
             删除源
           </Button>
         </MenuTrigger>
@@ -511,29 +500,25 @@ function BatchBar({ ids, onDone }: { ids: number[]; onDone: () => void }) {
             <MenuItem
               key={site}
               danger
-              onSelect={async () => {
-                const ok = await ask(
-                  `删掉选中的 ${ids.length} 部在 ${m.label} 的源？`,
-                  <>
-                    <p>只删这几部影片在 {m.label} 上的这个源，{m.label} 的其他影片和订阅不受影响。以后订阅、补源再抓到它们也不再使用这个源。</p>
-                    <p>删完没有别的可用源的影片，从所有输出库移出：删掉 strm，外部整理库里整理好的目录移进回收区，不再刮削。以后别的站点抓到这部片，会按订阅自动回来。</p>
-                    <p className="text-muted">删错了可以筛「已删源」，选中后用「恢复删掉的源」放回原来的输出库。</p>
-                  </>,
-                  { confirmText: "删除源", danger: true },
-                );
-                if (ok) batch({ action: "remove_source", sites: [site] }, r => `已排队删掉 ${m.label} 的源，任务 #${r.job_id}`);
-              }}
+              onSelect={() => batch({ action: "remove_source", sites: [site] })}
             >
               {m.label}
             </MenuItem>
           ))}
           <MenuSeparator />
-          <MenuItem onSelect={() => batch({ action: "restore_source" }, r => `已排队恢复删掉的源，任务 #${r.job_id}`)}>恢复删掉的源</MenuItem>
+          <MenuItem onSelect={() => batch({ action: "restore_source" })}>恢复删掉的源</MenuItem>
         </MenuContent>
       </Menu>
       <Button size="sm" variant="quiet" className="ml-auto" onClick={onDone}>
         取消选择
       </Button>
+      <Dialog open={!!operation} onOpenChange={open=>!open && setOperation(null)}>
+        <DialogContent title="确认批量处理范围" className="max-w-3xl" footer={<Button onClick={()=>setOperation(null)}>关闭</Button>}>
+          {operation?.payload.action==="remove" && <p className="text-sm text-warn">移出会删除本服务输出；外部整理库的独占目录移进回收区。规则或来源库以后可能把符合条件的影片重新加入。</p>}
+          {operation?.payload.action==="remove_source" && <p className="text-sm text-warn">删除后不会自动重新使用该站源。没有其他可用源的影片会移出输出库，文件归档；可通过“恢复删掉的源”恢复。</p>}
+          {operation && <OperationPreview request={operation} onApplied={()=>{setOperation(null);[["videos"],["jobs"],["libraries"],["status"]].forEach(queryKey=>qc.invalidateQueries({queryKey}));onDone();}} />}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

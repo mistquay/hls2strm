@@ -30,6 +30,7 @@ from urllib.parse import urljoin
 from weakref import WeakValueDictionary
 
 from . import archive
+from .file_changes import guarded
 from .codes import work_slug
 from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
@@ -85,7 +86,12 @@ class Engine:
         metrics: Metrics,
         boot: BootConfig,
     ) -> None:
+        from .file_changes import FileChanges
+        self.file_changes = FileChanges()
+        self.request_lock = asyncio.Lock()
         self.db = db
+        from .operations import Operations
+        self.operations = Operations(self)
         self.fetcher = fetcher
         self.writer = writer
         self.store = store
@@ -244,6 +250,7 @@ class Engine:
             await self._run_task(task)
 
     async def _run_task(self, task: dict) -> None:
+        from .operations import ScopeChanged
         tid = task["id"]
         t0 = time.monotonic()
         finished = False
@@ -264,9 +271,10 @@ class Engine:
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
                        "locate": self.strm.do_locate, "quality": self._do_quality, "prepare": self._do_prepare,
                        "membership": self._do_membership, "tidy": self.strm.do_tidy,
-                       "source_remove": self._do_source_remove, "source_restore": self._do_source_restore}[task["kind"]]
-            await handler(job, task)
-            await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000))
+                       "source_remove": self._do_source_remove, "source_restore": self._do_source_restore,
+                       "preview":self.operations.preview,"apply_preview":self.operations.apply,"selection_prepare":self.operations.selected}[task["kind"]]
+            result = await handler(job, task)
+            await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000), result=result if isinstance(result,dict) else None)
             log.info("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
             self.metrics.inc(f"task_{task['kind']}_done")
             finished = True
@@ -297,6 +305,9 @@ class Engine:
             await self.db.finish_task(tid, "failed", f"解析失败：{e}" + (f"（快照 {snap}）" if snap else ""))
             self.metrics.inc("task_failed")
             log.error("%s %s 解析失败：%s %s", task["kind"], task["target"], e, snap or "")
+            finished = True
+        except ScopeChanged as e:
+            await self.db.finish_task(tid,"failed",str(e))
             finished = True
         except Exception as e:
             finished = await self._retry_or_fail(task, e)
@@ -352,6 +363,8 @@ class Engine:
         job = await self.db.get_job(job_id)
         if job is None or job["status"] != "running":
             return
+        if await self.db._one("SELECT 1 FROM operation_requests WHERE job_id=? AND ready=0",(job_id,)):
+            return
         if await self.db.has_open_tasks(job_id):
             await self._log_progress(job)
             return
@@ -368,6 +381,8 @@ class Engine:
             if not state["list_complete"]:
                 state["partial_failure"] = True
         await self.db.update_job(job_id, status="done", finished_at=finished, state=state)
+        from . import output_sync
+        await output_sync.finish(self.db,await self.db.get_job(job_id))
         self._progress_at.pop(job_id, None)
         self._settle_wanted = True
         p = job["params"]
@@ -405,6 +420,7 @@ class Engine:
             raise ValueError(f"输出库 #{library_id} 不存在")
         return lib
 
+    @guarded
     async def _output_one(self, v: dict, library_id: int, *, cover: bool, old_strm: str | None = None,
                           settle: bool = False, versions: bool | None = None) -> None:
         from .runtime import stage
@@ -421,6 +437,8 @@ class Engine:
         if current is None or current["status"] == "removed":
             return
         lib = self._library(library_id)
+        if lib.get("operation_pending") and self.file_changes.owner is not asyncio.current_task():
+            raise ValueError(f"输出库有待处理变更，先查看任务 #{lib['operation_job_id']}")
         if old_strm is None:
             out = await self.db.get_output(v["id"], library_id)
             old_strm = out["strm_path"] if out else ""
@@ -543,6 +561,7 @@ class Engine:
             log.info("多画质版本 %s（%s）：写 %d 个、删 %d 个，现有 %s", v["slug"], lib["name"], wrote, removed,
                      "、".join(labels) or "无")
 
+    @guarded
     async def _quality_changed(self, source_id: int) -> None:
         """某个源的各档画质变了：开了多画质版本的库里，这部片的版本文件跟着改。"""
         src = await self.db.get_source(source_id)
@@ -577,11 +596,14 @@ class Engine:
         vid = await self.db.upsert_detail(site.name, d, self._slug_for(site, d.key, d.code, d.uncensored), self._rank)
         return await self.db.get_video_by_id(vid)
 
+    @guarded
     async def _do_list(self, job: dict, task: dict) -> None:
         p = job["params"]
         site = get_site(p.get("site", "jable"))
         lib_id = p.get("library_id") or DEFAULT_LIBRARY_ID
         lib = self._library(lib_id)
+        if lib.get("operation_pending"):
+            raise ValueError(f"先处理输出库变更任务 #{lib['operation_job_id']}")
         page = int(task["target"])
         url = site.page_url(p["source"], page, p.get("sort", ""), p.get("block_id"))
         pg = await self.fetcher.site(site.name).get_page(url)
@@ -675,6 +697,7 @@ class Engine:
                 return
         await self.fetch_detail(task["site"] or "jable", task["target"], library_id=job["params"].get("library_id"), job_id=job["id"])
 
+    @guarded
     async def fetch_detail(self, site_name: str, key: str, *, library_id: int | None = None,
                             priority: bool = False, job_id: int | None = None) -> dict:
         """抓某个源的详情、合并作品元数据；library_id 不为空时把作品加入该库。作品所在的每个库都会重写输出。"""
@@ -716,8 +739,12 @@ class Engine:
 
     async def _do_probe(self, job: dict, task: dict) -> None:
         site, _, vid = task["target"].partition(":")
-        await self.probe_work(int(vid), site)
+        if any(s["site"]==site for s in await self.db.get_sources(int(vid))):
+            return {"skipped":1}
+        found = await self.probe_work(int(vid), site)
+        return {"sources_added":found,"not_found":int(found==0)}
 
+    @guarded
     async def probe_work(self, video_id: int, site_name: str) -> int:
         """补源：按番号到这个站找这部作品，找到就加成源（同一部片的中字版也一起加）。返回新加的源数。
 
@@ -734,6 +761,7 @@ class Engine:
         found = await self._lookup(site, v, notes)
         return await self._attach_found(v, site, found, "补源", _lookup_text(notes, t0))
 
+    @guarded
     async def _attach_found(self, v: dict, site: Site, found: list[SourceItem | SourceDetail], how: str,
                             detail: str) -> int:
         """把按番号找到的结果挂成作品的源（同一部片的中字版也一起加），重写输出。返回新加的源数。
@@ -875,6 +903,7 @@ class Engine:
         return await self.create_videos(items, library_id=None,
                                         name=f"刷新详情：选中的 {len(have)} 部（{len(items)} 个源）")
 
+    @guarded
     async def add_to_library(self, video_ids: list[int], library_id: int) -> int:
         """选中的影片加入输出库（写 strm，有详情的带 nfo 和封面）。已在库里、在排除库里的跳过，返回新加入数。"""
         lib = self._library(library_id)
@@ -899,24 +928,34 @@ class Engine:
         self.notify()
         return job
 
+    @guarded
     async def _do_membership(self, job: dict, task: dict) -> None:
         library_id, video_id = job["params"]["library_id"], int(task["target"])
+        pending_lib = self._library(library_id)
+        if pending_lib.get("operation_pending") and self.file_changes.owner is not asyncio.current_task():
+            raise ValueError(f"先处理输出库变更任务 #{pending_lib['operation_job_id']}")
+        if job["params"].get("preview_id"):
+            await self.operations.check_retirement_item(job["params"]["preview_id"],video_id)
         if job["params"]["remove"]:
-            await self.remove_from_library([video_id], library_id)
-            return
+            removed = await self.remove_from_library([video_id], library_id)
+            return {"removed":removed,"skipped":int(not removed)}
         lib = self._library(library_id)
         video = await self.db.get_video_by_id(video_id)
         if video is None or video["status"] != "active" or await self.db.in_libraries(video_id, lib["excludes"]):
-            return
+            return {"skipped":1}
         old = await self.db.get_output(video_id, library_id)
         await self.db.ensure_output(video_id, library_id)
         if old is None or not old["strm_path"]:
             await self._output_one(video, library_id, cover=False)
         await self._queue_covers(job["id"], video)
+        return {"added":int(old is None),"already_exists":int(old is not None)}
 
+    @guarded
     async def remove_from_library(self, video_ids: list[int], library_id: int) -> int:
         """选中的影片移出输出库并删掉文件（外部整理库只删 strm）。规则库、来源库之后会按规则再把符合的加回来。"""
         lib = self._library(library_id)
+        if lib.get("operation_pending") and self.file_changes.owner is not asyncio.current_task():
+            raise ValueError(f"先处理输出库变更任务 #{lib['operation_job_id']}")
         removed = 0
         for vid in dict.fromkeys(video_ids):
             out = await self.db.get_output(vid, library_id)
@@ -946,11 +985,17 @@ class Engine:
         self.notify()
         return job
 
+    @guarded
     async def _do_source_remove(self, job: dict, task: dict) -> None:
+        if job["params"].get("preview_id"):
+            await self.operations.check_retirement_item(job["params"]["preview_id"],int(task["target"]))
         await self.remove_sources(int(task["target"]), job["params"]["sites"])
 
+    @guarded
     async def _do_source_restore(self, job: dict, task: dict) -> None:
         video_id = int(task["target"])
+        if job["params"].get("preview_id"):
+            await self.operations.check_retirement_item(job["params"]["preview_id"],video_id)
         if (await self.restore_sources(video_id, job["params"].get("sites"))
                 and (v := await self.db.get_video_by_id(video_id))):
             await self._queue_covers(job["id"], v)
@@ -960,6 +1005,7 @@ class Engine:
         lines = await self.db.lines_for([s["id"] for s in sources])
         return [s for s in sources if eligible(s, self.store.current, lines.get(s["id"], []))]
 
+    @guarded
     async def remove_sources(self, video_id: int, sites: list[str]) -> bool:
         """删掉影片在这些站点的源（以后列表、详情、补源再抓到也不用）。删完没有能用的源了（别的源所在站点停用、
         没有启用的线路也算没有），影片从所有输出库移出，文件搬进归档目录，记下移出了哪些库，恢复时搬回去。
@@ -974,6 +1020,8 @@ class Engine:
         if v is None:
             return False
         outputs = await self.db.get_outputs(video_id)
+        if self.file_changes.owner is not asyncio.current_task() and any(self.libs.get(out["library_id"],{}).get("operation_pending") for out in outputs):
+            raise ValueError("影片所在输出库有待处理变更，先完成或重新预览该变更")
         if outputs:
             self.archive_root()  # 归档目录不能用时先别动
         usable = [s["id"] for s in await self._usable(await self.db.get_sources(video_id)) if s["site"] not in sites]
@@ -990,6 +1038,7 @@ class Engine:
                  "「" + "」「".join(o["library_name"] for o in outputs) + "」" if outputs else "（本来就不在输出库里）")
         return True
 
+    @guarded
     async def restore_sources(self, video_id: int, sites: list[str] | None = None) -> int:
         """恢复影片删掉的源（sites 给了只恢复这些站点的）。影片因此有了能用的源时，放回删源时所在的输出库
         （已经在排除库里的不放）：归档的文件搬回原处，再按现在的设置改一遍 strm 内容；搬不回来的重新写 strm，
@@ -1083,6 +1132,7 @@ class Engine:
 
     # ---- 核对输出 ----
 
+    @guarded
     async def restore_lost(self, v: dict, lib: dict, *, force: bool = False) -> str:
         """记录的 strm 不在了，补回或找回。返回 rewritten（重新写了）/ relocated（外部工具挪走了，已更新路径）/
         missing（外部整理库找不到，按设置不补）/ absent、empty（外部整理目录不存在、是空的，没补）。
@@ -1231,11 +1281,14 @@ class Engine:
         self.notify()
         return job_id
 
+    @guarded
     async def apply_rules(self, v: dict, only_library: int | None = None, *, cover: bool = True) -> tuple[int, int]:
         """按规则库调整影片归属：命中就加入（via=rule），不再命中就移除规则加入的输出。返回 (加入, 移除)。"""
         added = removed = 0
         for lib in list(self.libs.values()):
             if not lib["rule"] or (only_library and lib["id"] != only_library):
+                continue
+            if lib.get("operation_pending") and self.file_changes.owner is not asyncio.current_task():
                 continue
             should = (v["status"] == "active" and match_rule(lib["rule"], v)
                       and not await self.db.in_libraries(v["id"], lib["excludes"]))
@@ -1270,6 +1323,7 @@ class Engine:
 
     # ---- 来源库 / 排除库 ----
 
+    @guarded
     async def settle(self) -> dict:
         """归并：按来源库、排除库调整各库的影片，只在本地，不联网。返回 {移除, 归入, 写入}，没有相关库时为空。
 
@@ -1281,7 +1335,7 @@ class Engine:
             self._settle_wanted = False
             self._settled_at = time.time()
             linked = await self.db.libraries_with_source_outputs()
-            libs = [lib for lib in self._dependency_order() if lib["sources"] or lib["excludes"] or lib["id"] in linked]
+            libs = [lib for lib in self._dependency_order() if not lib.get("operation_pending") and (lib["sources"] or lib["excludes"] or lib["id"] in linked)]
             if not libs:
                 return {}
             sub_cutoffs = await self._subscription_cutoffs()
@@ -1401,6 +1455,7 @@ class Engine:
         self.notify()
         return job_id
 
+    @guarded
     async def _do_purge(self, job: dict, task: dict) -> None:
         lib_id = int(task["target"])
         lib = await self.db.get_library(lib_id)
@@ -1683,9 +1738,16 @@ class Engine:
             await self.db.save_health(self.resolver.health.dump())
 
     async def create_rewrite(self, library_id: int | None = None) -> int:
+        from . import output_sync
         name = f"重写输出：{self._library(library_id)['name']}" if library_id else "重写全部输出"
-        job_id = await self.db.create_job("rewrite", name, {"library_id": library_id})
+        sync = await output_sync.view(self.db) if library_id is None else None
+        params = {"library_id": library_id}
+        if sync:
+            params["sync_revision"] = sync["revision"]
+        job_id = await self.db.create_job("rewrite", name, params)
         await self.db.add_tasks(job_id, "rewrite", ["all"], PRIORITY_USER)
+        if sync:
+            await output_sync.attach(self.db,sync["revision"],job_id)
         log.info("新建任务 #%d「%s」", job_id, name)
         self.notify()
         return job_id
@@ -1748,9 +1810,10 @@ class Engine:
                     raise ValueError(f"目录和输出库「{other['name']}」（{o}）重叠，各库的目录、外部整理目录不能互相嵌套")
         return name, dir, template, external_dir
 
+    @guarded
     async def create_library(self, name: str, dir: str, path_template: str = "", rule: dict | None = None,
                              external_dir: str = "", sources: list[int] = (), excludes: list[int] = (),
-                             versions: str = "") -> dict:
+                              versions: str = "", *, queue: bool = True) -> dict:
         """新建输出库；带规则、来源库或排除库时自动排一个重新归库任务。"""
         name, dir, template, external_dir = self._check_library(name, dir, path_template, external_dir)
         sources, excludes = self._check_links(None, list(sources), list(excludes))
@@ -1762,7 +1825,7 @@ class Engine:
         log.info("新建输出库「%s」：%s%s%s%s", name, self.writer.library_root(lib),
                  f"，外部整理到 {self.writer.external_root(lib)}" if external_dir else "",
                  f"，规则 {describe_rule(rule)}" if rule else "", self.describe_links(lib))
-        reclassify = rule or sources or excludes
+        reclassify = queue and (rule or sources or excludes)
         return {"id": lib_id, "reclassify_job_id": await self.create_reclassify(lib_id) if reclassify else None}
 
     def describe_links(self, lib: dict) -> str:
@@ -1770,9 +1833,10 @@ class Engine:
         return (f"，来源 {names['sources']}" if names["sources"] else "") + (
             f"，排除 {names['excludes']}" if names["excludes"] else "")
 
+    @guarded
     async def update_library(self, lib_id: int, name: str, dir: str, path_template: str = "",
                              rule: dict | None = None, external_dir: str = "", sources: list[int] = (),
-                             excludes: list[int] = (), versions: str = "") -> dict:
+                              excludes: list[int] = (), versions: str = "", *, queue: bool = True) -> dict:
         """修改输出库：目录或模板变了排重写任务搬文件，多画质版本改了也排重写（写上或清掉版本文件），
         规则变了排重新归库任务。
 
@@ -1787,6 +1851,8 @@ class Engine:
                                      external_dir=external_dir, sources=sources, excludes=excludes, versions=versions)
         await self.reload_libraries()
         jobs = {"rewrite_job_id": None, "reclassify_job_id": None, "locate_job_id": None}
+        if not queue:
+            return jobs
         if ((dir, template) != (old["dir"], old["path_template"]) and not external_dir) or versions != old["versions"]:
             jobs["rewrite_job_id"] = await self.create_rewrite(lib_id)
         if external_dir and external_dir != old["external_dir"]:
@@ -1795,6 +1861,7 @@ class Engine:
             jobs["reclassify_job_id"] = await self.create_reclassify(lib_id)
         return jobs
 
+    @guarded
     async def delete_library(self, lib_id: int, delete_files: bool) -> int:
         lib = self._library(lib_id)
         if lib_id == DEFAULT_LIBRARY_ID:
@@ -1861,6 +1928,8 @@ class Engine:
 
     async def _housekeep(self) -> None:
         """外部整理库：删掉回收区里放满天数的；开了自动清理残留时，每天排一次清理残留任务。"""
+        from .play_history import PlaybackHistory
+        await PlaybackHistory(self.db,self.store).cleanup()
         days = self.store.current.trash_days
         external = [lib for lib in list(self.libs.values()) if lib["external_dir"]]
         for lib in external:

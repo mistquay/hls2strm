@@ -4,6 +4,10 @@ import type { Tone } from "@/components/ui/data";
 import type { JobStatus, TaskStatus } from "./api";
 
 export const KIND_NAMES: Record<string, string> = {
+  preview:"影响预览",
+  operation_apply:"执行确认变更",
+  apply_preview:"复核并执行变更",
+  selection_prepare:"按固定范围分批入队",
   list: "列表页",
   detail: "详情页",
   rewrite: "重写输出",

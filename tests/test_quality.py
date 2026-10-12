@@ -182,7 +182,7 @@ def test_resolve_modes_for_gateway(tmp_path):
             assert c.put("/api/settings", json={"resolve_proxy_url": "https://pub.example/"}).status_code == 200
             relay = "https://pub.example/play/ipzz-983.m3u8?proxy=1"
             assert c.get("/api/resolve/ipzz-983", headers=h).json()["url"].endswith("/62384.m3u8")  # auto：Jable 能直连
-            assert c.get("/api/resolve/ipzz-983", headers=h, params={"mode": "proxy"}).json()["url"] == relay
+            assert c.get("/api/resolve/ipzz-983", headers=h, params={"mode": "proxy"}).json()["url"].split("&ph=")[0] == relay
 
             # 地址过期、详情页又抓不到：直连的源取地址失败，给中转地址（网关回退会把内网地址给外网客户端）
             db = app.state.ctx.db
@@ -194,7 +194,7 @@ def test_resolve_modes_for_gateway(tmp_path):
             c.portal.call(expire)
             for mode in ("auto", "redirect"):
                 r = c.get("/api/resolve/ipzz-983", headers=h, params={"mode": mode})
-                assert r.status_code == 200 and r.json()["url"] == relay
+                assert r.status_code == 200 and r.json()["url"].split("&ph=")[0] == relay
             assert c.put("/api/settings", json={"resolve_proxy_url": ""}).status_code == 200
             assert c.get("/api/resolve/ipzz-983", headers=h).status_code == 502
     finally:
@@ -221,7 +221,7 @@ def test_resolve_relay_via_gateway(tmp_path):
                 return r.json()
 
             data = get(relay="gateway", mode="proxy")
-            assert (data["relay"], data["url"]) == (True, "http://testserver/play/ipzz-983.m3u8?proxy=1&t=pk")
+            assert (data["relay"], data["url"].split("&ph=")[0]) == (True, "http://testserver/play/ipzz-983.m3u8?proxy=1&t=pk")
             data = get(relay="gateway", ua="Infuse/7.8")
             assert data["relay"] is False and data["url"].endswith("/62384.m3u8")  # Jable 能直连：照样 302 到 CDN
             assert get(relay="gateway", ua="Lavf/61.7")["relay"] is True  # Jable 的 CDN 拒绝 Lavf
@@ -229,7 +229,7 @@ def test_resolve_relay_via_gateway(tmp_path):
             assert get(relay="gateway", ua="Mozilla/5.0", fetch_mode="cors")["relay"] is True
             data = c.get("/api/resolve/play/ipzz-983@480p.m3u8", headers=h,
                          params={"relay": "gateway", "mode": "proxy"}).json()
-            assert data["url"] == "http://testserver/play/ipzz-983@480p.m3u8?proxy=1&t=pk"
+            assert data["url"].split("&ph=")[0] == "http://testserver/play/ipzz-983@480p.m3u8?proxy=1&t=pk"
             # 没有中转可用：照旧给 CDN 地址（只记日志）
             data = get(ua="Lavf/61.7")
             assert data["relay"] is False and data["url"].endswith("/62384.m3u8")

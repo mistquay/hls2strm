@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 from collections.abc import Callable
@@ -185,6 +186,10 @@ class Settings(BaseModel):
         description="redirect 模式下，User-Agent 含这些片段的客户端改走本服务中转（CDN 会拒绝它们，如 ffmpeg 默认的 Lavf）",
     )
     play_token: str = Field("", description="播放地址访问令牌；设置后 strm 地址带 ?t=令牌")
+    play_history_enabled: bool = Field(True, description="记录播放交付的影片、实际站点和中转/302；不记录 HEAD 探测与分片，不代表客户端完整观看")
+    play_history_days: int = Field(90, ge=0, description="播放记录保留天数；0 不按时间清理，仍受最大条数限制")
+    play_history_max_entries: int = Field(100000, ge=0, description="播放记录最多保留条数，定期清理最早记录；0 不按条数清理")
+    play_history_pending: int = Field(2048, ge=1, description="播放记录待写入队列容量，重启生效；队列满时跳过记录并写日志，避免阻塞播放")
     resolve_token: str = Field(
         "", description="供 embyGateway 等调用 /api/resolve 的令牌（Bearer）；留空则不开放该接口"
     )
@@ -336,6 +341,7 @@ class SettingsStore:
         self.boot = boot
         self._db = db
         self.current = Settings()
+        self._update_lock = asyncio.Lock()
         self._listeners: list[Callable[[Settings, Settings], None]] = []
 
     async def load(self) -> None:
@@ -347,13 +353,23 @@ class SettingsStore:
 
     async def update(self, patch: dict) -> Settings:
         """改设置；sites 按站点、按字段合并，只传改动的部分就行。"""
+        async with self._update_lock:
+            return await self._update(patch)
+
+    async def _update(self, patch: dict) -> Settings:
         data = self.current.model_dump()
         patch = dict(patch)
         for name, cfg in (patch.pop("sites", None) or {}).items():
             data["sites"][name] = {**data["sites"].get(name, {}), **cfg}
         new = Settings.model_validate({**data, **patch})
-        old, self.current = self.current, new
-        await self._db.set_setting("settings", new.model_dump_json())
+        from . import output_sync
+        old = self.current
+        sync = await output_sync.changed(self._db, old, new)
+        async with self._db._tx(invalidate=False) as conn:
+            await conn.execute("INSERT INTO settings(key,value) VALUES('settings',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (new.model_dump_json(),))
+            if sync:
+                await conn.execute("INSERT INTO settings(key,value) VALUES('output_sync',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(sync),))
+        self.current = new
         for fn in self._listeners:
             fn(old, new)
         return new

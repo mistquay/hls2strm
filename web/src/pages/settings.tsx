@@ -2,6 +2,8 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Save, Search, Undo2 } from "lucide-react";
 import { type ReactNode, useEffect, useRef, useState } from "react";
 import { Button } from "@/components/ui/button";
+import { QueryNotice } from "@/components/common";
+import { navigate } from "@/lib/route";
 import { useReorder } from "@/components/use-reorder";
 import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Select, Switch, Textarea } from "@/components/ui/form";
@@ -36,10 +38,12 @@ const GROUPS: { id: string; title: string; keys: string[]; note?: ReactNode }[] 
   { id: "gateway", title: "网关 /api/resolve", keys: ["resolve_token", "resolve_mode", "resolve_relay_ttl", "resolve_proxy_url"] },
   { id: "capacity", title: "连接与缓存", keys: ["play_connections", "background_connections", "hls_connections", "file_connections", "preflight_connections", "speed_connections", "pool_wait_timeout", "relay_buffer_kb", "playlist_cache_entries", "playlist_cache_seconds", "preflight_bytes", "preflight_cache_entries", "preflight_cache_seconds", "preflight_failure_cooldown", "source_failure_cooldown", "source_failure_cooldown_max", "play_session_entries", "play_session_hours"] },
   { id: "speed", title: "线路测速", keys: ["speed_test_bytes", "speed_test_timeout"] },
+  { id: "play-history", title: "播放记录", keys: ["play_history_enabled", "play_history_days", "play_history_max_entries", "play_history_pending"] },
   { id: "health", title: "连通性", keys: ["health_rank", "health_interval", "health_samples", "health_bytes", "health_slow_kbps"] },
 ];
 
 const LABELS: Record<string, string> = {
+  play_history_enabled:"记录播放交付",play_history_days:"播放记录保留天数",play_history_max_entries:"播放记录最大条数",play_history_pending:"播放记录待写入容量",
   play_remote: "按外部客户端处理普通播放",
   play_connections: "播放解析连接额度", background_connections: "后台抓取连接额度",
   hls_connections: "HLS 中转连接额度", file_connections: "文件中转连接额度",
@@ -101,7 +105,6 @@ const LABELS: Record<string, string> = {
   resolve_relay_ttl: "中转链接期限（秒）",
   resolve_proxy_url: "公网中转地址",
 };
-const REWRITE_KEYS = ["public_base_url", "play_mode", "play_token", "path_template", "output_dir", "write_nfo"];
 const SUBTITLE_NAMES: Record<string, string> = { zh: "中文字幕", none: "无字幕", en: "英文字幕" };
 const ENUM_NAMES: Record<string, Record<string, string>> = { play_mode: PLAY_MODES, resolve_mode: RESOLVE_MODES, variant_mode: VARIANT_MODES };
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
@@ -136,19 +139,22 @@ export default function Settings() {
   const qc = useQueryClient();
   const run = useRun();
   const meta = useMeta();
-  const { data } = useQuery({ queryKey: ["settings"], queryFn: ({ signal }) => api.get<SettingsResponse>("/api/settings", signal), staleTime: Infinity });
+  const settingsQuery = useQuery({ queryKey: ["settings"], queryFn: ({ signal }) => api.get<SettingsResponse>("/api/settings", signal), staleTime: Infinity,
+    refetchInterval:q=>q.state.data?.output_sync?.job_id && ["running","paused"].includes(q.state.data.output_sync.status) ? 3000 : false });
+  const data = settingsQuery.data;
   const [draft, setDraft] = useState<SettingsValues | null>(null);
   const [restored, setRestored] = useState(false);
-  const [needRewrite, setNeedRewrite] = useState(false);
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [q, setQ] = useState("");
   const latest = useRef<{ draft: SettingsValues | null; values: SettingsValues | null }>({ draft: null, values: null });
   useEffect(() => {
     if (!data) return;
     setRestored(!!unsaved && !same(unsaved, data.values));
-    setDraft(clone(unsaved && !same(unsaved, data.values) ? unsaved : data.values));
+    const previous = latest.current;
+    const edits = previous.draft && previous.values ? Object.fromEntries(Object.keys(previous.draft).filter(k=>!same(previous.draft![k],previous.values![k])).map(k=>[k,previous.draft![k]])) : {};
+    setDraft(clone(unsaved && !same(unsaved, data.values) ? unsaved : {...data.values,...edits}));
     unsaved = null;
-  }, [data]);
+  }, [JSON.stringify(data?.values)]);
   latest.current = { draft, values: data?.values ?? null };
   const dirty = !!draft && !!data && !same(draft, data.values);
   useEffect(() => () => {
@@ -161,7 +167,7 @@ export default function Settings() {
     window.addEventListener("beforeunload", warn);
     return () => window.removeEventListener("beforeunload", warn);
   }, [dirty]);
-  if (!data || !draft) return <div className="py-20 text-center text-sm text-muted">加载中…</div>;
+  if (!data || !draft) return <QueryNotice query={settingsQuery} label="设置" />;
 
   const changed = Object.keys(draft).filter(k => !same(draft[k], data.values[k]));
   const set = (k: string, v: unknown) => {
@@ -185,7 +191,7 @@ export default function Settings() {
     const patch = Object.fromEntries(changed.map(k => [k, draft[k]]));
     const r = await run(async () => {
       try {
-        return await api.put<Pick<SettingsResponse, "values" | "effective">>("/api/settings", patch);
+        return await api.put<Pick<SettingsResponse, "values" | "effective" | "output_sync">>("/api/settings", patch);
       } catch (e) {
         const found = fieldErrors((e as Error).message);
         setErrors(found);
@@ -193,12 +199,11 @@ export default function Settings() {
         if (first) document.getElementById(`setting-${first}`)?.scrollIntoView({ behavior: "smooth", block: "center" });
         throw Object.keys(found).length ? new Error(Object.entries(found).map(([k, msg]) => `${label(k)}：${msg}`).join("；")) : e;
       }
-    }, { success: "设置已保存，马上生效", invalidate: [["status"], ["meta"]] });
+    }, { success: "服务设置已保存，已有输出的同步状态见下方", invalidate: [["status"], ["meta"]] });
     if (!r) return;
     setErrors({});
     setRestored(false);
-    qc.setQueryData<SettingsResponse>(["settings"], prev => (prev ? { ...prev, values: r.values, effective: r.effective } : prev));
-    if (changed.some(k => REWRITE_KEYS.includes(k))) setNeedRewrite(true);
+    qc.setQueryData<SettingsResponse>(["settings"], prev => (prev ? { ...prev, values: r.values, effective: r.effective, output_sync:r.output_sync } : prev));
   };
   const discard = () => {
     setDraft(clone(data.values));
@@ -219,11 +224,11 @@ export default function Settings() {
       </nav>
       <div className="space-y-4">
         <div className="sticky top-12 z-20 -mx-3 flex flex-wrap items-center gap-2 border-b border-line bg-bg/95 px-3 py-2.5 backdrop-blur sm:-mx-5 sm:px-5">
-          <Button variant="primary" onClick={save} disabled={!changed.length}>
+          <Button variant="primary" onClick={save} disabled={!changed.length || run.busy}>
             <Save />
             保存{changed.length ? `（${changed.length} 项改动）` : ""}
           </Button>
-          <Button onClick={discard} disabled={!changed.length}>
+          <Button onClick={discard} disabled={!changed.length || run.busy}>
             <Undo2 />
             放弃改动
           </Button>
@@ -240,18 +245,24 @@ export default function Settings() {
             接着上次没保存的 {changed.length} 项改动，确认后点「保存」。
           </Notice>
         )}
-        {needRewrite && (
+        <QueryNotice query={settingsQuery} label="设置" />
+        {data.output_sync && (
           <Notice
             actions={
-              <Button size="sm" variant="primary" onClick={() => rewriteAll(run).then(() => setNeedRewrite(false))}>
+              <>
+              {data.output_sync.job_id && <Button size="sm" onClick={()=>navigate("jobs",{job:String(data.output_sync!.job_id)})}>查看同步任务 #{data.output_sync.job_id}</Button>}
+              {!["running","paused","synced"].includes(data.output_sync.status) && <Button size="sm" variant="primary" disabled={run.busy} onClick={() => rewriteAll(run).then(() => qc.invalidateQueries({queryKey:["settings"]}))}>
                 重写全部输出
-              </Button>
+              </Button>}
+              </>
             }
           >
-            改了影响 strm 内容或位置的设置，已有的文件要按新设置重写。
+            <p>服务设置已保存 · {({pending:"已有输出待同步",running:"输出同步进行中",paused:"同步任务已暂停",cancelled:"同步已取消，已有输出仍待同步",partial_failure:"输出同步部分失败，请查看任务",synced:"已有输出同步完成"} as Record<string,string>)[data.output_sync.status]}</p>
+            <p className="mt-1 text-xs">影响：{data.output_sync.keys.map(label).join("、")}。普通库按模板更新或移动文件；外部整理库仅原地修改 STRM，找不到的文件按现有保护策略处理。</p>
           </Notice>
         )}
         {!groups.length && <div className="py-16 text-center text-sm text-muted">没有和「{q}」相关的设置</div>}
+        <fieldset disabled={run.busy} className="space-y-4">
         {groups.map(g => (
           <Panel key={g.id} id={`set-${g.id}`} title={g.title} bodyClassName="divide-y divide-line py-0" className="scroll-mt-28">
             {g.note && <p className="py-3 text-[13px] leading-relaxed text-muted">{g.note}</p>}
@@ -264,6 +275,7 @@ export default function Settings() {
             ))}
           </Panel>
         ))}
+        </fieldset>
       </div>
     </div>
   );

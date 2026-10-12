@@ -24,8 +24,9 @@ import aiosqlite
 from .codes import code_key
 from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
 from .cache import AsyncCache
-from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18
+from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18, migrate_v19 as _migrate_v19
 from .job_history import JobHistory, migrate_v13 as _migrate_v13
+from .play_history import migrate_v20 as _migrate_v20
 from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
 from .runtime import stage
 from .quality import TRUST, Quality, parse_heights
@@ -354,7 +355,7 @@ async def _migrate_v17(conn: aiosqlite.Connection) -> None:
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18]
+              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -1507,6 +1508,17 @@ class Database:
     # ---- job ----
 
     async def create_job(self, kind: str, name: str, params: dict, status: str = "running") -> int:
+        from .request_jobs import current_request
+        request = current_request.get()
+        if request:
+            key,fingerprint = request
+            async with self._tx(invalidate=False) as conn:
+                old = await self._one("SELECT job_id FROM operation_requests WHERE key=?",(key,))
+                if old:
+                    return old["job_id"]
+                cur = await conn.execute("INSERT INTO jobs(kind,name,params,status,created_at) VALUES(?,?,?,?,?)",(kind,name,json.dumps(params,ensure_ascii=False),status,now()))
+                await conn.execute("INSERT INTO operation_requests(key,digest,job_id) VALUES(?,?,?)",(key,fingerprint,cur.lastrowid))
+                return cur.lastrowid
         cur = await self._write(
             "INSERT INTO jobs(kind, name, params, status, created_at) VALUES(?, ?, ?, ?, ?)",
             (kind, name, json.dumps(params, ensure_ascii=False), status, now()),
@@ -1537,14 +1549,10 @@ class Database:
         "done": "status='done' AND COALESCE(json_extract(state, '$.partial_failure'), 0)=0",
     }
 
-    async def list_jobs(self, limit: int = 50, offset: int = 0, status: str = "", kind: str = "") -> list[dict]:
-        where, params = ["1=1"], []
-        if status in self.JOB_FILTERS:
-            where.append(self.JOB_FILTERS[status])
-        if kind:
-            where.append("kind=?")
-            params.append(kind)
-        rows = await self._all(f"SELECT * FROM jobs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ? OFFSET ?",
+    async def list_jobs(self, limit: int = 50, offset: int = 0, status: str = "", kind: str = "", q: str = "") -> list[dict]:
+        from .job_views import job_condition
+        where, params = job_condition(self, status, kind, q)
+        rows = await self._all(f"SELECT * FROM jobs WHERE {where} ORDER BY id DESC LIMIT ? OFFSET ?",
                                (*params, limit, offset), bulk=True)
         jobs = [_job_row(r) for r in rows]
         if jobs:
@@ -1566,6 +1574,8 @@ class Database:
             await self.conn.execute("DELETE FROM job_logs WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM crawl_items WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM scan_staging WHERE scan_id=?", (job_id,))
+            await self.conn.execute("DELETE FROM operation_items WHERE preview_id=?", (job_id,))
+            await self.conn.execute("DELETE FROM operation_requests WHERE job_id=?",(job_id,))
             await self.conn.execute("DELETE FROM tasks WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM jobs WHERE id=?", (job_id,))
 
@@ -1614,11 +1624,12 @@ class Database:
         duration_ms: int | None = None,
         next_run_at: int = 0,
         refund_attempt: bool = False,
+        result: dict | None = None,
     ) -> None:
         await self._write(
             """UPDATE tasks SET status=?, last_error=?, duration_ms=?, next_run_at=?,
-                      attempts=attempts-?, updated_at=? WHERE id=?""",
-            (status, error[:2000], duration_ms, next_run_at, int(refund_attempt), now(), task_id),
+                       attempts=attempts-?, updated_at=?, result=? WHERE id=?""",
+            (status, error[:2000], duration_ms, next_run_at, int(refund_attempt), now(), json.dumps(result or {}), task_id),
         )
 
     async def reset_running_tasks(self) -> int:

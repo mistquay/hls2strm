@@ -93,7 +93,7 @@ def test_play_and_resolve_versions(tmp_path):
             data = c.get("/api/resolve/play/ipzz-983@480p.m3u8", headers=auth).json()
             assert data["slug"] == "ipzz-983" and data["url"] == root + "480p/video.m3u8"
             data = c.get("/api/resolve/play/ipzz-983@480p.m3u8", headers=auth, params={"mode": "proxy"}).json()
-            assert data["url"] == "https://pub.example/play/ipzz-983@480p.m3u8?proxy=1"
+            assert data["url"].split("&ph=")[0] == "https://pub.example/play/ipzz-983@480p.m3u8?proxy=1"
     finally:
         for hd in logging.getLogger().handlers:
             hd.close()

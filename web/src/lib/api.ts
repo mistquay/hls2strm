@@ -13,12 +13,13 @@ export function setUnauthorizedHandler(fn: () => void) {
   onUnauthorized = fn;
 }
 
-async function req<T>(method: string, url: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+async function req<T>(method: string, url: string, body?: unknown, signal?: AbortSignal, requestKey?: string): Promise<T> {
   const init: RequestInit = { method, headers: {}, signal };
   if (body !== undefined) {
     init.headers = { "Content-Type": "application/json" };
     init.body = JSON.stringify(body);
   }
+  if (requestKey) init.headers = {...init.headers,"Idempotency-Key":requestKey};
   const r = await fetch(url, init);
   const text = await r.text();
   let data: unknown = null;
@@ -36,9 +37,25 @@ async function req<T>(method: string, url: string, body?: unknown, signal?: Abor
   return data as T;
 }
 
+const pendingPosts = new Map<string,Promise<unknown>>();
+const retryKeys = new Map<string,string>();
+function post<T>(url:string,body:unknown):Promise<T> {
+  const signature = JSON.stringify([url,body]);
+  const existing = pendingPosts.get(signature);
+  if (existing) return existing as Promise<T>;
+  const key = retryKeys.get(signature) ?? Array.from(crypto.getRandomValues(new Uint8Array(16)),v=>v.toString(16).padStart(2,"0")).join("");
+  const promise = req<T>("POST",url,body,undefined,key).then(value=>{retryKeys.delete(signature);return value;}).catch(error=>{
+    if (!(error instanceof ApiError) || error.status>=500) retryKeys.set(signature,key);
+    else retryKeys.delete(signature);
+    throw error;
+  }).finally(()=>pendingPosts.delete(signature));
+  pendingPosts.set(signature,promise);
+  return promise;
+}
+
 export const api = {
   get: <T>(url: string, signal?: AbortSignal) => req<T>("GET", url, undefined, signal),
-  post: <T = { ok: boolean }>(url: string, body: unknown = {}) => req<T>("POST", url, body),
+  post: <T = { ok: boolean }>(url: string, body: unknown = {}) => post<T>(url,body),
   put: <T = { ok: boolean }>(url: string, body: unknown) => req<T>("PUT", url, body),
   del: <T = { ok: boolean }>(url: string) => req<T>("DELETE", url),
   stream: async <T>(url: string, body: unknown, signal: AbortSignal, onItem: (item: T) => void) => {
@@ -222,6 +239,9 @@ export type JobStatus = "running" | "paused" | "done" | "cancelled";
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "gone" | "cancelled";
 
 export interface Job {
+  phase?: string;
+  next_retry_at?: number | null;
+  results?: Record<string, number>;
   id: number;
   kind: string;
   name: string;
@@ -249,6 +269,7 @@ export interface CrawlItem {
 }
 
 export interface Task {
+  result?: Record<string, number>;
   id: number;
   job_id: number;
   kind: string;
@@ -407,6 +428,8 @@ export interface Rule {
 }
 
 export interface Library {
+  operation_job_id?: number | null;
+  operation_pending?: number;
   id: number;
   name: string;
   dir: string;
@@ -505,9 +528,18 @@ export interface SiteConfig {
 export type SettingsValues = Record<string, unknown> & { sites: Record<string, SiteConfig> };
 
 export interface SettingsResponse {
+  output_sync?: OutputSync | null;
   values: SettingsValues;
   schema: Record<string, SchemaProp>;
   effective: { output_dir: string; archive_dir: string; public_base_url: string };
+}
+
+export interface OutputSync {
+  revision: string;
+  keys: string[];
+  job_id: number | null;
+  status: "pending" | "running" | "paused" | "cancelled" | "partial_failure" | "synced";
+  updated_at: number;
 }
 
 // ---- 日志 ----

@@ -1,7 +1,7 @@
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Eye, FolderSearch, Pencil, Undo2, X } from "lucide-react";
 import { useEffect, useState } from "react";
-import { Pager } from "@/components/common";
+import { Pager, QueryNotice } from "@/components/common";
 import { ask } from "@/components/confirm";
 import { Button } from "@/components/ui/button";
 import { Chip, Code, EmptyRow, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
@@ -19,20 +19,22 @@ export default function Strm() {
   const qc = useQueryClient();
   const [dir, setDir] = useState("");
   const [scanId, setScanId] = useState<number | null>(null);
-  const { data: scans = [] } = useQuery({
+  const scansQuery = useQuery({
     queryKey: ["scans"],
     queryFn: ({ signal }) => api.get<Job[]>("/api/strm/scans", signal),
     refetchInterval: q => ((q.state.data ?? []).some(j => j.status === "running") ? 2000 : false),
   });
+  const scans = scansQuery.data ?? [];
   useEffect(() => {
     if (scanId == null && scans.length) setScanId(scans[0].id);
   }, [scans, scanId]);
   const scan = scans.find(j => j.id === scanId);
-  const { data: summary } = useQuery({
+  const summaryQuery = useQuery({
     queryKey: ["scan-summary", scanId, scan?.status],
     queryFn: ({ signal }) => api.get<ScanSummary>(`/api/strm/scans/${scanId}/summary`, signal),
     enabled: !!scanId,
   });
+  const summary = summaryQuery.data;
 
   const startScan = async () => {
     const r = await run(() => api.post<{ job_id: number }>("/api/strm/scan", { dir }), {
@@ -57,7 +59,7 @@ export default function Strm() {
           <Field label="目录（留空 = 输出根目录；也可以是别的工具生成 strm 的目录）" className="min-w-[300px] flex-1">
             <Input value={dir} onChange={e => setDir(e.target.value)} placeholder={status?.output_dir} />
           </Field>
-          <Button variant="primary" onClick={startScan}>
+          <Button variant="primary" onClick={startScan} disabled={run.busy}>
             <FolderSearch />
             开始扫描
           </Button>
@@ -73,6 +75,8 @@ export default function Strm() {
             </Select>
           </Field>
         </div>
+        <QueryNotice query={scansQuery} label="扫描记录" />
+        {!!scanId && <QueryNotice query={summaryQuery} label="扫描结果" />}
         {scan?.status === "running" && <p className="mt-3 text-sm text-warn">正在扫描，完成后自动显示结果…</p>}
         {summary && <Summary summary={summary} onPrefix={setPrefixOld} onFilter={setFilePrefix} />}
       </Panel>
@@ -374,13 +378,15 @@ function Files({ scanId, dir, prefix, setPrefix }: { scanId: number; dir: string
   }, [q]);
   useEffect(() => setF(p => ({ ...p, page: 1 })), [prefix, scanId]);
   const params = new URLSearchParams({ kind: f.kind, managed: f.managed, prefix, q: f.q, page: String(f.page), size: String(f.size) });
-  const { data } = useQuery({
+  const filesQuery = useQuery({
     queryKey: ["strm-files", scanId, params.toString()],
     queryFn: ({ signal }) => api.get<Page<StrmFile>>(`/api/strm/scans/${scanId}/files?${params}`, signal),
     placeholderData: keepPreviousData,
   });
+  const data = filesQuery.data;
   return (
     <Panel title="文件" bodyClassName="space-y-3">
+      <QueryNotice query={filesQuery} label="文件列表" />
       <div className="flex flex-wrap items-center gap-2">
         <Select value={f.kind} onChange={e => setF({ ...f, kind: e.target.value, page: 1 })} aria-label="类型" className="w-32">
           <option value="">全部类型</option>
@@ -443,7 +449,7 @@ function Files({ scanId, dir, prefix, setPrefix }: { scanId: number; dir: string
               </Td>
             </tr>
           ))}
-          {(data?.items ?? []).length === 0 && <EmptyRow cols={5}>没有文件</EmptyRow>}
+          {(data?.items ?? []).length === 0 && !filesQuery.error && !filesQuery.isPending && <EmptyRow cols={5}>没有文件</EmptyRow>}
         </tbody>
       </Table>
       <Pager page={f.page} size={f.size} total={data?.total ?? 0} onPage={page => setF({ ...f, page })} onSize={size => setF({ ...f, size, page: 1 })} />

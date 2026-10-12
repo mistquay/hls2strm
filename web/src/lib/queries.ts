@@ -2,7 +2,9 @@
 
 import { keepPreviousData, QueryClient, useQuery, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { api, type FacetField, type FacetItem, type HealthResponse, type Job, type Library, type Meta, type SiteMeta, type Status, type Subscription } from "./api";
+import { useRef, useState } from "react";
+import { navigate } from "./route";
+import { api, type FacetField, type FacetItem, type HealthResponse, type Job, type Page, type Library, type Meta, type SiteMeta, type Status, type Subscription } from "./api";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
@@ -48,9 +50,9 @@ export function useHealth() {
   });
 }
 
-export function useJobs(filter: { status?: string; kind?: string } = {}) {
-  const q = new URLSearchParams({ limit: "100", ...Object.fromEntries(Object.entries(filter).filter(([, v]) => v)) });
-  return useQuery({ queryKey: ["jobs", filter.status ?? "", filter.kind ?? ""], queryFn: ({ signal }) => api.get<Job[]>(`/api/jobs?${q}`, signal), refetchInterval: POLL });
+export function useJobs(filter: { status?: string; kind?: string; q?: string; page?: number } = {}) {
+  const q = new URLSearchParams({ limit: "50", paged: "true", offset: String(((filter.page ?? 1)-1)*50), status:filter.status ?? "",kind:filter.kind ?? "",q:filter.q ?? "" });
+  return useQuery({ queryKey: ["jobs", filter], queryFn: ({ signal }) => api.get<Page<Job>>(`/api/jobs?${q}`, signal), refetchInterval: POLL });
 }
 
 export function useFacet(field: FacetField, q = "", enabled = true) {
@@ -66,20 +68,30 @@ export function useFacet(field: FacetField, q = "", enabled = true) {
 /** 执行一个操作：成功提示、失败弹错误；完成后刷新相关数据。返回结果，失败返回 undefined。 */
 export function useRun() {
   const qc = useQueryClient();
-  return async function run<T>(
+  const inFlight = useRef(false);
+  const [busy,setBusy] = useState(false);
+  const run = async function run<T>(
     fn: () => Promise<T>,
     opts: { success?: string | ((r: T) => string); invalidate?: unknown[][] } = {},
   ): Promise<T | undefined> {
+    if (inFlight.current) return undefined;
+    inFlight.current = true;
+    setBusy(true);
     try {
       const r = await fn();
       const msg = typeof opts.success === "function" ? opts.success(r) : opts.success;
-      if (msg) toast.success(msg);
+      const result = r as Record<string, unknown> | null;
+      const jobId = result && (result.job_id || result.rewrite_job_id || result.reclassify_job_id || result.locate_job_id || (msg?.includes("任务") ? result.id : null));
+      if (msg) toast.success(msg, jobId ? { action: { label:"查看任务", onClick:()=>navigate("jobs",{job:String(jobId)}) } } : undefined);
       return r;
     } catch (e) {
       toast.error(e instanceof Error ? e.message : String(e));
       return undefined;
     } finally {
+      inFlight.current = false;
+      setBusy(false);
       for (const key of opts.invalidate ?? [["status"]]) qc.invalidateQueries({ queryKey: key });
     }
   };
+  return Object.assign(run,{busy});
 }

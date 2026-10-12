@@ -2,6 +2,14 @@
 
 import aiosqlite
 
+async def migrate_v19(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE libraries ADD COLUMN operation_job_id INTEGER")
+    await conn.execute("ALTER TABLE libraries ADD COLUMN operation_pending INTEGER NOT NULL DEFAULT 0")
+    await conn.execute("ALTER TABLE tasks ADD COLUMN result TEXT NOT NULL DEFAULT '{}'")
+    await conn.execute("CREATE TABLE operation_items(preview_id INTEGER NOT NULL,video_id INTEGER NOT NULL,data TEXT NOT NULL,PRIMARY KEY(preview_id,video_id))")
+    await conn.execute("CREATE TABLE operation_requests(key TEXT PRIMARY KEY,digest TEXT NOT NULL,job_id INTEGER NOT NULL,ready INTEGER NOT NULL DEFAULT 0)")
+    await conn.execute("CREATE INDEX operation_requests_job ON operation_requests(job_id)")
+
 async def migrate_v18(conn: aiosqlite.Connection) -> None:
     """补齐空值最后的双向排序索引，以及大库统计/源筛选的覆盖索引。"""
     for name, col in (("duration", "duration"), ("code", "code_key"), ("views", "views"), ("updated", "updated_at")):

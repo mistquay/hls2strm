@@ -1,15 +1,17 @@
 import { useQuery } from "@tanstack/react-query";
 import { Pause, Play, RotateCw, Trash2, X, XCircle } from "lucide-react";
 import { type ReactNode, useState } from "react";
-import { ErrorText } from "@/components/common";
+import { ErrorText, Pager, QueryNotice } from "@/components/common";
 import { ask } from "@/components/confirm";
 import { CrawlResults, JobLogs } from "@/components/job-history";
+import { OperationPreview, type OperationRequest } from "@/components/operation-preview";
+import { navigate } from "@/lib/route";
 import { defaultVerifyOptions, verifyHint, VerifyOptions, verifyParams } from "@/components/verify-options";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, KV, Mono, Panel, Progress, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Segmented, Select, Textarea } from "@/components/ui/form";
 import { Sheet, SheetClose, SheetContent } from "@/components/ui/overlay";
-import { api, type Job, type Task, type TaskStatus } from "@/lib/api";
+import { api, type Job, type Page, type Task, type TaskStatus } from "@/lib/api";
 import { fmtBytes, fmtDur, fmtNum, fmtTime } from "@/lib/format";
 import { JOB_STATUS, KIND_NAMES, kindName, TASK_STATUS } from "@/lib/labels";
 import { useJobs, useLibraries, useMeta, useRun, useStatus } from "@/lib/queries";
@@ -30,6 +32,8 @@ const KINDS: { value: Kind; label: string }[] = [
 
 export const jobTotal = (j: Job) => Object.values(j.tasks).reduce((a, b) => a + (b ?? 0), 0);
 export const jobFinished = (j: Job) => (j.tasks.done ?? 0) + (j.tasks.failed ?? 0) + (j.tasks.gone ?? 0) + (j.tasks.cancelled ?? 0);
+const PHASES: Record<string,string> = {queued:"排队中",executing:"执行中",following_up:"后续处理进行中",waiting_retry:"等待重试",scheduler_paused:"调度已暂停",pausing:"暂停调度，当前步骤收尾中",partial_failure:"完成 · 部分失败"};
+const jobLabel = (j:Job) => PHASES[j.phase ?? ""] || (j.status==="done" && j.state.partial_failure ? "完成 · 部分失败" : JOB_STATUS[j.status][0]);
 
 function progressText(j: Job): string {
   let text = `${fmtNum(jobFinished(j))} / ${fmtNum(jobTotal(j))}`;
@@ -67,17 +71,21 @@ export default function Jobs() {
     else p.delete("job");
     replaceParams(p);
   };
-  const filter = { status: params.get("status") ?? "", kind: params.get("kind") ?? "" };
-  const setFilter = (k: "status" | "kind", v: string) => {
+  const page = Math.max(1,Number(params.get("page")) || 1);
+  const filter = { status: params.get("status") ?? "", kind: params.get("kind") ?? "",q:params.get("q") ?? "",page };
+  const setFilter = (k: "status" | "kind" | "q" | "page", v: string) => {
     const p = new URLSearchParams(params);
     if (v) p.set(k, v);
     else p.delete(k);
+    if (k!=="page") p.delete("page");
     replaceParams(p);
   };
-  const { data: jobs = [] } = useJobs(filter);
+  const jobsQuery = useJobs(filter);
+  const jobs = jobsQuery.data?.items ?? [];
   const { data: status } = useStatus();
   const now = status?.now ?? Date.now() / 1000;
-  const open = jobs.find(j => j.id === openId) ?? null;
+  const detail = useQuery({queryKey:["jobs","detail",openId],queryFn:({signal})=>api.get<Job>(`/api/jobs/${openId}`,signal),enabled:!!openId,refetchInterval:q=>(q.state.data?.status==="done" || q.state.data?.status==="cancelled") && q.state.data?.phase!=="following_up" ? false : 3000});
+  const open = detail.data;
 
   return (
     <>
@@ -87,6 +95,7 @@ export default function Jobs() {
         bodyClassName="p-0"
         actions={
           <>
+            <Input value={filter.q} onChange={e=>setFilter("q",e.target.value)} placeholder="搜任务名称或编号" aria-label="搜索任务" className="w-44" />
             <Select value={filter.status} onChange={e => setFilter("status", e.target.value)} aria-label="按状态筛选任务" className="w-32">
               <option value="">全部状态</option>
               <option value="active">进行中 / 暂停</option>
@@ -97,10 +106,11 @@ export default function Jobs() {
               <option value="">全部类型</option>
               {Object.entries(KIND_NAMES).map(([k, name]) => <option key={k} value={k}>{name}</option>)}
             </Select>
-            <span className="text-[13px] text-muted">{filter.status || filter.kind ? `筛出 ${jobs.length}${jobs.length >= 100 ? "+" : ""} 个` : `最近 ${jobs.length} 个`}</span>
+            <span className="text-[13px] text-muted">共 {jobsQuery.data?.total ?? "—"} 个</span>
           </>
         }
       >
+        <QueryNotice query={jobsQuery} label="任务" />
         <Table>
           <thead>
             <tr>
@@ -115,7 +125,7 @@ export default function Jobs() {
           </thead>
           <tbody>
             {jobs.map(j => {
-              const [stText, stTone] = JOB_STATUS[j.status];
+              const [, stTone] = JOB_STATUS[j.status];
               const total = jobTotal(j);
               return (
                 <tr
@@ -129,7 +139,7 @@ export default function Jobs() {
                     <div className="text-xs text-muted">{kindName(j.kind)}</div>
                   </Td>
                   <Td>
-                    <Chip tone={j.status === "done" && j.state.partial_failure ? "warn" : stTone}>{j.status === "done" && j.state.partial_failure ? "完成 · 部分失败" : stText}</Chip>
+                    <Chip tone={j.status === "done" && j.state.partial_failure ? "warn" : stTone}>{jobLabel(j)}</Chip>
                   </Td>
                   <Td>
                     <Progress value={total ? (jobFinished(j) * 100) / total : 0} tone={j.tasks.failed ? "warn" : "accent"} />
@@ -149,11 +159,13 @@ export default function Jobs() {
                 </tr>
               );
             })}
-            {jobs.length === 0 && <EmptyRow cols={7}>{filter.status || filter.kind ? "没有符合筛选的任务" : "还没有任务。在上面新建一个，或者到「输出库与订阅」建订阅。"}</EmptyRow>}
+            {jobs.length === 0 && !jobsQuery.error && !jobsQuery.isPending && <EmptyRow cols={7}>{filter.status || filter.kind ? "没有符合筛选的任务" : "还没有任务。在上面新建一个，或者到「输出库与订阅」建订阅。"}</EmptyRow>}
           </tbody>
         </Table>
       </Panel>
-      <Sheet open={!!open} onOpenChange={o => !o && setOpen(null)}>
+      <Pager page={page} size={50} total={jobsQuery.data?.total ?? 0} onPage={n=>setFilter("page",String(n))} />
+      <Sheet open={!!openId} onOpenChange={o => !o && setOpen(null)}>
+        {!open && <SheetContent label={`任务 #${openId}`}><QueryNotice query={detail} label={`任务 #${openId}`} /><Button onClick={()=>setOpen(null)}>关闭</Button></SheetContent>}
         {open && (
           <SheetContent label={`任务 #${open.id}`} className="sm:max-w-3xl">
             <JobDetail key={open.id} job={open} now={now} onDeleted={() => setOpen(null)} />
@@ -258,8 +270,8 @@ function NewJob() {
         {kind === "verify" && (
           <VerifyOptions value={verify} onChange={setVerify} />
         )}
-        <Button variant="primary" onClick={create}>
-          创建任务
+        <Button variant="primary" onClick={create} disabled={run.busy}>
+          {run.busy ? "正在提交…" : "创建任务"}
         </Button>
       </div>
       {kind === "videos" && (
@@ -287,12 +299,15 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
   const meta = useMeta();
   const [filter, setFilter] = useState<"" | TaskStatus>(job.tasks.failed ? "failed" : "");
   const [logTask, setLogTask] = useState<number | null>(null);
-  const { data: tasks = [] } = useQuery({
-    queryKey: ["tasks", job.id, filter, job.status],
-    queryFn: ({ signal }) => api.get<Task[]>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=300`, signal),
+  const [page,setPage] = useState(1);
+  const [target,setTarget] = useState("");
+  const taskQuery = useQuery({
+    queryKey: ["tasks", job.id, filter, job.status,page,target],
+    queryFn: ({ signal }) => api.get<Page<Task>>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=100&paged=true&offset=${(page-1)*100}&q=${encodeURIComponent(target)}`, signal),
     refetchInterval: job.status === "running" ? 3000 : false,
   });
-  const [stText, stTone] = JOB_STATUS[job.status];
+  const tasks = taskQuery.data?.items ?? [];
+  const [, stTone] = JOB_STATUS[job.status];
   const total = jobTotal(job);
   const act = (action: string, success: string) =>
     run(() => api.post(`/api/jobs/${job.id}/${action}`), { success, invalidate: [["jobs"], ["status"], ["tasks", job.id]] });
@@ -305,7 +320,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
         <h3 className="min-w-0 flex-1 truncate font-semibold" title={job.name}>
           {job.name}
         </h3>
-        <Chip tone={stTone}>{stText}</Chip>
+        <Chip tone={job.state.partial_failure ? "warn" : stTone}>{jobLabel(job)}</Chip>
         <SheetClose className="rounded p-1 text-muted hover:bg-panel-2 hover:text-ink" aria-label="关闭">
           <X className="size-4" />
         </SheetClose>
@@ -356,12 +371,15 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
             </Button>
           )}
         </div>
+        {job.results && <p className="text-sm text-muted">{Object.entries(job.results).map(([k,n])=>`${({sources_added:"新增源",not_found:"未找到",added:"新加入",already_exists:"已存在",skipped:"跳过",removed:"移出",matched:"匹配影片",inapplicable:"不适用",processed:"已处理影片",queued:"已排队影片"} as Record<string,string>)[k] ?? k} ${n}`).join(" · ")}</p>}
 
         <div>
           <Progress value={total ? (jobFinished(job) * 100) / total : 0} />
           <p className="mt-1.5 text-[13px] text-muted">{progressText(job)}</p>
         </div>
 
+        {job.state.child_job_id && <Button onClick={()=>navigate("jobs",{job:String(job.state.child_job_id)})}>查看后续处理任务 #{String(job.state.child_job_id)}</Button>}
+        {job.kind==="preview" && !!job.params.operation && <OperationPreview request={job.params.operation as unknown as OperationRequest} initialJobId={job.id} onApplied={id=>navigate("jobs",{job:String(id)})} />}
         <KV
           items={[
             ["类型", kindName(job.kind)],
@@ -379,8 +397,10 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
         <section>
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <h4 className="text-sm font-semibold">子任务</h4>
-            <Segmented size="sm" value={filter} onChange={setFilter} options={TASK_FILTERS} className="ml-auto flex-wrap" />
+            <Segmented size="sm" value={filter} onChange={v=>{setFilter(v);setPage(1);}} options={TASK_FILTERS} className="ml-auto flex-wrap" />
           </div>
+          <Input value={target} onChange={e=>{setTarget(e.target.value);setPage(1);}} placeholder="搜影片目标或子任务 ID" aria-label="查找子任务" className="mb-2" />
+          <QueryNotice query={taskQuery} label="子任务" />
           <Table>
             <thead>
               <tr>
@@ -415,10 +435,10 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
                   <Td className="whitespace-nowrap text-right align-top text-[13px] text-muted">{t.duration_ms != null ? `${(t.duration_ms / 1000).toFixed(1)}s` : ""}</Td>
                 </tr>
               ))}
-              {tasks.length === 0 && <EmptyRow cols={5}>没有{filter ? TASK_STATUS[filter][0] : ""}的子任务</EmptyRow>}
+              {tasks.length === 0 && !taskQuery.error && !taskQuery.isPending && <EmptyRow cols={5}>没有{filter ? TASK_STATUS[filter][0] : ""}的子任务</EmptyRow>}
             </tbody>
           </Table>
-          {tasks.length >= 300 && <p className="mt-2 text-xs text-muted">只显示最近更新的 300 个。</p>}
+          <Pager page={page} size={100} total={taskQuery.data?.total ?? 0} onPage={setPage} />
         </section>
       </div>
     </>

@@ -1,6 +1,6 @@
 import { Activity, RotateCcw, Wifi } from "lucide-react";
 import { useState } from "react";
-import { ErrorText } from "@/components/common";
+import { ErrorText, QueryNotice } from "@/components/common";
 import { LogLines } from "@/components/log-lines";
 import { siteSignal } from "@/components/site-signals";
 import { nextSubscriptionTime } from "@/components/subscription-schedule";
@@ -24,10 +24,11 @@ export function subState(sub: Subscription): { text: string; tone: "warn" | "neu
 }
 
 export default function Overview() {
-  const { data: s } = useStatus();
+  const statusQuery = useStatus();
+  const s = statusQuery.data;
   const run = useRun();
   const meta = useMeta();
-  if (!s) return <div className="py-20 text-center text-sm text-muted">正在连接服务…</div>;
+  if (!s) return <QueryNotice query={statusQuery} label="服务状态" />;
 
   const queueSum = (k: "pending" | "running" | "failed") => Object.values(s.queue).reduce((a, q) => a + (q[k] ?? 0), 0);
   // 概览只看启用的订阅里正在跑的和最近要跑的，全部订阅到「输出库与订阅」管理
@@ -41,6 +42,7 @@ export default function Overview() {
 
   return (
     <>
+      <QueryNotice query={statusQuery} label="服务状态" />
       {blocked.length > 0 && (
         <Notice
           tone="warn"

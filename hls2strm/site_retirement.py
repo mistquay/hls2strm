@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 
 from .engine import PRIORITY_USER
@@ -82,26 +83,50 @@ async def preview(engine, site: str) -> dict:
             "jobs": jobs, "archive_dir": str(archive_dir)}
 
 
-async def apply(engine, site: str) -> int:
+async def apply(engine, site: str, *, video_ids=None, preview_id=None, parent_job_id=None) -> int:
     """清退，返回删源任务 id。"""
     label, db = _site(site), engine.db
-    await _retired(db, site)
     engine.archive_root()
-    ids = [r["video_id"] for r in await db._all(TARGETS + " ORDER BY video_id", (site,), bulk=True)]
+    parent = await db.get_job(parent_job_id) if parent_job_id else None
+    child = parent["state"].get("child_job_id") if parent else None
+    if child:
+        job = await db.get_job(child)
+        if not job or job["params"].get("preview_id")!=preview_id:
+            raise ValueError("清退执行记录不可用")
+        if job["status"]=="paused":
+            await engine.store.update({"sites": {site: {"enabled": False}}})
+            await db.update_job(child,status="running")
+        for cancelled_job in job["params"].get("cancelled_jobs",[]):
+            await engine._maybe_finish_job(cancelled_job)
+        await engine._maybe_finish_job(child)
+        engine.notify()
+        return child
+    await _retired(db, site)
+    frozen = preview_id is not None and video_ids is None
+    ids = [] if frozen else video_ids if video_ids is not None else [r["video_id"] for r in await db._all(TARGETS + " ORDER BY video_id", (site,), bulk=True)]
+    total = (await db._one("SELECT COUNT(*) AS n FROM operation_items WHERE preview_id=?",(preview_id,),bulk=True))["n"] if frozen else len(ids)
+    stamp = int(time.time())
+    # 队列、停用订阅及父任务回执原子保存；删源任务先暂停，设置落盘后才开始。
+    async with db._tx() as conn:
+        await _retired(db,site)
+        subs = [s["id"] for s in await db.list_subscriptions() if s["site"]==site and s["enabled"]]
+        jobs = [r["job_id"] for r in await db._all("SELECT DISTINCT job_id FROM tasks WHERE site=? AND status='pending'",(site,))]
+        await conn.execute("UPDATE subscriptions SET enabled=0 WHERE site=? AND enabled=1",(site,))
+        await conn.execute("UPDATE tasks SET status='cancelled',updated_at=? WHERE site=? AND status='pending'",(stamp,site))
+        params = {"sites":[site],"subscriptions":subs,"preview_id":preview_id,"cancelled_jobs":jobs}
+        cur = await conn.execute("INSERT INTO jobs(kind,name,params,status,created_at) VALUES('source_remove',?,?,'paused',?)",(f"清退站点 {label}：{total} 部",json.dumps(params),stamp))
+        job_id = cur.lastrowid
+        if frozen:
+            await conn.execute("INSERT INTO tasks(job_id,kind,target,priority,updated_at) SELECT ?,'source_remove',CAST(video_id AS TEXT),?,? FROM operation_items WHERE preview_id=? ORDER BY video_id",(job_id,PRIORITY_USER,stamp,preview_id))
+        else:
+            await conn.executemany("INSERT INTO tasks(job_id,kind,target,priority,updated_at) VALUES(?,'source_remove',?,?,?)",[(job_id,str(vid),PRIORITY_USER,stamp) for vid in ids])
+        await conn.execute("INSERT INTO site_retirements(site,job_id,created_at) VALUES(?,?,?)",(site,job_id,stamp))
+        if parent:
+            await conn.execute("UPDATE jobs SET state=? WHERE id=?",(json.dumps({**parent["state"],"child_job_id":job_id,"matched":total}),parent_job_id))
     await engine.store.update({"sites": {site: {"enabled": False}}})
-    subs = [s["id"] for s in await db.list_subscriptions() if s["site"] == site and s["enabled"]]
-    for sub_id in subs:
-        await db.update_subscription(sub_id, enabled=0)
-    # 站点停用后它的子任务不会再领，排队中的取消掉，免得任务一直挂着
-    jobs = [r["job_id"] for r in await db._all("SELECT DISTINCT job_id FROM tasks WHERE site=? AND status='pending'", (site,))]
-    await db._write("UPDATE tasks SET status='cancelled', updated_at=? WHERE site=? AND status='pending'",
-                    (int(time.time()), site))
-    for job_id in jobs:
-        await engine._maybe_finish_job(job_id)
-    job_id = await db.create_job("source_remove", f"清退站点 {label}：{len(ids)} 部", {"sites": [site], "subscriptions": subs})
-    await db.add_tasks(job_id, "source_remove", ids, PRIORITY_USER)
-    await db._write("INSERT INTO site_retirements(site, job_id, created_at) VALUES(?, ?, ?)",
-                    (site, job_id, int(time.time())))
+    await db.update_job(job_id,status="running")
+    for cancelled_job in jobs:
+        await engine._maybe_finish_job(cancelled_job)
     await engine._maybe_finish_job(job_id)  # 这个站一部影片都没有时直接结束
     engine.notify()
     return job_id

@@ -1,4 +1,4 @@
-import { FileVideo, Film, FolderTree, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, PanelLeftClose, PanelLeftOpen, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
+import { FileVideo, Film, FolderTree, History, LayoutDashboard, ListChecks, LogOut, Menu as MenuIcon, Monitor, Moon, PanelLeftClose, PanelLeftOpen, Pause, Play, RotateCw, ScrollText, Settings2, Sun } from "lucide-react";
 import { type ComponentType, lazy, Suspense, useEffect, useState } from "react";
 import { ConfirmHost } from "./components/confirm";
 import { PlayerHost } from "./components/player";
@@ -19,6 +19,7 @@ const pages: { id: string; name: string; icon: ComponentType<{ className?: strin
   { id: "overview", name: "概览", icon: LayoutDashboard, Page: Overview },
   { id: "jobs", name: "任务", icon: ListChecks, Page: lazy(() => import("./pages/jobs")) },
   { id: "videos", name: "影片库", icon: Film, Page: lazy(() => import("./pages/videos")) },
+  { id: "play-history", name: "播放记录", icon: History, Page: lazy(() => import("./pages/play-history")) },
   { id: "libraries", name: "输出库与订阅", icon: FolderTree, Page: lazy(() => import("./pages/libraries")) },
   { id: "strm", name: "strm 管理", icon: FileVideo, Page: lazy(() => import("./pages/strm")) },
   { id: "settings", name: "设置", icon: Settings2, Page: lazy(() => import("./pages/settings")) },
@@ -27,10 +28,10 @@ const pages: { id: string; name: string; icon: ComponentType<{ className?: strin
 ];
 
 export function engineState(s: Status | undefined, error: boolean, label: (n: string) => string): { text: string; tone: Tone } {
-  if (error) return { text: "服务离线", tone: "err" };
+  if (error) return { text: "状态读取失败", tone: "err" };
   if (!s) return { text: "加载中", tone: "neutral" };
   const e = s.engine;
-  if (e.paused) return { text: "已暂停", tone: "neutral" };
+  if (e.paused) return { text: e.running.length ? "暂停调度，等待当前步骤结束" : "调度已暂停", tone: "neutral" };
   if (e.blocked_for > 0) return { text: Object.keys(e.blocked).map(label).join("、") + " 被拦截", tone: "warn" };
   if (e.running.length) return { text: `运行中 · ${e.running.length} 个子任务`, tone: "ok" };
   return { text: "空闲", tone: "info" };
@@ -190,14 +191,14 @@ function Nav({ current, status, user, onGo, compact = false }: { current: string
           size="sm"
           variant={paused ? "primary" : "outline"}
           className="w-full"
-          aria-label={paused ? "恢复全部任务" : "暂停全部任务"}
-          title={compact ? (paused ? "恢复全部任务" : "暂停全部任务") : undefined}
+          aria-label={paused ? "恢复调度" : "暂停调度"}
+          title={paused ? "恢复调度" : "停止领取新任务，当前步骤完成后暂停"}
           onClick={() =>
             run(() => api.post(`/api/engine/${paused ? "resume" : "pause"}`), { success: paused ? "引擎已恢复" : "引擎已暂停" })
           }
         >
           {paused ? <Play /> : <Pause />}
-          {!compact && (paused ? "恢复全部任务" : "暂停全部任务")}
+          {!compact && (paused ? "恢复调度" : "暂停调度")}
         </Button>
         <ThemeSwitch compact={compact} />
         {user && (

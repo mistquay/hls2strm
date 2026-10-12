@@ -4,6 +4,8 @@ import { useState } from "react";
 import { ask, confirm } from "@/components/confirm";
 import { ConfigTransfer } from "@/components/config-transfer";
 import { SiteRetirement } from "@/components/site-retirement";
+import { OperationPreview } from "@/components/operation-preview";
+import { QueryNotice } from "@/components/common";
 import { nextSubscriptionTime, SubscriptionSchedule } from "@/components/subscription-schedule";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, Help, Mono, Panel, Table, Td, Th } from "@/components/ui/data";
@@ -44,7 +46,8 @@ function WaitingReason({ waiting, sub }: { waiting: NonNullable<Library["waiting
 }
 
 function LibrariesPanel() {
-  const { data: libs = [] } = useLibraries(true);
+  const librariesQuery = useLibraries(true);
+  const libs = librariesQuery.data ?? [];
   const { data: subs = [] } = useSubscriptions();
   const { data: status } = useStatus();
   const run = useRun();
@@ -110,6 +113,7 @@ function LibrariesPanel() {
       }
       bodyClassName="px-4 py-0"
     >
+      <QueryNotice query={librariesQuery} label="输出库" />
       <Table>
         <thead>
           <tr>
@@ -129,6 +133,7 @@ function LibrariesPanel() {
                 <button type="button" className="font-medium hover:text-accent" onClick={() => navigate("videos", { library: String(l.id) })} title="在影片库里看这个库">
                   {l.name}
                 </button>
+                {!!l.operation_pending && <p className="mt-1 text-xs text-warn">变更尚未完成 <button className="text-accent underline" onClick={()=>navigate("jobs",{job:String(l.operation_job_id)})}>查看任务 #{l.operation_job_id}</button>；普通归并暂不处理该库</p>}
               </Td>
               <Td>
                 <Mono>{l.root}</Mono>
@@ -210,7 +215,7 @@ function LibrariesPanel() {
               </Td>
             </tr>
           ))}
-          {libs.length === 0 && <EmptyRow cols={7}>加载中…</EmptyRow>}
+          {libs.length === 0 && !librariesQuery.error && !librariesQuery.isPending && <EmptyRow cols={7}>还没有输出库</EmptyRow>}
         </tbody>
       </Table>
       <div className="py-3">
@@ -267,8 +272,12 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
   const toggle = (key: "sources" | "excludes", id: number) =>
     setF(p => ({ ...p, [key]: p[key].includes(id) ? p[key].filter(x => x !== id) : [...p[key], id] }));
 
+  const ruleKeys = ["categories","tags","models","quality","keywords"] as const;
+  const normalizedRule = useRule ? {...Object.fromEntries(ruleKeys.map(k=>[k,rule[k].replace(/，/g,",").split(",").map(v=>v.trim()).filter(Boolean)])),match:rule.match} : null;
+  const body = {...f,rule:normalizedRule};
+  const originalRule = lib?.rule ? {...Object.fromEntries(ruleKeys.map(k=>[k,lib.rule![k] ?? []])),match:lib.rule.match} : null;
+  const needsPreview = lib ? !!lib.operation_pending || Object.keys(f).filter(k=>k!=="name").some(k=>JSON.stringify(f[k as keyof typeof f])!==JSON.stringify(lib[k as keyof Library])) || JSON.stringify(normalizedRule)!==JSON.stringify(originalRule) : !!(useRule || f.sources.length || f.excludes.length);
   const save = async () => {
-    const body = { ...f, rule: useRule ? rule : null };
     const r = await run(
       () =>
         lib
@@ -296,13 +305,14 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
       footer={
         <>
           <Button onClick={onDone}>取消</Button>
-          <Button variant="primary" onClick={save} disabled={!f.name.trim() || !f.dir.trim()}>
+          {!needsPreview && <Button variant="primary" onClick={save} disabled={!f.name.trim() || !f.dir.trim() || run.busy}>
             {lib ? "保存" : "新建"}
-          </Button>
+          </Button>}
+          {needsPreview && <span className="text-sm text-muted">请在影响预览中确认变更</span>}
         </>
       }
     >
-      <div className="grid gap-3 sm:grid-cols-2">
+      <fieldset disabled={run.busy} className="grid gap-3 sm:grid-cols-2">
         <Field label="名称">
           <Input value={f.name} onChange={e => setF({ ...f, name: e.target.value })} placeholder="中文字幕" autoFocus />
         </Field>
@@ -328,7 +338,7 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
             ))}
           </Select>
         </Field>
-      </div>
+      </fieldset>
       {others.length > 0 && (
         <div className="mt-4 grid gap-3 sm:grid-cols-2">
           <Field label="来源库：这些库里的影片自动归入本库">
@@ -385,6 +395,7 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
           </div>
         )}
       </div>
+      {needsPreview && <OperationPreview request={{kind:"library",payload:{library_id:lib?.id ?? null,values:body}}} disabled={!f.name.trim() || !f.dir.trim()} confirmText={lib ? "确认保存并执行变更" : "确认创建并归库"} onApplied={()=>onDone()} />}
     </DialogContent>
   );
 }
@@ -400,7 +411,8 @@ function subGroup(sub: Subscription): string {
 }
 
 function SubscriptionsPanel() {
-  const { data: subs = [] } = useSubscriptions(true);
+  const subscriptionsQuery = useSubscriptions(true);
+  const subs = subscriptionsQuery.data ?? [];
   const { data: libs = [] } = useLibraries();
   const { data: status } = useStatus();
   const { data: retired = [] } = useQuery({ queryKey: ["site-retirements"], queryFn: ({ signal }) => api.get<{ site: string }[]>("/api/site-retirements", signal) });
@@ -448,6 +460,7 @@ function SubscriptionsPanel() {
         )}
         <span className="ml-auto text-[13px] text-muted">{shown.length === subs.length ? `共 ${subs.length} 个` : `显示 ${shown.length} / ${subs.length} 个`}</span>
       </div>
+      <QueryNotice query={subscriptionsQuery} label="订阅" />
       <Table>
         <thead>
           <tr>
@@ -546,7 +559,7 @@ function SubscriptionsPanel() {
               </tr>
             );
           })}
-          {subs.length === 0 && <EmptyRow cols={8}>还没有订阅。新建一个，用 cron 自动跟进站点上的更新。</EmptyRow>}
+          {subs.length === 0 && !subscriptionsQuery.error && !subscriptionsQuery.isPending && <EmptyRow cols={8}>还没有订阅。新建一个，用 cron 自动跟进站点上的更新。</EmptyRow>}
         </tbody>
       </Table>
       <p className="py-3 text-[13px] text-muted">
@@ -593,7 +606,7 @@ function SubscriptionForm({ sub, onDone }: { sub: Subscription | null; onDone: (
       footer={
         <>
           <Button onClick={onDone}>取消</Button>
-          <Button variant="primary" onClick={save} disabled={!f.name.trim() || !f.source.trim() || !scheduleValid}>
+          <Button variant="primary" onClick={save} disabled={!f.name.trim() || !f.source.trim() || !scheduleValid || run.busy}>
             {sub ? "保存" : "新建"}
           </Button>
         </>
