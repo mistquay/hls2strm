@@ -33,6 +33,7 @@ from .parser import ParseError, VideoGone
 from .rules import describe_rule
 from .subscription_schedule import ScheduleFields, next_cron_at
 from .sites import SITES, get_site
+from .task_controls import CancellableKind, cancel_pending
 
 log = logging.getLogger(__name__)
 _basic = HTTPBasic(auto_error=False)
@@ -288,9 +289,10 @@ async def list_jobs(request: Request, limit: int = 50, offset: int = 0,
     db = _ctx(request).db
     jobs = await db.list_jobs(limit=max(1,min(limit, 200)), offset=max(0,offset), status=status, kind=kind, q=q)
     counts = await db.history.counts([j["id"] for j in jobs])
+    remaining = await job_views.remaining_tasks(db, jobs)
     for job in jobs:
         job["crawl"] = counts.get(job["id"])
-        await job_views.describe(_ctx(request).engine, job)
+        await job_views.describe(_ctx(request).engine, job, remaining.get(job["id"], []))
     if not paged:
         return jobs
     condition, params = job_views.job_condition(db,status,kind,q)
@@ -320,6 +322,25 @@ async def job_items(job_id: int, request: Request, status: Literal["", "new", "e
 async def job_tasks(job_id: int, request: Request, status: str = "", limit: int = 100, offset: int = 0, q: str = "", paged: bool = False):
     page = await job_views.task_page(_ctx(request).db,job_id,status,q,max(1,min(limit,500)),max(0,offset))
     return page if paged else page["items"]
+
+
+class CancelPendingTasks(BaseModel):
+    task_ids: list[int] | None = Field(None, min_length=1, max_length=500)
+    site: str | None = None
+    kind: CancellableKind | None = None
+
+
+@router.post("/jobs/{job_id}/tasks/cancel-pending")
+async def cancel_pending_tasks(job_id: int, body: CancelPendingTasks, request: Request):
+    if body.site and body.site not in SITES:
+        raise HTTPException(422, "未知站点")
+    if body.task_ids is not None and any(tid <= 0 for tid in body.task_ids):
+        raise HTTPException(422, "子任务编号必须为正整数")
+    try:
+        count = await cancel_pending(_ctx(request).engine, job_id, **body.model_dump())
+    except KeyError:
+        raise HTTPException(404, "任务不存在") from None
+    return {"cancelled": count}
 
 
 @router.post("/jobs/{job_id}/{action}")

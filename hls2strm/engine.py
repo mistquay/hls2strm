@@ -332,7 +332,7 @@ class Engine:
         if (sub_id := job["params"].get("subscription_id")) and not job["params"].get("incremental"):
             await self.db.update_subscription(sub_id, initialized=1)
         self._settle_wanted = True
-        log.info("任务 #%d 列表扫描完整，元数据和封面继续在后台补充", job_id)
+        log.info("任务 #%d 列表扫描完整，详情、封面及补源继续在后台处理", job_id)
 
     async def _retry_or_fail(self, task: dict, e: Exception) -> bool:
         s = self.store.current
@@ -360,9 +360,9 @@ class Engine:
             old.unlink(missing_ok=True)
         return name
 
-    async def _maybe_finish_job(self, job_id: int) -> None:
+    async def _maybe_finish_job(self, job_id: int, *, allow_paused: bool = False) -> None:
         job = await self.db.get_job(job_id)
-        if job is None or job["status"] != "running":
+        if job is None or job["status"] not in (("running", "paused") if allow_paused else ("running",)):
             return
         if await self.db._one("SELECT 1 FROM operation_requests WHERE job_id=? AND ready=0",(job_id,)):
             return

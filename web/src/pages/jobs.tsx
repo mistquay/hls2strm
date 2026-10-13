@@ -32,7 +32,7 @@ const KINDS: { value: Kind; label: string }[] = [
 
 export const jobTotal = (j: Job) => Object.values(j.tasks).reduce((a, b) => a + (b ?? 0), 0);
 export const jobFinished = (j: Job) => (j.tasks.done ?? 0) + (j.tasks.failed ?? 0) + (j.tasks.gone ?? 0) + (j.tasks.cancelled ?? 0);
-const PHASES: Record<string,string> = {queued:"排队中",executing:"执行中",following_up:"后续处理进行中",waiting_retry:"等待重试",scheduler_paused:"调度已暂停",pausing:"暂停调度，当前步骤收尾中",partial_failure:"完成 · 部分失败"};
+const PHASES: Record<string,string> = {queued:"排队中",executing:"执行中",background_running:"列表完成 · 后续处理中",background_waiting:"列表完成 · 等待后续处理",following_up:"后续处理进行中",waiting_retry:"等待重试",scheduler_paused:"调度已暂停",pausing:"暂停调度，当前步骤收尾中",partial_failure:"完成 · 部分失败",partial_cancelled:"完成 · 部分取消"};
 const jobLabel = (j:Job) => PHASES[j.phase ?? ""] || (j.status==="done" && j.state.partial_failure ? "完成 · 部分失败" : JOB_STATUS[j.status][0]);
 // 同片整理执行时预览后有变化、没处理的组
 const skippedGroups = (j:Job) => ((j.state as Record<string,unknown>).skipped_groups as {group_id:number;code_key?:string;reason:string}[] | undefined) ?? [];
@@ -142,6 +142,7 @@ export default function Jobs() {
                   </Td>
                   <Td>
                     <Chip tone={j.status === "done" && j.state.partial_failure ? "warn" : stTone}>{jobLabel(j)}</Chip>
+                    {j.phase_detail && <p className="mt-1 max-w-80 text-xs text-muted">{j.phase_detail}</p>}
                   </Td>
                   <Td>
                     <Progress value={total ? (jobFinished(j) * 100) / total : 0} tone={j.tasks.failed ? "warn" : "accent"} />
@@ -303,6 +304,8 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
   const [logTask, setLogTask] = useState<number | null>(null);
   const [page,setPage] = useState(1);
   const [target,setTarget] = useState("");
+  const [cancelSite, setCancelSite] = useState("*");
+  const [cancelKind, setCancelKind] = useState("*");
   const taskQuery = useQuery({
     queryKey: ["tasks", job.id, filter, job.status,page,target],
     queryFn: ({ signal }) => api.get<Page<Task>>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=100&paged=true&offset=${(page-1)*100}&q=${encodeURIComponent(target)}`, signal),
@@ -314,6 +317,19 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
   const act = (action: string, success: string) =>
     run(() => api.post(`/api/jobs/${job.id}/${action}`), { success, invalidate: [["jobs"], ["status"], ["tasks", job.id]] });
   const active = job.status === "running" || job.status === "paused";
+  const pendingGroups = job.pending_groups ?? [];
+  const cancelCount = pendingGroups.filter(g => (cancelSite === "*" || g.site === cancelSite) && (cancelKind === "*" || g.kind === cancelKind)).reduce((sum, g) => sum + g.count, 0);
+  const cancelPending = async (body: {task_ids?: number[]; site?: string; kind?: string}, count: number, scope: string) => {
+    if (!await ask(`取消${scope}？`, `预计取消 ${fmtNum(count)} 个当前待处理子任务。已完成结果和文件保留，正在执行的子任务继续完成。取消后仍可查看记录；以后新生成的任务不受影响。`, {confirmText: "确认取消", danger: true})) return;
+    const result = await run(() => api.post<{cancelled: number}>(`/api/jobs/${job.id}/tasks/cancel-pending`, body), {
+      success: r => r.cancelled ? `已取消 ${fmtNum(r.cancelled)} 个待处理子任务` : "没有可取消的待处理子任务，可能已开始执行或结束",
+      invalidate: [["jobs"], ["status"], ["tasks", job.id]],
+    });
+    if (result) {
+      setCancelSite("*");
+      setCancelKind("*");
+    }
+  };
 
   return (
     <>
@@ -386,6 +402,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
         <div>
           <Progress value={total ? (jobFinished(job) * 100) / total : 0} />
           <p className="mt-1.5 text-[13px] text-muted">{progressText(job)}</p>
+          {job.phase_detail && <p className="mt-2 text-sm text-muted">{job.phase_detail}</p>}
         </div>
 
         {job.state.child_job_id && <Button onClick={()=>navigate("jobs",{job:String(job.state.child_job_id)})}>查看后续处理任务 #{String(job.state.child_job_id)}</Button>}
@@ -410,6 +427,20 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
             <Segmented size="sm" value={filter} onChange={v=>{setFilter(v);setPage(1);}} options={TASK_FILTERS} className="ml-auto flex-wrap" />
           </div>
           <Input value={target} onChange={e=>{setTarget(e.target.value);setPage(1);}} placeholder="搜影片目标或子任务 ID" aria-label="查找子任务" className="mb-2" />
+          {active && !!pendingGroups.length && <div className="mb-3 space-y-2 rounded border border-line p-3">
+            <p className="text-xs text-muted">取消当前待处理的抓取子任务，可按站点和类型限定范围（覆盖所有页）。</p>
+            <div className="flex flex-wrap items-center gap-2">
+              <Select value={cancelSite} onChange={e => setCancelSite(e.target.value)} aria-label="取消子任务的站点" className="w-36">
+                <option value="*">全部站点</option>
+                {[...new Set(pendingGroups.map(g => g.site))].map(site => <option key={site} value={site}>{site ? meta.label(site) : "不分站点"}</option>)}
+              </Select>
+              <Select value={cancelKind} onChange={e => setCancelKind(e.target.value)} aria-label="取消子任务的类型" className="w-36">
+                <option value="*">全部抓取类型</option>
+                {[...new Set(pendingGroups.map(g => g.kind))].map(kind => <option key={kind} value={kind}>{kindName(kind)}</option>)}
+              </Select>
+              <Button size="sm" variant="danger" disabled={run.busy || !cancelCount} onClick={() => cancelPending({...(cancelSite !== "*" ? {site: cancelSite} : {}), ...(cancelKind !== "*" ? {kind: cancelKind} : {})}, cancelCount, `${cancelSite === "*" ? "全部站点" : meta.label(cancelSite) || "不分站点"}的${cancelKind === "*" ? "待处理抓取子任务" : `待处理${kindName(cancelKind)}子任务`}`)}>取消待处理的 {fmtNum(cancelCount)} 个</Button>
+            </div>
+          </div>}
           <QueryNotice query={taskQuery} label="子任务" />
           <Table>
             <thead>
@@ -440,6 +471,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
                   <Td className="align-top">
                     <Chip tone={TASK_STATUS[t.status]?.[1]}>{TASK_STATUS[t.status]?.[0] ?? t.status}</Chip>
                     {t.status === "pending" && t.next_run_at > now && <div className="mt-1 text-xs text-muted">{fmtTime(t.next_run_at)} 重试</div>}
+                    {active && t.status === "pending" && pendingGroups.some(g => g.kind === t.kind && g.site === (t.site ?? "")) && <Button size="sm" variant="ghost" disabled={run.busy} onClick={() => cancelPending({task_ids: [t.id]}, 1, `子任务 #${t.id}`)}>取消子任务</Button>}
                   </Td>
                   <Td className="text-right align-top">{t.attempts}</Td>
                   <Td className="whitespace-nowrap text-right align-top text-[13px] text-muted">{t.duration_ms != null ? `${(t.duration_ms / 1000).toFixed(1)}s` : ""}</Td>

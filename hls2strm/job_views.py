@@ -3,6 +3,48 @@
 import json
 import time
 
+from .sites import SITES
+from .task_controls import CANCELLABLE_KINDS
+
+
+async def remaining_tasks(db, jobs):
+    """一页任务共用一次汇总查询，只读取未结束子任务。"""
+    ids = [j["id"] for j in jobs if j["status"] in ("running", "paused")]
+    if not ids:
+        return {}
+    rows = await db._all(
+        f"""SELECT job_id,kind,site,SUM(status='pending') AS pending,SUM(status='running') AS running,
+                   MIN(CASE WHEN status='pending' THEN next_run_at END) AS next_run_at
+            FROM tasks WHERE job_id IN ({','.join('?' * len(ids))}) AND status IN ('pending','running')
+            GROUP BY job_id,kind,site ORDER BY job_id,kind,site""", ids, bulk=True)
+    grouped = {}
+    for row in rows:
+        grouped.setdefault(row["job_id"], []).append(dict(row))
+    return grouped
+
+
+def remaining_text(engine, groups):
+    names = {"list": "列表抓取", "detail": "详情", "probe": "补源", "cover": "封面", "quality": "画质探测"}
+    parts = []
+    now = time.time()
+    for group in groups:
+        site = group["site"]
+        label = SITES[site].label if site in SITES else site
+        count = group["pending"] + group["running"]
+        part = f"{label + ' ' if label else ''}{names.get(group['kind'], group['kind'])} {count} 项"
+        if group["running"]:
+            part += f"，{group['running']} 项执行中"
+        elif site and not engine.store.current.site(site).enabled:
+            part += "，站点已停用"
+        elif engine.blocked.get(site, 0) > now:
+            part += f"，站点冷却，约 {max(1, int(engine.blocked[site] - now))} 秒后重试"
+        elif (group["next_run_at"] or 0) > now:
+            part += f"，约 {max(1, int(group['next_run_at'] - now))} 秒后重试"
+        else:
+            part += "，等待调度"
+        parts.append(part)
+    return "；".join(parts)
+
 
 def job_condition(db, status="", kind="", q=""):
     where, params = ["1=1"], []
@@ -17,10 +59,11 @@ def job_condition(db, status="", kind="", q=""):
     return " AND ".join(where), params
 
 
-async def describe(engine, job):
+async def describe(engine, job, remaining=None):
     tasks = job["tasks"]
     if job["status"] == "done":
-        job["phase"] = "partial_failure" if job["state"].get("partial_failure") else "done"
+        job["phase"] = ("partial_cancelled" if tasks.get("cancelled") and not tasks.get("failed")
+                        else "partial_failure" if job["state"].get("partial_failure") else "done")
     elif job["status"] != "running":
         job["phase"] = job["status"]
     elif engine.paused:
@@ -29,6 +72,27 @@ async def describe(engine, job):
         job["phase"] = "executing"
     else:
         job["phase"] = "queued"
+    job["phase_detail"] = ""
+    job["pending_groups"] = []
+    if job["status"] in ("running", "paused"):
+        if remaining is None:
+            remaining = (await remaining_tasks(engine.db, [job])).get(job["id"], [])
+        job["pending_groups"] = [{"kind": g["kind"], "site": g["site"], "count": g["pending"]}
+                                 for g in remaining if g["pending"] and g["kind"] in CANCELLABLE_KINDS]
+        list_complete = (job["kind"] in ("crawl", "incremental") and job["state"].get("list_complete")
+                         and not any(g["kind"] == "list" for g in remaining))
+        if list_complete:
+            site = job["params"].get("site", "jable")
+            label = SITES[site].label if site in SITES else site
+            job["phase_detail"] = f"{label} 列表抓取已完成。"
+            if remaining and job["status"] == "running" and not engine.paused:
+                job["phase"] = "background_running" if tasks.get("running") else "background_waiting"
+        if remaining:
+            if job["status"] == "paused" or engine.paused:
+                job["phase_detail"] += "任务已暂停；剩余："
+            elif list_complete:
+                job["phase_detail"] += "后续处理："
+            job["phase_detail"] += remaining_text(engine, remaining)
     if job["state"].get("child_job_id"):
         child = await engine.db.get_job(job["state"]["child_job_id"])
         if child:

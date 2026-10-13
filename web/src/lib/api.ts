@@ -267,6 +267,8 @@ export type TaskStatus = "pending" | "running" | "done" | "failed" | "gone" | "c
 
 export interface Job {
   phase?: string;
+  phase_detail?: string;
+  pending_groups?: {kind: string; site: string; count: number}[];
   next_retry_at?: number | null;
   results?: Record<string, number>;
   id: number;

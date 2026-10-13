@@ -248,6 +248,8 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 列表任务显示已识别、新增、重复、新加入输出库和排除跳过的数量，并可筛选、分页查看影片明细。同一影片在一个任务中只计一次，重试和跨页重复不会累加；「新增」是本任务首次创建的影片，「重复」是影片库里已有的作品，与是否新加入目标输出库分别统计。升级前未记录的明细不追溯。
 
+任务详情的「子任务」区域支持取消单个待处理子任务，或按站点、类型批量取消当前已入队的列表、详情、补源、封面和画质探测任务（覆盖所有页）。确认框会说明范围和预计数量，执行后返回实际取消数量；正在执行的子任务继续完成，已入库影片、源和输出文件保留。取消记录可按「已取消」筛选，重启或重试失败项不会恢复这些记录。以后新生成的子任务不受影响；要停止整个任务及后续入队，使用「取消任务」。最后一个未结束子任务取消后，父任务收尾并显示「完成 · 部分取消」，被取消的列表页不会计为完整扫描。预览、批量变更等流程步骤仍使用整任务控制。
+
 - **列表地址**：先选站点，再填列表地址，可以指定排序、页码范围和输出库。
   - Jable：分类 `/categories/x/`、标签 `/tags/x/`、女优 `/models/x/`、搜索 `/search/关键词/`、热门 `/hot/`
   - MissAV：`/cn/new`、`/cn/release`、`/cn/chinese-subtitle`、`/cn/uncensored-leak`、搜索 `/cn/search/关键词`、女优 `/cn/actresses/名字`、类型 `/cn/genres/名称`；每页 12 部，最多 2000 页
@@ -417,6 +419,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 | GET | `/api/jobs/{id}/logs?task_id=&before=&limit=200` | 持久化执行日志，按子任务筛选；响应的 `next_before` 用于向前翻页 |
 | GET | `/api/jobs/{id}/items?status=new&limit=50&offset=0` | 列表识别明细；状态为空、`new`、`existing` 或 `excluded`，响应含总数 |
 | POST | `/api/jobs/{id}/pause\|resume\|cancel\|retry` | 控制任务 |
+| POST | `/api/jobs/{id}/tasks/cancel-pending` | 取消当前待处理抓取子任务；可选 `task_ids`（1–500 个）、`site`、`kind`，多个条件取交集；`{}` 取消本任务全部待处理抓取子任务，返回 `{"cancelled": 实际数量}` |
 | GET | `/api/videos?q=&filter=no_detail&library_id=&page=` | 影片库（每部影片带各个源、所在的库和 strm 路径）。还能按 `has_site`、`lacks_site`、`sources=single\|multi\|failing\|none`、`subtitle=zh\|en\|none`、`uncensored`、`model`、`category`、`tag`、`maker`、`quality`（列表参数可以重复，组内任一满足）、`release_from/to`、`added_from/to`、`duration_min/max` 筛，`sort=created\|release\|duration\|code\|views\|updated&order=asc\|desc` 排序 |
 | POST | `/api/videos/batch` | 批量：`{"action": "probe\|refresh\|add\|remove\|remove_source\|restore_source", "ids": [...], "library_id": 2, "sites": ["123av"]}`；都排成任务；remove_source 删掉 `sites` 里站点的源，restore_source 恢复删掉的源 |
 | GET | `/api/facets?field=models\|categories\|tags\|makers\|quality&q=` | 库里已有的女优、分类等及影片数（筛选、规则的候选） |
