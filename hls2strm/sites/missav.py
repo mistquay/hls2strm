@@ -36,6 +36,11 @@ UNCENSORED_LISTS = {
     "10musume": "10musume", "pacopacomama": "pacopacomama", "gachinco": "Gachinco",
     "xxxav": "XXX-AV", "marriedslash": "人妻斩",
 }
+CHANNEL_LISTS = {
+    "siro": "SIRO", "luxu": "LUXU", "gana": "GANA", "maan": "PRESTIGE PREMIUM",
+    "scute": "S-CUTE", "ara": "ARA", "naughty4610": "顽皮 4610", "naughty0930": "顽皮 0930",
+    "madou": "麻豆传媒", "twav": "TWAV", "furuke": "Furuke",
+}
 
 
 def split_variant(key: str) -> tuple[str, str, bool]:
@@ -129,6 +134,8 @@ class MissAVSite(Site):
         {"name": "中文字幕", "source": "/cn/chinese-subtitle", "sort": ""},
         {"name": "无码流出", "source": "/cn/uncensored-leak", "sort": ""},
         {"name": "FC2", "source": "/cn/fc2", "sort": "published_at"},
+        *[{"name": label, "source": f"/cn/{key}", "sort": "published_at"}
+          for key, label in CHANNEL_LISTS.items()],
         *[{"name": f"原生无码 · {label}", "source": f"/cn/{key}", "sort": "published_at"}
           for key, label in UNCENSORED_LISTS.items()],
         {"name": "搜索", "source": "/cn/search/<关键词>", "sort": ""},
@@ -137,7 +144,7 @@ class MissAVSite(Site):
         {"name": "发行商", "source": "/cn/makers/<名称>", "sort": ""},
     ]
     default_sort = ""
-    source_hint = ("最近更新 /cn/new、最新发行 /cn/release、中文字幕 /cn/chinese-subtitle、无码流出 /cn/uncensored-leak、"
+    source_hint = ("最近更新 /cn/new、最新发行 /cn/release、中文字幕 /cn/chinese-subtitle、无码流出 /cn/uncensored-leak、S-CUTE /cn/scute、"
                    "搜索 /cn/search/关键词、女优 /cn/actresses/名字，直接粘贴站点网址也行；每页 12 部，最多 2000 页")
 
     def detail_path(self, key: str) -> str:
@@ -182,8 +189,7 @@ class MissAVSite(Site):
         if not rest:
             raise ValueError(f"不是列表地址：{value}")
         if "/" not in rest and rest not in ("new", "release", "chinese-subtitle", "uncensored-leak", "today-hot",
-                                            "weekly-hot", "monthly-hot", "fc2", "siro", "luxu", "gana", "maan",
-                                            *UNCENSORED_LISTS):
+                                            "weekly-hot", "monthly-hot", "fc2", *CHANNEL_LISTS, *UNCENSORED_LISTS):
             raise ValueError(f"看起来是影片地址，不是列表地址：{value}")
         parts = [quote(unquote(p), safe="") for p in rest.split("/")]
         return "/cn/" + "/".join(parts)

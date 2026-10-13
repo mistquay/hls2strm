@@ -1,6 +1,8 @@
 import asyncio
 import logging
 
+import pytest
+
 from hls2strm.engine import Engine
 from hls2strm.fetcher import NotFound
 from hls2strm.observability import Metrics
@@ -47,6 +49,21 @@ def test_keys_and_sources():
     for key in UNCENSORED_LISTS:
         assert MISSAV.normalize_source(f"https://missav123.com/dm817/cn/{key}?page=3") == f"/cn/{key}"
     assert MISSAV.page_url("/cn/new", 3, "released_at") == "/cn/new?page=3&sort=released_at"
+
+
+@pytest.mark.parametrize("channel", ["scute", "ara", "naughty4610", "naughty0930", "madou", "twav", "furuke"])
+def test_navigation_channels_are_supported(channel):
+    # 使用站点页面样本确认分类确实存在，避免只验证白名单自身。
+    assert f"/cn/{channel}\"" in fixture("missav_list.html")
+    assert MISSAV.normalize_source(f"/cn/{channel}") == f"/cn/{channel}"
+    assert MISSAV.normalize_source(f"https://missav123.com/dm38/cn/{channel}/?page=2") == f"/cn/{channel}"
+    assert any(p["source"] == f"/cn/{channel}" for p in MISSAV.presets)
+
+
+@pytest.mark.parametrize("path", ["/cn/scut", "/cn/ssis-001", "/cn/cawd-646-uncensored-leak"])
+def test_channel_support_does_not_allow_video_or_invalid_paths(path):
+    with pytest.raises(ValueError):
+        MISSAV.normalize_source(path)
 
 
 def test_date_codes_with_underscore():
