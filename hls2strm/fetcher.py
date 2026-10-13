@@ -46,6 +46,8 @@ class Page:
 class DomainState:
     base: str
     cooldown_until: float = 0.0
+    block_reason: str = ""
+    solver_status: str = ""
     block_streak: int = 0
     ok: int = 0
     blocked: int = 0
@@ -408,8 +410,15 @@ class SiteFetcher:
         self._domain_cursor = 0
 
     def _schedule_solver(self, dom: DomainState):
-        if not self.parent.store.current.solver_url or not self.cfg.solver or dom.base in self._solving:
+        if dom.block_reason == "HTTP 429" or dom.base in self._solving:
             return
+        if not self.parent.store.current.solver_url:
+            dom.solver_status = "未配置解题服务"
+            return
+        if not self.cfg.solver:
+            dom.solver_status = "本站未启用解题服务"
+            return
+        dom.solver_status = "等待后台过盾"
         async def solve():
             try:
                 await self._solve(dom, "/", "播放请求后台恢复", time.time())
@@ -446,6 +455,7 @@ class SiteFetcher:
     def reset_cooldowns(self) -> None:
         for d in self.domains:
             d.cooldown_until = 0
+            d.block_reason = ""
             d.block_streak = 0
             d.error_until = 0
         self.limiter.set_limit(self.cfg.rate_per_sec)
@@ -481,6 +491,7 @@ class SiteFetcher:
         return path_or_url if path_or_url.startswith("/") else "/" + path_or_url
 
     def _mark_blocked(self, dom: DomainState, reason: str) -> None:
+        dom.block_reason = reason
         dom.blocked += 1
         dom.block_streak += 1
         settings = self.parent.store.current
@@ -488,10 +499,11 @@ class SiteFetcher:
         if settings.domain_cooldown_max:
             cool = min(settings.domain_cooldown_max, cool)
         dom.cooldown_until = time.time() + cool
-        dom.last_status = f"被拦截（{reason}），冷却 {cool}s"
+        label = "请求限流" if reason == "HTTP 429" else "被拦截"
+        dom.last_status = f"{label}（{reason}），冷却 {cool}s"
         self.limiter.penalize()
         self.metrics.inc("fetch_blocked")
-        log.warning("%s 被拦截（%s），冷却 %ss，限速降到 %.2f 次/秒", dom.host, reason, cool, self.limiter.rate)
+        log.warning("%s %s（%s），冷却 %ss，限速降到 %.2f 次/秒", dom.host, label, reason, cool, self.limiter.rate)
 
     async def _get(self, dom: DomainState, path: str):
         """用 curl_cffi 请求这个域名，带上解题服务给的 cookie 和 UA。"""
@@ -592,9 +604,12 @@ class SiteFetcher:
             log.debug("%s %s → HTTP %d（%.1fs%s）", self.site.label, url, status, time.monotonic() - t0,
                       "，插队" if priority else "")
             if reason := self._block_reason(resp):
-                # 429 是限流，解题也没用
+                dom.block_reason = reason
+                # 没有挑战标记的 429 按限流处理；带挑战标记的 429 仍尝试过盾。
                 page = None
-                if reason != "HTTP 429":
+                if reason == "HTTP 429":
+                    dom.solver_status = "限流，等待重试（无需过盾）"
+                else:
                     if traffic.get() == "play":
                         self._schedule_solver(dom)
                     else:
@@ -610,7 +625,7 @@ class SiteFetcher:
                             continue
                 if page is not None:
                     return self._served(page, skipped)
-                self._mark_blocked(dom, reason)
+                self._mark_blocked(dom, dom.block_reason or reason)
                 skipped.append(f"{dom.host} 被拦")
                 continue
             if status == 404:
@@ -632,6 +647,7 @@ class SiteFetcher:
                 continue
             dom.ok += 1
             dom.block_streak = 0
+            dom.block_reason = ""
             dom.last_ok_at = time.time()
             dom.last_status = "正常"
             self.limiter.reward()
@@ -641,17 +657,20 @@ class SiteFetcher:
         if missing and len(missing) == len(self.domains):
             raise NotFound(f"{self.site.label} 所有镜像都没有该页面：{path}")
         if not tried and self.domains and all(d.cooldown_until > time.time() for d in self.domains):
-            if traffic.get() == "play":
-                self._schedule_solver(self.domains[0])
-                raise Blocked(f"{self.site.label} 正在恢复，稍后重试", self.blocked_for())
-            page = await self._solve(self.domains[0], path, "域名都在冷却", time.time())
-            if page is not None:
-                return page
+            # 限流不是挑战；选可过盾的镜像，避免冷却期间反复请求限流域名。
+            recoverable = next((d for d in self.domains if d.block_reason != "HTTP 429"), None)
+            if recoverable is not None:
+                if traffic.get() == "play":
+                    self._schedule_solver(recoverable)
+                    raise Blocked(f"{self.site.label} 正在恢复，稍后重试", self.blocked_for())
+                page = await self._solve(recoverable, path, "域名都在冷却", time.time())
+                if page is not None:
+                    return page
         if errors:
             raise FetchError("；".join(errors))
         if self.cfg.domain_mode != "priority" and (missing or any(d.error_until > time.time() for d in self.domains)):
             raise FetchError(f"{self.site.label} 暂无可用镜像，部分镜像缺页或处于冷却，无法确认页面不存在")
-        raise Blocked(f"{self.site.label} 的域名都被拦截（{self._blocked_reason()}）", self.blocked_for())
+        raise Blocked(f"{self.site.label} 的域名暂不可用（{self._blocked_reason()}）", self.blocked_for())
 
     def _eligible_domains(self, tried: set[str]) -> list[DomainState]:
         now = time.time()
@@ -669,12 +688,14 @@ class SiteFetcher:
         now = time.time()
         cooling = "、".join(f"{d.host} 冷却 {int(d.cooldown_until - now)}s" for d in self.domains
                             if d.cooldown_until > now) or "没有可用域名"
-        if not self.parent.store.current.solver_url:
+        if all(d.block_reason == "HTTP 429" for d in self.domains):
+            solver = "HTTP 429 限流，等待重试（无需过盾）"
+        elif not self.parent.store.current.solver_url:
             solver = "没配置解题服务"
         elif not self.cfg.solver:
             solver = "本站没开解题服务"
         else:
-            solver = "解题服务也没通过"
+            solver = "；".join(f"{d.host}：{d.solver_status}" for d in self.domains if d.solver_status) or "等待过盾恢复"
         return f"{cooling}；{solver}"
 
     async def _solve(self, dom: DomainState, path: str, reason: str, since: float) -> Page | None:
@@ -684,26 +705,50 @@ class SiteFetcher:
         省一次解题。落到了别的站（停放、被劫持的域名会把访客引走）也算没过。
         """
         s = self.parent.store.current
-        if not s.solver_url or not self.cfg.solver:
+        if not s.solver_url:
+            dom.solver_status = "未配置解题服务"
+            return None
+        if not self.cfg.solver:
+            dom.solver_status = "本站未启用解题服务"
             return None
         async with self._solver_lock:
+            # 等锁时其他请求可能已确认是普通限流，不再用解题服务重复请求。
+            if dom.block_reason == "HTTP 429":
+                dom.solver_status = "限流，等待重试（无需过盾）"
+                return None
             if dom.solved_at > since:
                 try:
                     resp = await self._get(dom, path)
+                except PoolBusy:
+                    raise
                 except Exception:
                     resp = None
+                if resp is not None and self._block_reason(resp) == "HTTP 429":
+                    dom.block_reason = "HTTP 429"
+                    dom.solver_status = "限流，等待重试（无需过盾）"
+                    return None
                 if resp is not None and resp.status_code == 200 and not self._block_reason(resp):
+                    dom.cooldown_until = 0
+                    dom.error_until = 0
+                    dom.block_streak = 0
+                    dom.block_reason = ""
+                    dom.ok += 1
+                    dom.last_ok_at = time.time()
+                    dom.last_status = "正常（复用过盾 Cookie）"
                     return Page(resp.text, str(resp.url), dom.base)
             url = dom.base + path
+            dom.solver_status = "过盾中"
             log.info("%s 被拦截（%s），调用解题服务：%s", dom.host, reason, url)
             t0 = time.monotonic()
             try:
                 result = await call_solver(s.solver_url, url, s.proxy, s.solver_timeout)
             except Exception as e:
+                dom.solver_status = f"过盾失败：{explain_conn_error(e)}"
                 self.metrics.inc("solver_error")
                 log.warning("解题服务失败（%.0fs）：%s", time.monotonic() - t0, e)
                 return None
             if result.status == 404:
+                dom.solver_status = "过盾后 HTTP 404"
                 raise NotFound(url)
             landed = urlsplit(result.url).hostname or ""
             if landed.removeprefix("www.") != dom.host.removeprefix("www."):
@@ -713,14 +758,20 @@ class SiteFetcher:
             else:
                 fail = ""
             if fail:
+                dom.solver_status = f"过盾失败：{fail}"
                 self.metrics.inc("solver_fail")
                 log.warning("解题服务没过 %s（%.0fs）：%s", dom.host, time.monotonic() - t0, fail)
                 return None
             dom.cookies = result.cookies
             dom.user_agent = result.user_agent
             dom.solved_at = time.time()
+            dom.ok += 1
+            dom.last_ok_at = dom.solved_at
             dom.cooldown_until = 0
+            dom.error_until = 0
+            dom.block_reason = ""
             dom.block_streak = 0
+            dom.solver_status = "过盾成功，已注入 Cookie"
             dom.last_status = "解题成功，已注入 cookie"
             self.metrics.inc("solver_ok")
             log.info("解题成功（%.0fs），%s 接着用（cookie %d 个）", time.monotonic() - t0, dom.host,
@@ -742,21 +793,38 @@ class SiteFetcher:
                 "cookies": len(r.cookies), "user_agent": r.user_agent, "ms": int((time.monotonic() - t0) * 1000)}
 
     async def test_domains(self) -> list[dict]:
-        """逐个测试域名连通性（忽略冷却），成功的解除冷却。"""
+        """逐个测试域名（忽略冷却）；挑战时尝试过盾并复用 Cookie，成功的解除冷却。"""
         out = []
         for dom in self.domains:
             t0 = time.monotonic()
+            sent = time.time()
             try:
                 resp = await self._get(dom, "/")
-                ms = int((time.monotonic() - t0) * 1000)
-                blocked = bool(self._block_reason(resp))
+                reason = self._block_reason(resp)
+                blocked = bool(reason)
                 ok = resp.status_code == 200 and not blocked
+                status, via, message = resp.status_code, "curl", ""
+                if reason:
+                    dom.block_reason = reason
+                    if reason == "HTTP 429":
+                        dom.solver_status = "限流，等待重试（无需过盾）"
+                        message = "HTTP 429，请求限流（无需过盾）"
+                    else:
+                        label = "CF 挑战" if reason.endswith(" challenge") else "请求被拦截"
+                        page = await self._solve(dom, "/", reason, sent)
+                        if page is not None:
+                            ok, blocked, status, via = True, False, 200, page.via
+                            message = f"HTTP {resp.status_code}，{label} → 过盾恢复成功"
+                        else:
+                            message = f"HTTP {resp.status_code}，{label}；{dom.solver_status}"
                 if ok:
                     dom.cooldown_until = 0
                     dom.error_until = 0
+                    dom.block_reason = ""
                     dom.block_streak = 0
-                    dom.last_status = "正常"
-                out.append({"host": dom.host, "status": resp.status_code, "blocked": blocked, "ok": ok, "ms": ms})
+                    dom.last_status = "过盾恢复成功" if message else "正常"
+                out.append({"host": dom.host, "status": status, "blocked": blocked, "ok": ok,
+                            "via": via, "message": message, "ms": int((time.monotonic() - t0) * 1000)})
             except Exception as e:
                 out.append({"host": dom.host, "status": 0, "blocked": False, "ok": False, "error": str(e)[:200]})
         return out

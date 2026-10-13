@@ -1,3 +1,12 @@
+import type { DomainTestResult } from "./api";
+
+export function fmtDomainTest(r: DomainTestResult): string {
+  if (r.error) return r.error;
+  const blocked = r.blocked ? (r.status === 429 ? "，请求限流" : "，请求被拦截") : "";
+  const detail = r.message || `HTTP ${r.status}${blocked}`;
+  return `${detail}，${r.ms}ms`;
+}
+
 export function fmtNum(n: number | null | undefined): string {
   return n == null ? "-" : Number(n).toLocaleString("zh-CN");
 }

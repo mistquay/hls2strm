@@ -7,8 +7,8 @@ import { nextSubscriptionTime } from "@/components/subscription-schedule";
 import { Button } from "@/components/ui/button";
 import { Chip, Dot, EmptyRow, KV, Mono, Notice, Panel, Table, Td, Th, type Tone } from "@/components/ui/data";
 import { rewriteAll, runSubscription, verifyLibrary } from "@/lib/actions";
-import { api, type Status, type Subscription } from "@/lib/api";
-import { fmtDur, fmtNum, fmtTime, pct } from "@/lib/format";
+import { api, type DomainTestResult, type Status, type Subscription } from "@/lib/api";
+import { fmtDomainTest, fmtDur, fmtNum, fmtTime, pct } from "@/lib/format";
 import { kindName, PLAY_MODES } from "@/lib/labels";
 import { useLogs } from "@/lib/logs";
 import { useHealth, useMeta, useRun, useStatus } from "@/lib/queries";
@@ -311,16 +311,6 @@ function Metrics({ s, queueSum, c }: { s: Status; queueSum: (k: "pending" | "run
   );
 }
 
-interface TestResult {
-  site: string;
-  host: string;
-  ok: boolean;
-  status?: number;
-  blocked?: boolean;
-  ms?: number;
-  error?: string;
-}
-
 const HEALTH_TONES: Tone[] = ["ok", "warn", "warn", "err"];
 
 function PlaybackHealth() {
@@ -395,7 +385,7 @@ function PlaybackHealth() {
 function Channels({ s }: { s: Status }) {
   const run = useRun();
   const [testing, setTesting] = useState(false);
-  const [results, setResults] = useState<TestResult[] | null>(null);
+  const [results, setResults] = useState<DomainTestResult[] | null>(null);
   const meta = useMeta();
   return (
     <Panel
@@ -407,7 +397,7 @@ function Channels({ s }: { s: Status }) {
             disabled={testing}
             onClick={async () => {
               setTesting(true);
-              const r = await run(() => api.post<TestResult[]>("/api/fetcher/test"));
+              const r = await run(() => api.post<DomainTestResult[]>("/api/fetcher/test"));
               setTesting(false);
               if (r) setResults(r);
             }}
@@ -448,12 +438,13 @@ function Channels({ s }: { s: Status }) {
                   <Mono className="ml-3.5 text-muted">{d.host}</Mono>
                 </Td>
                 <Td>
-                  <Chip tone={d.cooling ? "warn" : d.ok ? "ok" : "neutral"}>{d.cooling ? `冷却 ${fmtDur(d.cooling)}` : d.ok ? "可用" : "未使用"}</Chip>
+                  <Chip tone={d.cooling ? "warn" : d.ok ? "ok" : "neutral"}>{d.cooling ? `${d.block_reason === "HTTP 429" ? "限流" : "拦截"}冷却 ${fmtDur(d.cooling)}` : d.ok ? "可用" : "未使用"}</Chip>
                   {d.last_status && (
                     <div className="max-w-[220px] truncate text-xs text-muted" title={d.last_status}>
                       {d.last_status}
                     </div>
                   )}
+                  {d.solver_status && <div className="text-xs text-muted">{d.solver_status}</div>}
                 </Td>
                 <Td className="text-right">{fmtNum(d.ok)}</Td>
                 <Td className="text-right">{fmtNum(d.blocked)}</Td>
@@ -470,7 +461,7 @@ function Channels({ s }: { s: Status }) {
               <Chip tone={r.ok ? "ok" : "err"}>{r.ok ? "通" : "不通"}</Chip>
               <span>{meta.label(r.site)}</span>
               <Mono>{r.host}</Mono>
-              <span className="text-muted">{r.error || `HTTP ${r.status}${r.blocked ? "，被 CF 拦截" : ""}，${r.ms}ms`}</span>
+              <span className="text-muted">{fmtDomainTest(r)}</span>
             </li>
           ))}
         </ul>

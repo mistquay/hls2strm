@@ -1,7 +1,7 @@
 import { RotateCcw, Wifi } from "lucide-react";
 import { useState } from "react";
-import { api, type SiteStatus } from "@/lib/api";
-import { fmtDur, fmtNum } from "@/lib/format";
+import { api, type DomainTestResult, type SiteStatus } from "@/lib/api";
+import { fmtDomainTest, fmtDur, fmtNum } from "@/lib/format";
 import { DOMAIN_MODES } from "@/lib/labels";
 import { useRun, useStatus } from "@/lib/queries";
 import { cn } from "@/lib/utils";
@@ -11,21 +11,14 @@ import { Popover, PopoverContent, PopoverTrigger } from "./ui/overlay";
 
 export function siteSignal(st: SiteStatus, blockedFor = 0): { tone: Tone; text: string } {
   if (!st.enabled) return { tone: "neutral", text: "未启用" };
-  if (blockedFor > 0 || st.blocked_for > 0) return { tone: "err", text: `被拦截，${fmtDur(blockedFor || st.blocked_for)}后重试` };
+  if (blockedFor > 0 || st.blocked_for > 0) {
+    const label = st.domains.every(d => d.block_reason === "HTTP 429") ? "请求限流" : "暂不可用";
+    return { tone: "err", text: `${label}，${fmtDur(blockedFor || st.blocked_for)}后重试` };
+  }
   const cooling = st.domains.filter(d => d.cooling > 0 || (st.domain_mode !== "priority" && d.error_cooling > 0)).length;
   if (cooling) return { tone: "warn", text: `${cooling} 个域名冷却中` };
   if (st.domains.some(d => d.ok > 0)) return { tone: "ok", text: "可用" };
   return { tone: "neutral", text: "还没请求过" };
-}
-
-interface TestResult {
-  site: string;
-  host: string;
-  ok: boolean;
-  status?: number;
-  blocked?: boolean;
-  ms?: number;
-  error?: string;
 }
 
 /** 顶栏：每个站点一盏灯，点开看域名状态、测试连通性、重置冷却。 */
@@ -45,10 +38,10 @@ function SiteLamp({ st, blockedFor }: { st: SiteStatus; blockedFor: number }) {
   const sig = siteSignal(st, blockedFor);
   const run = useRun();
   const [testing, setTesting] = useState(false);
-  const [results, setResults] = useState<TestResult[] | null>(null);
+  const [results, setResults] = useState<DomainTestResult[] | null>(null);
   const test = async () => {
     setTesting(true);
-    const r = await run(() => api.post<TestResult[]>(`/api/fetcher/test?site=${st.name}`));
+    const r = await run(() => api.post<DomainTestResult[]>(`/api/fetcher/test?site=${st.name}`));
     setTesting(false);
     if (r) setResults(r);
   };
@@ -92,8 +85,9 @@ function SiteLamp({ st, blockedFor }: { st: SiteStatus; blockedFor: number }) {
                     </span>
                   </div>
                   <div className="truncate text-xs text-muted" title={d.last_status}>
-                    {d.cooling ? `拦截冷却 ${fmtDur(d.cooling)}` : st.domain_mode !== "priority" && d.error_cooling ? `网络错误冷却 ${fmtDur(d.error_cooling)}` : d.last_status || "未使用"}
+                    {d.cooling ? `${d.block_reason === "HTTP 429" ? "限流" : "拦截"}冷却 ${fmtDur(d.cooling)}` : st.domain_mode !== "priority" && d.error_cooling ? `网络错误冷却 ${fmtDur(d.error_cooling)}` : d.last_status || "未使用"}
                   </div>
+                  {d.solver_status && <div className="text-xs text-muted" title={d.solver_status}>{d.solver_status}</div>}
                   <div className="text-xs text-muted">处理中 {d.in_flight ?? 0} · 响应 {d.response_ms == null ? "未测" : `${d.response_ms.toFixed(0)} ms`}</div>
                 </div>
               </li>
@@ -105,8 +99,8 @@ function SiteLamp({ st, blockedFor }: { st: SiteStatus; blockedFor: number }) {
                 <li key={r.host} className="flex gap-2">
                   <Chip tone={r.ok ? "ok" : "err"}>{r.ok ? "通" : "不通"}</Chip>
                   <span className="font-mono">{r.host}</span>
-                  <span className="truncate text-muted">
-                    {r.error || `HTTP ${r.status}${r.blocked ? "，被 CF 拦截" : ""}，${r.ms}ms`}
+                  <span className="min-w-0 flex-1 break-words text-muted">
+                    {fmtDomainTest(r)}
                   </span>
                 </li>
               ))}

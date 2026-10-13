@@ -121,6 +121,8 @@ export interface Domain {
   host: string;
   cooldown_until: number;
   cooling: number;
+  block_reason: string;
+  solver_status: string;
   block_streak: number;
   ok: number;
   blocked: number;
@@ -140,6 +142,17 @@ export interface SiteStatus {
   rate: { limit: number; current: number };
   concurrency: number;
   blocked_for: number;
+}
+
+export interface DomainTestResult {
+  site: string;
+  host: string;
+  ok: boolean;
+  status?: number;
+  blocked?: boolean;
+  ms?: number;
+  error?: string;
+  message?: string;
 }
 
 export interface RunningTask {
