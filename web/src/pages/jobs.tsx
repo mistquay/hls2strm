@@ -34,6 +34,8 @@ export const jobTotal = (j: Job) => Object.values(j.tasks).reduce((a, b) => a + 
 export const jobFinished = (j: Job) => (j.tasks.done ?? 0) + (j.tasks.failed ?? 0) + (j.tasks.gone ?? 0) + (j.tasks.cancelled ?? 0);
 const PHASES: Record<string,string> = {queued:"排队中",executing:"执行中",following_up:"后续处理进行中",waiting_retry:"等待重试",scheduler_paused:"调度已暂停",pausing:"暂停调度，当前步骤收尾中",partial_failure:"完成 · 部分失败"};
 const jobLabel = (j:Job) => PHASES[j.phase ?? ""] || (j.status==="done" && j.state.partial_failure ? "完成 · 部分失败" : JOB_STATUS[j.status][0]);
+// 同片整理执行时预览后有变化、没处理的组
+const skippedGroups = (j:Job) => ((j.state as Record<string,unknown>).skipped_groups as {group_id:number;code_key?:string;reason:string}[] | undefined) ?? [];
 
 function progressText(j: Job): string {
   let text = `${fmtNum(jobFinished(j))} / ${fmtNum(jobTotal(j))}`;
@@ -371,7 +373,15 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
             </Button>
           )}
         </div>
-        {job.results && <p className="text-sm text-muted">{Object.entries(job.results).map(([k,n])=>`${({sources_added:"新增源",not_found:"未找到",added:"新加入",already_exists:"已存在",skipped:"跳过",removed:"移出",matched:"匹配影片",inapplicable:"不适用",processed:"已处理影片",queued:"已排队影片"} as Record<string,string>)[k] ?? k} ${n}`).join(" · ")}</p>}
+        {job.results && <p className="text-sm text-muted">{Object.entries(job.results).map(([k,n])=>`${({sources_added:"新增源",not_found:"未找到",added:"新加入",already_exists:"已存在",skipped:"跳过",removed:"移出",matched:"匹配影片",inapplicable:"不适用",processed:"已处理影片",queued:"已排队影片",merged_groups:"已整理组",skipped_groups:"跳过组"} as Record<string,string>)[k] ?? k} ${n}`).join(" · ")}</p>}
+        {!!skippedGroups(job).length && (
+          <div className="text-sm">
+            <p className="text-warn">跳过 {skippedGroups(job).length} 组（预览后有变化），重新预览后再处理：</p>
+            <ul className="mt-1 space-y-0.5 text-[13px] text-muted">
+              {skippedGroups(job).map(g => <li key={g.group_id}>组 #{g.group_id}{g.code_key ? ` ${g.code_key}` : ""}：{g.reason}</li>)}
+            </ul>
+          </div>
+        )}
 
         <div>
           <Progress value={total ? (jobFinished(job) * 100) / total : 0} />

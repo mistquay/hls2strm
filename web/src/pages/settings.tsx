@@ -31,7 +31,7 @@ const GROUPS: { id: string; title: string; keys: string[]; note?: ReactNode }[] 
       </>
     ),
   },
-  { id: "select", title: "选源偏好", keys: ["subtitle_priority", "subtitle_fallback", "quality_first", "quality_max", "quality_unknown", "prefer_direct", "play_discover"] },
+  { id: "select", title: "选源偏好", keys: ["subtitle_priority", "subtitle_fallback", "edition_fallback", "quality_first", "quality_max", "quality_unknown", "prefer_direct", "play_discover"] },
   { id: "quality", title: "画质与多画质版本", keys: ["variant_mode", "version_min_height", "quality_capture", "quality_concurrency", "quality_pending"] },
   { id: "timeouts", title: "播放时限", keys: ["resolve_timeout", "resolve_attempt_timeout"],
     note: "超过总时限还没开始返回，播放器会收到 504，日志里会写明卡在哪一步；调大只会让失败时等得更久，线路本身失败时调大没用。" },
@@ -91,6 +91,7 @@ const LABELS: Record<string, string> = {
   hls_margin: "有效期余量（分钟）",
   subtitle_priority: "字幕偏好",
   subtitle_fallback: "字幕回退",
+  edition_fallback: "版本起播备用",
   quality_first: "画质优先",
   quality_max: "选源画质偏好上限",
   quality_unknown: "未知画质按",
@@ -107,7 +108,7 @@ const LABELS: Record<string, string> = {
   resolve_proxy_url: "公网中转地址",
 };
 const SUBTITLE_NAMES: Record<string, string> = { zh: "中文字幕", none: "无字幕", en: "英文字幕" };
-const ENUM_NAMES: Record<string, Record<string, string>> = { play_mode: PLAY_MODES, resolve_mode: RESOLVE_MODES, variant_mode: VARIANT_MODES };
+const ENUM_NAMES: Record<string, Record<string, string>> = { edition_fallback: {off:"关闭",both:"普通版和 -U 版互为备用",normal_uses_u:"只让普通版用 -U 版备用",u_uses_normal:"只让 -U 版用普通版备用"}, play_mode: PLAY_MODES, resolve_mode: RESOLVE_MODES, variant_mode: VARIANT_MODES };
 const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b);
 const clone = <T,>(v: T): T => JSON.parse(JSON.stringify(v));
 const label = (k: string) => LABELS[k] ?? k;

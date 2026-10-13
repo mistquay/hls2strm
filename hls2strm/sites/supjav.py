@@ -16,7 +16,7 @@ from urllib.parse import parse_qs, quote, unquote, urlsplit
 
 from selectolax.lexbor import LexborHTMLParser
 
-from ..codes import code_key
+from ..codes import STUDIOS, code_key
 from ..errors import FetchError, ParseError
 from ..quality import from_labels
 from .hosts import HostStream, resolve_embed
@@ -34,6 +34,9 @@ _FC2_RE = re.compile(r"^FC2[\s-]*(?:PPV)?[\s-]*(\d{5,9})", re.I)
 _CODE_RE = re.compile(r"^([A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+)(?=\s|$|[^\w-])")
 _HEYZO_RE = re.compile(r"^(HEYZO)[\s-]*(\d+)", re.I)
 _DATE_CODE_RE = re.compile(r"(?<!\d)(\d{6}[-_]\d{2,3})(?!\d)")
+_STUDIO_TITLE_RE = re.compile(r"(?<![a-z0-9])(" + "|".join(
+    sorted((re.escape(a) for names, _ in STUDIOS.values() for a in names), key=len, reverse=True)
+) + r")(?![a-z])", re.I)
 _PAGE_RE = re.compile(r"/page/(\d+)")
 
 
@@ -52,7 +55,8 @@ def parse_title(title: str) -> tuple[str, str, bool]:
     elif m := _CODE_RE.match(rest):
         code = m.group(1).upper()
     elif m := _DATE_CODE_RE.search(rest):
-        code = m.group(1).replace("_", "-")
+        studio = _STUDIO_TITLE_RE.search(rest[:m.start()])
+        code = (studio.group(1).upper() + "-" if studio else "") + m.group(1)
     else:
         code = ""
     return code, subtitle, uncensored

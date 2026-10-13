@@ -573,6 +573,8 @@ async def _full_view(c, v: dict) -> dict:
     sources = await c.db.get_sources(v["id"])
     view = _video_view(c, v, sources, await c.db.lines_for([s["id"] for s in sources]))
     view["outputs"] = await c.db.get_outputs(v["id"])
+    view["siblings"] = [{k: other[k] for k in ("slug", "uncensored", "status")}
+                        for other in await c.db.sibling_videos(v, active_only=False)]
     return view
 
 

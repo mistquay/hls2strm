@@ -10,11 +10,14 @@ export interface PlaybackSource {
   height: number;
   duration: number;
   url: string;
+  served_slug: string;
+  requested_slug: string;
+  edition_fallback: boolean;
 }
 
 const key = (source: PlaybackSource) => `${source.source_id}:${source.line_id}`;
 export const sourceLabel = (source: PlaybackSource) =>
-  `${source.label}${source.line ? ` · ${source.line} / ${source.host}` : ""} · ${source.media_type === "hls" ? "HLS" : "MP4"} · 中转`;
+  `${source.label}${source.line ? ` · ${source.line} / ${source.host}` : ""} · ${source.media_type === "hls" ? "HLS" : "MP4"} · 中转${source.edition_fallback ? ` · 版本备用：${source.served_slug}` : ""}`;
 
 /** 一次恢复有总预算和次数限制，换源始终建立新会话，旧异步结果不能覆盖新请求。 */
 export function usePlaybackSource(video: RefObject<HTMLVideoElement | null>, src: string) {
@@ -36,12 +39,15 @@ export function usePlaybackSource(video: RefObject<HTMLVideoElement | null>, src
   const switchReason = useRef("");
   const stable = useRef({ key: "", since: 0 });
   const userPaused = useRef(false);
+  const playedEdition = useRef<{slug:string;requested:string}|null>(null);
 
   const change = useCallback((reason: string, auto = false, retry = false) => {
     if (preparing) return false;
     if (auto && (!automatic || recovery.current.count >= 3 ||
       (recovery.current.until > 0 && performance.now() >= recovery.current.until))) return false;
     const v = video.current;
+    if (v && v.currentTime > 0 && prepared?.served_slug && !playedEdition.current)
+      playedEdition.current = {slug:prepared.served_slug,requested:prepared.requested_slug};
     // 连续候选失败时沿用最初进度，不能用尚未起播的新 video 的 0 覆盖。
     if (v && !recovering.current) {
       snapshot.current = { time: v.currentTime, duration: v.duration, paused: v.paused && v.readyState >= 2,
@@ -75,6 +81,12 @@ export function usePlaybackSource(video: RefObject<HTMLVideoElement | null>, src
     const controller = new AbortController();
     let cancelled = false;
     const target = new URL(src, location.href);
+    // 已起播后的恢复只在实际版本内换源，不能跨版本沿用播放进度。
+    if (playedEdition.current) {
+      const quality = target.pathname.match(/@[a-z0-9]+(?=\.m3u8$)/i)?.[0] ?? "";
+      target.pathname = target.pathname.replace(/[^/]+$/, `${playedEdition.current.slug}${quality}.m3u8`);
+      target.searchParams.set("edition_only", "1");
+    }
     target.searchParams.set("prepare", "1");
     target.searchParams.set("proxy", "1");
     target.searchParams.set("skip", [...tried.current].join(","));
@@ -85,6 +97,10 @@ export function usePlaybackSource(video: RefObject<HTMLVideoElement | null>, src
       if (!response.ok) throw new Error(body.detail || `选源失败（HTTP ${response.status}）`);
       if (cancelled) return;
       const source = { ...body, url: new URL(body.url, response.url).href } as PlaybackSource;
+      if (playedEdition.current) {
+        source.requested_slug = playedEdition.current.requested;
+        source.edition_fallback = source.served_slug !== source.requested_slug;
+      }
       setPrepared(source);
       setPreparing(false);
       setMessage(`${switchReason.current ? switchReason.current + "；" : ""}正在加载：${sourceLabel(source)}`);
@@ -149,6 +165,7 @@ export function usePlaybackSource(video: RefObject<HTMLVideoElement | null>, src
     if (!prepared || !video.current || video.current.currentTime <= 0 || error || video.current.paused ||
       (recovering.current && video.current.currentTime <= snapshot.current.time + 0.05)) return;
     setCurrent(prepared);
+    playedEdition.current ??= {slug:prepared.served_slug,requested:prepared.requested_slug};
     setMessage("");
     recovering.current = false;
     resumeAt.current = 0;

@@ -31,7 +31,7 @@ from weakref import WeakValueDictionary
 
 from . import archive
 from .file_changes import guarded
-from .codes import work_slug
+from .codes import edition, work_slug
 from .config import BootConfig, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
@@ -584,9 +584,10 @@ class Engine:
         return self.store.current.site_rank(site)
 
     @staticmethod
-    def _slug_for(site: Site, key: str, code: str, uncensored: bool) -> str:
+    def _slug_for(site: Site, key: str, code: str, uncensored: bool, maker: str = "") -> str:
         """新作品的 slug：Jable 沿用站内 slug（和老数据一致），其他站用番号。"""
-        return key if site.name == "jable" else work_slug(code, uncensored)
+        normalized = edition(code, uncensored, maker)
+        return key if site.name == "jable" and (not uncensored or normalized) else work_slug(code, normalized)
 
     async def upsert_item(self, site: Site, it: SourceItem, *, crawl: tuple[int, int, int] | None = None) -> tuple[dict, bool]:
         vid, created = await self.db.upsert_item(site.name, it, self._slug_for(site, it.key, it.code, it.uncensored),
@@ -594,7 +595,7 @@ class Engine:
         return await self.db.get_video_by_id(vid), created
 
     async def upsert_detail(self, site: Site, d: SourceDetail) -> dict:
-        vid = await self.db.upsert_detail(site.name, d, self._slug_for(site, d.key, d.code, d.uncensored), self._rank)
+        vid = await self.db.upsert_detail(site.name, d, self._slug_for(site, d.key, d.code, d.uncensored, d.maker), self._rank)
         return await self.db.get_video_by_id(vid)
 
     @guarded
@@ -801,8 +802,8 @@ class Engine:
 
     async def _lookup(self, site: Site, v: dict, notes: list[str],
                       priority: bool = False) -> list[SourceItem | SourceDetail]:
-        return await find_by_code(site, self.fetcher.site(site.name), v["code"], bool(v["uncensored"]), priority,
-                                  notes)
+        return await find_by_code(site, self.fetcher.site(site.name), v["code"], edition(v["code"], v["uncensored"], v["maker"]), priority,
+                                  notes, prefixes=self.db.prefixes, maker=v["maker"])
 
     async def probe_video(self, slug: str) -> tuple[dict, list[dict]]:
         """影片库里点「查找其他源」：到每个启用、还没有源的站点找一次（不管之前查过没有）。

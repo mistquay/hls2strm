@@ -21,7 +21,7 @@ from typing import Any
 
 import aiosqlite
 
-from .codes import code_key
+from .codes import Prefixes, code_key, compatible_keys, edition, is_native, legacy_code_key, work_slug
 from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
 from .cache import AsyncCache
 from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18, migrate_v19 as _migrate_v19
@@ -277,7 +277,7 @@ async def _migrate_v6(conn: aiosqlite.Connection) -> None:
         await conn.execute(sql)
     async with conn.execute("SELECT id, code, slug FROM videos") as cur:
         rows = await cur.fetchall()
-    await conn.executemany("UPDATE videos SET code_key=? WHERE id=?", [(code_key(r[1] or r[2]), r[0]) for r in rows])
+    await conn.executemany("UPDATE videos SET code_key=? WHERE id=?", [(legacy_code_key(r[1] or r[2]), r[0]) for r in rows])
     await conn.execute("CREATE INDEX videos_code_key ON videos(code_key)")
 
 
@@ -336,7 +336,7 @@ async def _migrate_v11(conn: aiosqlite.Connection) -> None:
 async def _migrate_v16(conn: aiosqlite.Connection) -> None:
     """日期型番号（没有字母）的匹配键保留下划线：100826_001 和 100826-001 是不同厂牌的片，不再算同一部。"""
     async with conn.execute(r"SELECT id, code FROM videos WHERE code LIKE '%\_%' ESCAPE '\'") as cur:
-        rows = [(code_key(r["code"]), r["id"]) for r in await cur.fetchall() if not any(c.isalpha() for c in r["code"])]
+        rows = [(legacy_code_key(r["code"]), r["id"]) for r in await cur.fetchall() if not any(c.isalpha() for c in r["code"])]
     await conn.executemany("UPDATE videos SET code_key=? WHERE id=?", rows)
 
 
@@ -354,9 +354,29 @@ async def _migrate_v17(conn: aiosqlite.Connection) -> None:
     await conn.execute("CREATE TABLE site_retirements(site TEXT PRIMARY KEY, job_id INTEGER NOT NULL, created_at INTEGER NOT NULL)")
 
 
+async def _migrate_v22(conn: aiosqlite.Connection) -> None:
+    """只重算匹配键并清掉失效的负查找记录，不改版本、slug 或文件。"""
+    async with conn.execute("SELECT id,code,slug,maker,code_key FROM videos") as cur:
+        rows = [(key, r["id"]) for r in await cur.fetchall()
+                if (key := code_key(r["code"] or r["slug"], r["maker"])) != r["code_key"]]
+    await conn.executemany("DELETE FROM source_checks WHERE video_id=? AND found=0", [(vid,) for _, vid in rows])
+    await conn.executemany("UPDATE videos SET code_key=? WHERE id=?", rows)
+
+
+async def _migrate_v23(conn: aiosqlite.Connection) -> None:
+    await conn.execute("""CREATE TABLE video_aliases (
+        slug TEXT PRIMARY KEY, video_id INTEGER NOT NULL, created_at INTEGER NOT NULL, job_id INTEGER)""")
+    await conn.execute("CREATE INDEX video_aliases_video ON video_aliases(video_id)")
+
+
+async def _migrate_v24(conn: aiosqlite.Connection) -> None:
+    await conn.execute("ALTER TABLE play_history ADD COLUMN served_video_id INTEGER")
+    await conn.execute("UPDATE play_history SET served_video_id=video_id")
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21]
+              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21, _migrate_v22, _migrate_v23, _migrate_v24]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -433,6 +453,7 @@ class Database:
         self.metrics = None
         self.subscription_schedule_started_at = 0
         self._lock = asyncio.Lock()
+        self.prefixes = Prefixes()
 
     async def open(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -441,6 +462,8 @@ class Database:
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
+        for row in await self._all("SELECT DISTINCT code FROM videos WHERE code GLOB '[0-9][0-9][0-9][A-Z]*'"):
+            self.prefixes.add(row["code"])
         for attr in ("reader", "bulk_reader"):
             conn = await aiosqlite.connect(self.path, isolation_level=None)
             conn.row_factory = aiosqlite.Row
@@ -554,7 +577,7 @@ class Database:
     # ---- 作品与源 ----
 
     async def _attach(self, site: str, key: str, code: str, uncensored: bool, slug: str, site_vid: str,
-                      title: str, subtitle: str, video_id: int | None = None) -> tuple[int, int, bool, bool]:
+                      title: str, subtitle: str, video_id: int | None = None, maker: str = "") -> tuple[int, int, bool, bool]:
         """在事务里调用：找到或新建这个源和它所属的作品，返回 (作品 id, 源 id, 是否新作品, 是不是用户删掉的源)。
 
         已有的源直接用；新源挂到指定的作品（video_id，补源时用），没指定就按番号匹配键 + 是否无码流出找作品，
@@ -575,19 +598,34 @@ class Database:
                 (site_vid, site_vid, title, title, subtitle, subtitle, t, src["id"]),
             )
             return src["video_id"], src["id"], False, False
-        ck = code_key(code)
+        ck = code_key(code, maker)
+        normalized = edition(code, uncensored, maker)
+        if uncensored and not normalized:
+            slug = work_slug(code)
+        uncensored = normalized
         work = {"id": video_id} if video_id else None
         if ck and work is None:
+            condition = "code_key=?" if is_native(ck) else "code_key=? AND uncensored=?"
+            params = (ck,) if is_native(ck) else (ck, int(uncensored))
             async with self.conn.execute(
-                "SELECT id FROM videos WHERE code_key=? AND uncensored=? ORDER BY status='active' DESC, id LIMIT 1",
-                (ck, int(uncensored)),
+                f"SELECT id FROM videos WHERE {condition} ORDER BY status='active' DESC, id LIMIT 1", params,
             ) as cur:
                 work = await cur.fetchone()
+            if work is None and (alternatives := compatible_keys(ck)):
+                # 没写厂牌的源：没有精确匹配、且带厂牌的兼容作品唯一时才挂过去，不凭活动状态猜一个厂牌。
+                # 带厂牌的源不会反过来挂到没写厂牌的作品上（见 compatible_keys）。
+                async with self.conn.execute(
+                    f"SELECT id FROM videos WHERE code_key IN ({','.join('?' for _ in alternatives)}) LIMIT 2",
+                    alternatives,
+                ) as cur:
+                    candidates = await cur.fetchall()
+                if len(candidates) == 1:
+                    work = candidates[0]
         created = work is None
         if created:
             base, n = slug, 1
             while True:
-                async with self.conn.execute("SELECT 1 FROM videos WHERE slug=?", (slug,)) as cur:
+                async with self.conn.execute("SELECT 1 FROM videos WHERE slug=? UNION ALL SELECT 1 FROM video_aliases WHERE slug=?", (slug, slug)) as cur:
                     if await cur.fetchone() is None:
                         break
                 n += 1
@@ -620,9 +658,13 @@ class Database:
         for k in ("models", "categories", "tags"):
             if k in sets:
                 sets[k] = json.dumps(sets[k], ensure_ascii=False)
-        if code:
-            sets["code"] = code.upper()
-            sets["code_key"] = code_key(code)
+        if code or "maker" in sets:
+            async with self.conn.execute("SELECT code,slug,maker FROM videos WHERE id=?", (video_id,)) as cur:
+                current = await cur.fetchone()
+            if code:
+                sets["code"] = code.upper()
+                self.prefixes.add(code)
+            sets["code_key"] = code_key(code or current["code"] or current["slug"], sets.get("maker", current["maker"]))
         sets["status"] = "active"  # 抓到了可用的源：下架的、删源后没有源的都回来
         sets["removed_from"] = ""
         sets["updated_at"] = t
@@ -656,7 +698,7 @@ class Database:
         t = now()
         async with self._tx():
             video_id, source_id, _, removed = await self._attach(site, d.key, d.code, d.uncensored, slug, d.site_vid,
-                                                                 d.title, d.subtitle, video_id)
+                                                                 d.title, d.subtitle, video_id, d.maker)
             if removed:
                 return video_id
             if d.lines:
@@ -1044,7 +1086,19 @@ class Database:
         return {int(r["site_vid"]): r["slug"] for r in rows if r["site_vid"].isdigit()}
 
     async def get_video(self, slug: str) -> dict | None:
-        return _video_row(await self._one("SELECT * FROM videos WHERE slug=?", (slug.lower(),)))
+        row = await self._one("SELECT * FROM videos WHERE slug=?", (slug.lower(),))
+        if row is None:
+            row = await self._one("SELECT v.* FROM video_aliases a JOIN videos v ON v.id=a.video_id WHERE a.slug=?", (slug.lower(),))
+        return _video_row(row)
+
+    async def sibling_videos(self, video: dict, *, active_only: bool = True) -> list[dict]:
+        key = video["code_key"]
+        if not key or is_native(key):
+            return []
+        rows = await self._all("SELECT * FROM videos WHERE code_key=? AND uncensored!=?"
+                               + (" AND status='active'" if active_only else "") + " ORDER BY id",
+                               (key, int(edition(video["code"], video["uncensored"], video["maker"]))))
+        return [_video_row(row) for row in rows]
 
     async def set_duration(self, video_id: int, duration: int) -> None:
         await self._write("UPDATE videos SET duration=? WHERE id=?", (duration, video_id))
@@ -1316,7 +1370,7 @@ class Database:
         return [r["strm_path"] for r in rows]
 
     async def video_keys(self) -> list[tuple[int, str]]:
-        rows = await self._all("SELECT id, slug FROM videos", bulk=True)
+        rows = await self._all("SELECT id, slug FROM videos UNION ALL SELECT video_id,slug FROM video_aliases", bulk=True)
         return [(r["id"], r["slug"]) for r in rows]
 
     # ---- strm 扫描 ----

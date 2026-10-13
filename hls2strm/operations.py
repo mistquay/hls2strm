@@ -43,13 +43,20 @@ class Operations:
             await _retired(self.db,request["payload"]["site"])
         if request["kind"]=="library":
             request["payload"]["values"] = library_body(self.e,request["payload"])
-        Planner(self.e,request)  # 拒绝无效配置/筛选，不创建空壳任务。
+        if request["kind"] == "dedupe":
+            from .dedupe import options
+            options(request["payload"])
+        else:
+            Planner(self.e,request)  # 拒绝无效配置/筛选，不创建空壳任务。
         job = await self.db.create_job("preview","计算影响预览",{"operation":request})
         await self.db.add_tasks(job,"preview",["all"],100)
         self.e.notify()
         return job
 
     async def calculate(self,request,job_id,*,save=False):
+        if request["kind"] == "dedupe":
+            from .dedupe import calculate
+            return await calculate(self.e, request, job_id, save)
         baseline = context(self.e,request)
         planner = Planner(self.e,request)
         counts = {"matched":0,"added":0,"removed":0,"rewritten":0,"archived":0,"kept":0,"unknown":0,"skipped":0,"already_exists":0,"tasks":0}
@@ -181,6 +188,9 @@ class Operations:
         from . import site_retirement
         preview = await self.db.get_job(job["params"]["preview_id"])
         request = preview["params"]["operation"]
+        if request["kind"] == "dedupe":
+            from .dedupe_apply import apply
+            return await apply(self.e, job, preview)
         async with self.e.file_changes.exclusive():
             current = await self.db.get_job(job["id"])
             state = dict(current["state"])

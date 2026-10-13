@@ -57,7 +57,7 @@ def test_titles_lists_and_sources():
     assert parse_title("[4K][英文字幕]IPZZ-983 a") == ("IPZZ-983", "en", False)
     assert parse_title("FC2PPV 4988588 xx") == ("FC2-PPV-4988588", "", False)
     assert parse_title("HEYZO 3894 x")[0] == "HEYZO-3894"
-    assert parse_title("Caribbeancom 加勒比 071926-001 xx")[0] == "071926-001"
+    assert parse_title("Caribbeancom 加勒比 071926-001 xx")[0] == "CARIBBEANCOM-071926-001"
 
     lp = SUPJAV.parse_list(fixture("supjav_list.html"))
     assert len(lp.items) == 24 and lp.last_page == 456

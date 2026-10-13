@@ -70,6 +70,7 @@ const ADDED: Record<string, string> = Object.fromEntries(ADDED_OPTIONS.map(o => 
 
 export default function Videos() {
   const { params } = useRoute();
+  const [dedupe,setDedupe] = useState<OperationRequest|null>(null);
   const meta = useMeta();
   const { data: libraries = [] } = useLibraries();
   const p = (k: string) => params.get(k) ?? "";
@@ -155,7 +156,13 @@ export default function Videos() {
 
   return (
     <>
+      <Dialog open={!!dedupe} onOpenChange={open=>!open && setDedupe(null)}>
+        <DialogContent title="同片整理" className="max-h-[90vh] overflow-auto sm:max-w-4xl">
+          {dedupe && <OperationPreview request={dedupe} onRequestChange={setDedupe} onApplied={()=>setDedupe(null)} confirmText="确认整理并清理重复文件" />}
+        </DialogContent>
+      </Dialog>
       <div className="flex flex-wrap items-center gap-2">
+        <Button onClick={()=>setDedupe({kind:"dedupe",payload:{}})}>同片整理</Button>
         <div className="relative min-w-[220px] flex-1">
           <Search className="pointer-events-none absolute left-2.5 top-1/2 size-4 -translate-y-1/2 text-muted" />
           <Input value={q} onChange={e => setQ(e.target.value)} placeholder="搜番号、标题、女优、标签" className="pl-8" aria-label="搜索影片" />

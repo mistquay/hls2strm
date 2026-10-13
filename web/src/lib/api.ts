@@ -383,6 +383,7 @@ export interface Output {
 }
 
 export interface Video {
+  siblings?: {slug:string;uncensored:number;status:string}[];
   id: number;
   slug: string;
   code: string;

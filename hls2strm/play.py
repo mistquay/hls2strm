@@ -34,6 +34,7 @@ from .health import HealthTracker, host_key
 from .quality import QualityProber, filter_master, from_master, label as quality_label, needed as quality_needed
 from .quality import parse_heights, parse_label, tier as quality_tier
 from .sites.hosts import ts_start
+from .codes import edition
 from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
 from .runtime import deadline as request_deadline, traffic, stage, measured_lock, attempt_wait_state, trace
 from .playback import PlaybackSessions
@@ -77,6 +78,7 @@ class Resolved:
     line: dict | None = None  # 多线路站点：这次用的线路
     proxy_forced: bool = False  # 线路设置了强制中转
     allow_direct: bool = False
+    requested: dict | None = None  # 版本起播备用：请求影片和实际供源影片分别保留。
 
     @property
     def traits(self) -> StreamTraits:
@@ -259,7 +261,7 @@ class Resolver:
 
     async def resolve(self, slug: str, *, min_remaining: int | None = None, site: str | None = None,
                       line: str | None = None, direct_only: bool = False, remote: bool = False,
-                      want: int | None = None, relay: bool = False,
+                      want: int | None = None, relay: bool = False, edition_only: bool = False,
                       excluded: frozenset[tuple[int, int]] = frozenset()) -> Resolved:
         """挑一个能用的源并返回它的新鲜地址；依次尝试，全部失败才报错。line 只在指定了 site 时有效。
         want：要的档位，有这一档的源、线路优先。拿到地址后，还不知道画质的在后台顺手探测（只请求 CDN）。"""
@@ -269,7 +271,7 @@ class Resolver:
             with stage(self.metrics, "play.resolve"):
                 async with asyncio.timeout_at(limit):
                     r = await self._resolve(slug, min_remaining=min_remaining, site=site, line=line, direct_only=direct_only,
-                                            remote=remote, want=want, relay=relay, excluded=excluded)
+                                            remote=remote, want=want, relay=relay, excluded=excluded, edition_only=edition_only)
         except TimeoutError:
             self.metrics.inc("play_deadline_exceeded")
             raise FetchError("播放解析超过总时间预算") from None
@@ -281,13 +283,24 @@ class Resolver:
         return r
 
     async def _resolve(self, slug: str, *, min_remaining: int | None, site: str | None, line: str | None,
-                       direct_only: bool, remote: bool, want: int | None, relay: bool = False,
+                       direct_only: bool, remote: bool, want: int | None, relay: bool = False, edition_only: bool = False,
                        excluded: frozenset[tuple[int, int]] = frozenset()) -> Resolved:
         v = await self.db.get_video(slug.lower())
         if v is None:
             v = await self.discover(slug.lower())
         sources = await self.db.get_sources(v["id"])
         ranked = self.rank(sources, site=site, direct_only=direct_only, remote=remote, want=want)
+        owners = {v["id"]: v}
+        mode = self.store.current.edition_fallback
+        u = edition(v["code"], v["uncensored"], v["maker"])
+        allowed = mode == "both" or mode == ("u_uses_normal" if u else "normal_uses_u")
+        if allowed and not site and not edition_only:
+            siblings = await self.db.sibling_videos(v)
+            owners.update({other["id"]: other for other in siblings})
+            extras = [src for group in (await self.db.sources_for([other["id"] for other in siblings])).values() for src in group]
+            if ranked and not self.store.current.subtitle_fallback:
+                extras = [src for src in extras if src["subtitle"] == ranked[0]["subtitle"]]
+            ranked += self.rank(extras, direct_only=direct_only, remote=remote, want=want)
         # 先应用字幕偏好，再排除本轮失败候选，不能借排除绕过“字幕不回退”。
         before = len(ranked)
         ranked = [src for src in ranked if (src["id"], 0) not in excluded]
@@ -307,6 +320,7 @@ class Resolver:
         blocked: Blocked | None = None
         gone = 0
         for i, src in enumerate(ranked):
+            owner = owners[src["video_id"]]
             left = deadline - time.monotonic()
             if left <= 0:
                 errors.append(f"超过 {timeout} 秒，没再试后面的源")
@@ -317,8 +331,8 @@ class Resolver:
             wait_token = attempt_wait_state.set(wait_state)
             try:
                 attempts = 2 if get_site(src["site"]).multi_line else 1
-                need = 60 if relay and not get_site(src["site"]).multi_line else self._need(v, min_remaining)
-                r = await asyncio.wait_for(self._ensure(v, src, need, line=line if site else None,
+                need = 60 if relay and not get_site(src["site"]).multi_line else self._need(owner, min_remaining)
+                r = await asyncio.wait_for(self._ensure(owner, src, need, line=line if site else None,
                                                         direct_only=direct_only, remote=remote, height=want,
                                                         excluded=excluded), min(left, self.store.current.resolve_attempt_timeout * attempts))
             except (NotFound, VideoGone) as e:
@@ -356,6 +370,13 @@ class Resolver:
                 continue
             finally:
                 attempt_wait_state.reset(wait_token)
+            if owner["id"] != v["id"]:
+                r.requested = v
+                target = "-U 版" if owner["uncensored"] else "普通版"
+                message = f"播放 {v['slug']}：本版的源都不可用，改用 {target} {owner['slug']} 的源 {label}"
+                log.info(message)
+                trace(message)
+                self.metrics.inc("play_edition_fallback")
             if i:
                 self.metrics.inc("play_failover")
                 log.info("%s 前 %d 个源不可用，改用 %s", slug, i, label)
@@ -392,7 +413,7 @@ class Resolver:
                 break
             try:
                 found = await asyncio.wait_for(
-                    find_by_code(site, self.fetcher.site(name), v["code"], bool(v["uncensored"]), priority=True), min(left, s.resolve_attempt_timeout))
+                    find_by_code(site, self.fetcher.site(name), v["code"], edition(v["code"], v["uncensored"], v["maker"]), priority=True, prefixes=self.db.prefixes, maker=v["maker"]), min(left, s.resolve_attempt_timeout))
             except (NotFound, VideoGone):
                 found = []  # 搜索页 404 也是这个站没有，不能让整个解析变成「影片不存在」
             except (Blocked, FetchError, ParseError, TimeoutError) as e:
@@ -432,7 +453,7 @@ class Resolver:
             if not site.can_lookup or not s.site(name).enabled or (name != "jable" and not s.play_discover):
                 continue
             try:
-                found = await asyncio.wait_for(find_by_code(site, self.fetcher.site(name), slug, priority=True), s.resolve_attempt_timeout)
+                found = await asyncio.wait_for(find_by_code(site, self.fetcher.site(name), slug, priority=True, prefixes=self.db.prefixes), s.resolve_attempt_timeout)
             except (Blocked, FetchError, ParseError, TimeoutError) as e:
                 errors.append(e)
                 log.info("在 %s 找 %s 失败：%s", site.label, slug, e)
@@ -598,6 +619,7 @@ class Resolver:
         if stale is None and (not r.traits.expires or (r.expires or 0)-time.time() >= 60):
             return r
         refreshed = await self.ensure_source(source_id, stale=stale, line_id=r.line["id"] if r.line else None)
+        refreshed.requested = r.requested
         self.sessions.update(session, refreshed)
         return refreshed
 
@@ -707,7 +729,7 @@ async def _pick_variant(ctx, r: Resolved, want: int | None) -> str:
 
 @router.api_route("/play/{name}", methods=["GET", "HEAD"])
 async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: str = "", line: str = "",
-               variants: str = "", prepare: bool = False, skip: str = "", continuous: bool = False):
+               variants: str = "", prepare: bool = False, skip: str = "", continuous: bool = False, edition_only: bool = False):
     """proxy=1 强制中转（网页试播用）；src=站点 只用这个站点的源，line=线路 再限定线路。
     variants=all 多码率的主播放列表整个给（网页试播要切画质），不管设置里的「只给最高一档」。
     {slug}@720p.m3u8 要指定档位（多画质版本的 strm 用）：有这一档的源优先，多档的主播放列表只给这一档。
@@ -729,7 +751,7 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
         excluded = {tuple(map(int, part.split(":"))) for part in parts}
     forced = prepare or bool(proxy) or continuous or s.play_mode == "proxy" or bool(direct_blocker(s.proxy_user_agents, ua, origin, fetch_mode))
     r = await _resolve_or_http(request, slug, site=src or None, line=line or None, want=want,
-                                relay=forced, remote=s.play_remote, excluded=frozenset(excluded))
+                                relay=forced, remote=s.play_remote, excluded=frozenset(excluded), edition_only=edition_only)
     if prepare:
         request.scope["skip_play_history"] = True
         return JSONResponse({**playback_source(r), "url": await _media_location(request, r, want)},
@@ -970,6 +992,8 @@ async def _media_location(request: Request, r: Resolved, want: int | None = None
 def playback_source(r: Resolved) -> dict:
     from .health import host_label
     return {"source_id": r.source["id"], "line_id": r.line["id"] if r.line else 0,
+            "served_slug": r.video["slug"], "requested_slug": (r.requested or r.video)["slug"],
+            "edition_fallback": r.requested is not None,
             "site": r.site.name, "label": r.site.label, "line": r.line["line"] if r.line else "",
             "host": host_label(r.host), "media_type": "hls" if _is_hls(r.url) else "file",
             "height": (r.line or r.source).get("height") or 0,
@@ -1062,8 +1086,12 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
     refs += re.findall(r'URI="([^"]+)"', raw.decode("utf-8", "replace"))
     unsafe = any("?" in urljoin(r.url, ref) or not urljoin(r.url, ref).startswith(root) for ref in refs)
     if not r.site.multi_line and r.traits.expires and (r.expires or 0)-time.time() < required and unsafe:
-        r = await _resolve_or_http(request, r.video["slug"], min_remaining=required,
-                                   site=request.query_params.get("src") or None, line=request.query_params.get("line") or None, want=want)
+        requested = r.requested
+        r = await _resolve_or_http(request, (requested or r.video)["slug"], min_remaining=required,
+                                   site=request.query_params.get("src") or None, line=request.query_params.get("line") or None,
+                                   want=want, edition_only=request.query_params.get("edition_only") in ("1", "true", "True"))
+        if requested and r.video["id"] != requested["id"]:
+            r.requested = requested
         history_delivery(request,r)
         if not _is_hls(r.url):
             return await _proxy_file(request, r)

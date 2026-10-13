@@ -108,6 +108,7 @@ function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }
       </header>
 
       <div className="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-4">
+        {!!v.siblings?.length && <div className="flex flex-wrap items-center gap-2 text-sm">其他版本：{v.siblings.map(other=><Button key={other.slug} size="sm" onClick={()=>run(async()=>{openDetail(await api.get<Video>(`/api/videos/${other.slug}`));})}>{other.slug} · {other.uncensored ? "-U 版" : "普通版"} · {other.status==="active" ? "可用" : other.status==="removed" ? "已删源" : "已下架"}</Button>)}</div>}
         {videoError && <p role="alert" className="text-xs text-err">影片信息更新失败：{videoError.message}</p>}
         {jobId > 0 && <p className="text-xs text-muted">任务 #{jobId} · {busy ? `已处理 ${(job?.tasks.done ?? 0) + (job?.tasks.failed ?? 0) + (job?.tasks.gone ?? 0)} 项，可离开页面` : job?.status === "cancelled" ? "已取消" : job?.state.partial_failure ? "完成，部分步骤失败，请在任务页重试" : "已完成"}</p>}
         <div className="grid gap-4 sm:grid-cols-[240px_1fr]">

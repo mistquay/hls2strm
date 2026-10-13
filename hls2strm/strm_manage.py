@@ -153,7 +153,7 @@ def iter_scan_rows(root, library_roots, managed, slug_by_id, id_by_slug, scan_id
 
 
 def find_by_video(roots: list[Path], slug_by_id: dict[int, str],
-                  id_by_slug: dict[str, int]) -> tuple[dict[int, list[str]], list[int]]:
+                  id_by_slug: dict[str, int], alias_paths: set[str] | None = None) -> tuple[dict[int, list[str]], list[int]]:
     """按 strm 内容（本服务地址或 CDN 直链）找出每部影片的文件，不看文件名，所以外部工具改名也认得出。
     返回 (每部影片的文件, 每个目录里认得出的 strm 数)。
 
@@ -162,20 +162,28 @@ def find_by_video(roots: list[Path], slug_by_id: dict[int, str],
     """
     now = time.time()
     found: dict[int, list[str]] = {}
+    current = {}
+    for slug, vid in id_by_slug.items():
+        current.setdefault(vid, slug)  # video_keys 先返回现行 slug，再返回别名。
+    old_paths = set()
     counts = []
     for root in roots:
         n = 0
         for p, _, info in iter_strm(root, now) if root.is_dir() else ():
             if info.kind not in ("ours", "cdn"):
                 continue
-            _, vid = video_of(info, slug_by_id, id_by_slug)
+            slug, vid = video_of(info, slug_by_id, id_by_slug)
             if vid is None:
                 continue
             n += 1
             if not os.path.islink(p):
                 found.setdefault(vid, []).append(p)
+                if slug != current[vid]:
+                    old_paths.add(p)
         counts.append(n)
-    return {vid: sorted(paths) for vid, paths in found.items()}, counts
+    if alias_paths is not None:
+        alias_paths.update(old_paths)
+    return {vid: sorted(paths, key=lambda p: (p in old_paths, p)) for vid, paths in found.items()}, counts
 
 
 def replace_prefix_in_file(path: Path, old: str, new: str) -> tuple[str, str] | None:
@@ -234,6 +242,7 @@ class StrmManager:
         self.e = engine
         self.file_changes = engine.file_changes
         self.db = engine.db
+        self._alias_paths: dict[int, set[str]] = {}
         self._index: dict[int, tuple[float, dict[int, list[str]], int]] = {}  # 库 id -> (时间, 文件, 外部整理目录 strm 数)
 
     # ---- 按内容找文件 ----
@@ -247,13 +256,16 @@ class StrmManager:
         keys = await self.db.video_keys()
         ext = self.e.writer.external_root(lib)
         roots = [self.e.writer.library_root(lib)] + ([ext] if ext else [])
+        aliases = set()
         found, counts = await asyncio.to_thread(find_by_video, roots, await self.db.cdn_video_map(),
-                                                {s: i for i, s in keys})
+                                                {s: i for i, s in keys}, aliases)
+        self._alias_paths[lib["id"]] = aliases
         self._index[lib["id"]] = (time.time(), found, counts[1] if ext else 0)
         return found
 
     def pick(self, lib: dict, paths: list[str]) -> str:
         """同一部影片找到多个文件时优先外部整理目录里的（整理好的那份才是媒体库在用的）。"""
+        paths = [p for p in paths if p not in self._alias_paths.get(lib["id"], set())] or paths
         ext = self.e.writer.external_root(lib)
         if ext is not None:
             prefix = os.path.normcase(str(ext)) + os.sep
@@ -455,10 +467,12 @@ class StrmManager:
         async for v, out in self.db.iter_outputs(lib["id"]):
             seen.add(v["id"])
             result["checked"] += 1
-            cur, ext_paths, paths = out["strm_path"], in_ext.get(v["id"], []), found.get(v["id"], [])
+            paths = found.get(v["id"], [])
+            paths = [p for p in paths if p not in self._alias_paths.get(lib["id"], set())] or paths
+            cur, ext_paths = out["strm_path"], [p for p in in_ext.get(v["id"], []) if p in paths]
             result["duplicates"] += len(ext_paths) > 1
             if cur and (os.path.normcase(cur) in {os.path.normcase(p) for p in ext_paths}
-                        or (not ext_paths and os.path.isfile(cur))):
+                        or (not ext_paths and os.path.isfile(cur) and (not paths or cur in paths))):
                 continue
             if ext_paths or paths:
                 updates.append(((ext_paths or paths)[0], v["id"]))

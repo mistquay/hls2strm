@@ -12,6 +12,7 @@ import { navigate, replaceParams, useRoute } from "@/lib/route";
 interface PlaybackRecord {
   id:number;created_at:number;updated_at:number;slug:string;code:string;title:string;
   video_id:number|null;source_id:number|null;site:string;source_key:string;line:string;host:string;
+  served_video_id:number|null;served_slug:string|null;
   mode:"proxy"|"redirect"|"";entry:"play"|"session"|"gateway";
   state:"issued"|"delivered"|"failed"|"interrupted";http_status:number;client:string;user_agent:string;request_id:string;
 }
@@ -65,7 +66,7 @@ export default function PlayHistory() {
           <Td className="whitespace-nowrap">{fmtTime(row.created_at)}</Td>
           <Td><button className="text-left hover:text-accent" onClick={()=>row.slug && navigate("videos",{q:row.slug})} disabled={!row.slug}><Mono>{row.code || row.slug || "影片未知"}</Mono><p className="mt-1 max-w-64 truncate text-xs text-muted" title={row.title}>{row.title || row.slug || "会话已失效"}</p></button></Td>
           <Td><Chip tone={row.mode==="proxy" ? "warn" : "info"}>{row.mode==="proxy" ? "原样中转" : row.mode==="redirect" ? "302 直连" : "未确定"}</Chip></Td>
-          <Td><span>{row.site ? meta.label(row.site) : "尚未选源"}</span><p className="mt-1 text-xs text-muted">{[row.line,row.source_key].filter(Boolean).join(" · ")}</p></Td>
+          <Td><span>{row.site ? meta.label(row.site) : "尚未选源"}</span><p className="mt-1 text-xs text-muted">{[row.line,row.source_key].filter(Boolean).join(" · ")}</p>{row.served_video_id!=null && row.served_video_id!==row.video_id && <p className="mt-1 text-xs text-warn">版本备用：{row.served_slug || `影片 #${row.served_video_id}`}</p>}</Td>
           <Td><Chip tone={STATES[row.state][1]}>{STATES[row.state][0]}</Chip><p className="mt-1 text-xs text-muted" title={row.request_id ? `请求编号 ${row.request_id}` : undefined}>HTTP {row.http_status}</p></Td>
           <Td><span className="text-xs">{ENTRIES[row.entry]} · {row.client || "未知地址"}</span><p className="mt-1 max-w-48 truncate text-xs text-muted" title={row.user_agent}>{row.user_agent || "未知客户端"}</p></Td>
         </tr>)}

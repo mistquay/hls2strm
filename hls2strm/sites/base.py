@@ -138,6 +138,11 @@ class Site:
         """从站内 key 看出的 (字幕, 是否无码流出)；看不出返回 ('', False)。"""
         return "", False
 
+    def key_candidates(self, code: str, subtitle: str, uncensored: bool, spellings: list[str]) -> list[str]:
+        """按候选写法拼地址，保留顺序；同一个站内地址只试一次。"""
+        return list(dict.fromkeys(key for text in spellings
+                                  if (key := self.key_for(text, subtitle, uncensored))))
+
     @property
     def multi_line(self) -> bool:
         return bool(self.line_specs)

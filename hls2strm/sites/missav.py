@@ -163,6 +163,15 @@ class MissAVSite(Site):
         _, subtitle, uncensored = split_variant(key)
         return subtitle, uncensored
 
+    def key_candidates(self, code: str, subtitle: str, uncensored: bool, spellings: list[str]) -> list[str]:
+        name, _, number = code_key(code).partition("-")
+        aliases = {"1PON": "pondo", "10MU": "musume"}
+        if name in aliases:
+            spellings = [code, aliases[name] + "-" + number, number, *spellings]
+        elif name in ("CARIB", "CARIBPR", "PACO"):
+            spellings = [code, number, *spellings]
+        return super().key_candidates(code, subtitle, uncensored, spellings)
+
     def normalize_source(self, value: str) -> str:
         """'https://missav.ws/dm514/cn/genres/巨乳?page=2' -> '/cn/genres/%E5%B7%A8%E4%B9%B3'。"""
         value = value.strip()

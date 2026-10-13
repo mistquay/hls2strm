@@ -62,6 +62,8 @@ def context(engine, request):
     if request["kind"] in ("retirement","selection"):
         common["sites"] = {name:{"enabled":cfg.enabled,"lines":{n:{"enabled":v.enabled} for n,v in cfg.lines.items()}} for name,cfg in settings.sites.items()}
         common["site_priority"] = settings.site_priority
+    if request["kind"] == "dedupe":
+        common["trash_days"] = settings.trash_days
     return common
 
 

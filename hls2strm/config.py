@@ -206,6 +206,10 @@ class Settings(BaseModel):
     subtitle_fallback: bool = Field(
         True, description="首选字幕的源都不能用时，是否用其他字幕的源顶上（比如中字源失效时播无字幕版）"
     )
+    edition_fallback: Literal["off", "both", "normal_uses_u", "u_uses_normal"] = Field(
+        "off", description="本版起播失败后才借用另一版本的已知源。直链模式写出的 STRM 不经过本服务，此设置不生效。"
+                           "借用会播放另一版本内容：-U 版借普通版会是有码的，两版时间轴也可能不同。"
+    )
     quality_first: bool = Field(
         True, description="挑源时画质优先：先比画质（源里最清楚的一档），再看站点优先顺序；关掉则站点优先，画质只用来分先后"
     )

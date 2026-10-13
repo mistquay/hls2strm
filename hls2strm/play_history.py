@@ -45,8 +45,9 @@ def delivery(request, resolved=None, *, mode="proxy", session=None):
     if session and not info["linked"]:
         info["session_key"] = session
     if resolved:
-        info.update(slug=resolved.video["slug"],video_id=resolved.video["id"],code=resolved.video.get("code") or "",
-                    title=resolved.video.get("title") or "",source_id=resolved.source["id"],site=resolved.site.name,
+        requested = resolved.requested or resolved.video
+        info.update(slug=requested["slug"],video_id=requested["id"],code=requested.get("code") or "",
+                    title=requested.get("title") or "",served_video_id=resolved.video["id"],source_id=resolved.source["id"],site=resolved.site.name,
                     source_key=resolved.source["key"],line=resolved.line["line"] if resolved.line else "",host=resolved.host)
     return info["session_key"]
 
@@ -135,7 +136,7 @@ class PlaybackHistory:
                 params.append(value)
         condition = " AND ".join(where)
         counts = await self.db._one(f"SELECT COUNT(*) AS total,COALESCE(SUM(mode='redirect'),0) AS redirect,COALESCE(SUM(mode='proxy'),0) AS proxy,COALESCE(SUM(state IN ('failed','interrupted')),0) AS failed FROM play_history WHERE {condition}",params,bulk=True)
-        columns = "id,created_at,updated_at,slug,code,title,video_id,source_id,site,source_key,line,host,mode,entry,state,http_status,client,user_agent,request_id"
+        columns = "id,created_at,updated_at,slug,code,title,video_id,source_id,site,source_key,line,host,mode,entry,state,http_status,client,user_agent,request_id,served_video_id,(SELECT slug FROM videos WHERE id=play_history.served_video_id) AS served_slug"
         rows = await self.db._all(f"SELECT {columns} FROM play_history WHERE {condition} ORDER BY created_at DESC,id DESC LIMIT ? OFFSET ?",(*params,limit,offset),bulk=True)
         return {"items":[dict(row) for row in rows],"total":counts["total"],"counts":dict(counts)}
 

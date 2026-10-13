@@ -51,8 +51,9 @@ class VideoQuery:
 
         if self.q.strip():
             like = f"%{self.q.strip()}%"
-            where.append("(slug LIKE ? OR code LIKE ? OR title LIKE ? OR models LIKE ? OR tags LIKE ?)")
-            params += [like] * 5
+            where.append("(slug LIKE ? OR code LIKE ? OR title LIKE ? OR models LIKE ? OR tags LIKE ? "
+                         "OR id IN (SELECT video_id FROM video_aliases WHERE slug=?))")
+            params += [like] * 5 + [self.q.strip().lower()]
         if self.status == "pending":
             # 等待归入：已经算进输出库、还没写 strm（有排除库的库要等排除库的订阅跑完一轮）；选了库就只看那个库的
             lib = " AND o.library_id=?" if self.library_id else ""
