@@ -36,6 +36,21 @@ def test_normalize_and_match():
     assert describe_rule(rule) == "分类：中文字幕、chinese-subtitle 且 标签：巨乳"
 
 
+def test_edition_condition():
+    """版本条件：-U 版只认无码流出 / 破解；原生无码厂牌的番号不分版本，旧数据标了 uncensored 也算普通版。"""
+    rule = normalize_rule({"edition": "u"})
+    assert rule["edition"] == "u" and describe_rule(rule) == "版本：-U 版"
+    assert match_rule(rule, {"code": "CAWD-646", "uncensored": 1})
+    assert not match_rule(rule, {"code": "CAWD-646", "uncensored": 0})
+    assert not match_rule(rule, {"code": "100826-001", "uncensored": 1})  # Caribbeancom：原生无码
+    assert match_rule(normalize_rule({"edition": "normal"}), {"code": "HEYZO-1234", "uncensored": 1})
+    both = normalize_rule({"keywords": "SONE-", "edition": "u", "match": "all"})
+    assert match_rule(both, {**VIDEO, "uncensored": 1}) and not match_rule(both, VIDEO)
+    assert match_rule({k: v for k, v in rule.items() if k != "edition"} | {"tags": ["巨乳"]}, VIDEO)  # 旧规则没有 edition
+    with pytest.raises(ValueError):
+        normalize_rule({"edition": "x"})
+
+
 def test_rule_library(make_store, boot):
     async def run():
         db, store = await make_store()

@@ -19,7 +19,7 @@ const GROUPS: { id: string; title: string; keys: string[]; note?: ReactNode }[] 
   { id: "fetch", title: "抓取与重试", keys: ["proxy", "impersonate", "request_timeout", "domain_cooldown", "domain_cooldown_max", "solver_url", "solver_timeout", "max_attempts", "retry_base_delay"] },
   { id: "tasks", title: "任务", keys: ["fetch_detail", "auto_probe_sites", "probe_recheck_days"] },
   { id: "output", title: "输出", keys: ["output_dir", "path_template", "write_nfo", "download_cover", "poster_crop"] },
-  { id: "external", title: "外部整理与归档", keys: ["external_restore", "trash_days", "archive_dir"], note: <>位置同步与残留清理的计划统一在 <button className="text-accent underline" onClick={() => navigate("schedules")}>定时任务</button> 管理。</> },
+  { id: "external", title: "外部整理与归档", keys: ["external_restore", "relocate_scraped", "trash_days", "archive_dir"], note: <>位置同步与残留清理的计划统一在 <button className="text-accent underline" onClick={() => navigate("schedules")}>定时任务</button> 管理。</> },
   {
     id: "play",
     title: "播放地址与模式",
@@ -76,6 +76,7 @@ const LABELS: Record<string, string> = {
   health_slow_kbps: "低于多少算慢（kbps）",
   external_restore: "外部整理库补回丢失的 strm",
   external_sync_interval: "自动同步位置间隔（分钟）",
+  relocate_scraped: "换库时搬运已整理的目录",
   trash_days: "外部整理库回收区保留（天）",
   orphan_cleanup: "自动清理外部整理库残留",
   output_dir: "输出根目录",

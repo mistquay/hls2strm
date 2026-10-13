@@ -162,6 +162,12 @@ class Settings(BaseModel):
         description="每天清理一次外部整理库的残留：整理目录里已经没有 strm、只剩 nfo 和图片的影片目录移进回收区"
                     "（一天内有改动的不动，可能正在整理）",
     )
+    relocate_scraped: bool = Field(
+        False,
+        description="影片换库时搬运已整理的目录：从外部整理库换到它的排除库（比如「其他」→「无码破解」），外部工具已经整理好的"
+                    "影片目录原样搬到新库整理目录下同样的位置，不进回收区、不用重新刮削（须确认两库采用相容的目录命名）。"
+                    "目标冲突、挂载不可用或移动报错时保留现场；共用目录或未整理文件按原移出流程处理",
+    )
     # 输出
     output_dir: str = Field(
         "", description="输出根目录，各输出库的相对目录都在它下面；留空使用 HLS2STRM_OUTPUT_DIR 或 数据目录/strm"

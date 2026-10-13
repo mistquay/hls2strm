@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+from dataclasses import replace
+from weakref import WeakValueDictionary
 import secrets
 import json
 import time
@@ -16,6 +19,7 @@ class PlaybackSessions:
         self.hours = hours
         self.items = OrderedDict()
         self.created = 0
+        self.locks = WeakValueDictionary()
 
     def create(self, resolved):
         key = secrets.token_hex(12)
@@ -40,16 +44,27 @@ class PlaybackSessions:
             self.items[key] = (self.items[key][0], resolved)
 
     async def persist(self, db, resolved):
+        resolved = replace(resolved, started=False, replacement="")
         key = self.create(resolved)
         ttl = self.items[key][0] - time.monotonic()
         data = {"video": resolved.video, "source": resolved.source, "line": resolved.line,
-                "proxy_forced": resolved.proxy_forced, "allow_direct": resolved.allow_direct, "requested": resolved.requested}
+                "proxy_forced": resolved.proxy_forced, "allow_direct": resolved.allow_direct, "requested": resolved.requested,
+                "playback_options": resolved.playback_options, "started": resolved.started, "replacement": resolved.replacement}
         await db._write("INSERT INTO play_sessions(id,source_id,data,expires_at) VALUES(?,?,?,?)",
                         (key, resolved.source["id"], json.dumps(data), int(time.time()+ttl)))
         self.created += 1
         if self.created % 64 == 0:
             await db._write("DELETE FROM play_sessions WHERE expires_at<=?", (int(time.time()),))
         return key
+
+    def lock(self, key):
+        return self.locks.setdefault(key, asyncio.Lock())
+
+    async def mark_started(self, db, key, resolved):
+        # 响应返回前持久化；重启后也不能把同一播放会话切到另一个文件。
+        await db._write("UPDATE play_sessions SET data=json_set(data,'$.started',json('true')) WHERE id=?", (key,))
+        resolved.started = True
+        self.update(key, resolved)
 
     async def restore(self, db, key: str, source_id: int):
         try:
@@ -63,7 +78,8 @@ class PlaybackSessions:
             from .sites import get_site
             data = json.loads(row["data"])
             resolved = Resolved(data["video"], data["source"], get_site(data["source"]["site"]), data["line"],
-                                data["proxy_forced"], data.get("allow_direct", False), data.get("requested"))
+                                data["proxy_forced"], data.get("allow_direct", False), data.get("requested"), data.get("playback_options"),
+                                data.get("started", True), data.get("replacement", ""))
             self.items[key] = (time.monotonic()+row["expires_at"]-time.time(), resolved)
             while self.capacity and len(self.items) > self.capacity:
                 self.items.popitem(last=False)

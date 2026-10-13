@@ -59,7 +59,7 @@ class Operations:
             return await calculate(self.e, request, job_id, save)
         baseline = context(self.e,request)
         planner = Planner(self.e,request)
-        counts = {"matched":0,"added":0,"removed":0,"rewritten":0,"archived":0,"kept":0,"unknown":0,"skipped":0,"already_exists":0,"tasks":0}
+        counts = {"matched":0,"added":0,"removed":0,"rewritten":0,"archived":0,"kept":0,"unknown":0,"relocated":0,"skipped":0,"already_exists":0,"tasks":0}
         samples = []
         fingerprint = hashlib.sha256(digest(baseline).encode())
         if save:
@@ -88,6 +88,7 @@ class Operations:
                         key = {"add":"added","remove":"removed","rewrite":"rewritten"}[effect["action"]]
                         counts[key] += 1
                         counts["unknown"] += int(effect["external"] and effect["had_file"])
+                        counts["relocated"] += int(effect.get("relocate", False))
                 if len(samples)<30 and (item["effects"] or request["kind"]!="library"):
                     samples.append({"video_id":video_id,"slug":item["slug"],"title":item["title"],"reason":item["reason"],"effects":item["effects"]})
                 # 普通源地址/健康数据不参与范围比较。
@@ -176,7 +177,10 @@ class Operations:
             rows = await self.db._all("SELECT video_id,data FROM operation_items WHERE preview_id=? AND video_id>? ORDER BY video_id LIMIT 200",(preview["id"],cursor),bulk=True)
             if not rows:
                 break
-            targets = [(job["id"],t["kind"],t["target"],100,t["site"],int(time.time())) for row in rows for t in json.loads(row["data"])["targets"]]
+            # 存量补源属于后台维护，不抢在订阅列表和用户操作之前；播放仍走独立请求链路。
+            from .engine import PRIORITY_DETAIL
+            priority = PRIORITY_DETAIL if request["payload"]["action"] == "probe" else 100
+            targets = [(job["id"],t["kind"],t["target"],priority,t["site"],int(time.time())) for row in rows for t in json.loads(row["data"])["targets"]]
             cursor = rows[-1]["video_id"]
             state = {"cursor":cursor,"matched":counts["matched"],"skipped":counts["skipped"],"already_exists":counts["already_exists"]}
             async with self.db._tx(invalidate=False) as conn:
@@ -240,7 +244,8 @@ class Operations:
                     if not memberships_match(expected,actual[0][1],locate=planner.locate):
                         raise ScopeChanged(f"影片 {expected['slug']} 的归属已改变；未处理该影片，请重新预览剩余范围")
                     video = await self.db.get_video_by_id(row["video_id"])
-                    for effect in expected["effects"]:
+                    # 先加入再移出：换到排除库的影片，移出旧库时新库已在等写出，整理好的目录能搬过去（见 engine._relocate）
+                    for effect in sorted(expected["effects"], key=lambda effect: effect["action"] == "remove"):
                         lid = state["library_id"] if effect["library_id"]==planner.root else effect["library_id"]
                         if effect["action"]=="remove":
                             await self.e.remove_from_library([video["id"]],lid)

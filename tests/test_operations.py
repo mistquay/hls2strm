@@ -24,6 +24,49 @@ async def prepare(engine,request):
     return job
 
 
+def test_probe_preview_limits_sites_and_preserves_removed_sources(make_store, boot):
+    async def run():
+        db, store = await make_store()
+        vid = await seed(db, store, "abc-001")
+        engine = build(db, store, boot, FakeFetcher("", {}))
+        from hls2strm.operation_plans import Planner
+        request = {"kind": "selection", "payload": {"action": "probe", "ids": [vid], "sites": ["missav"]}}
+        planner = Planner(engine, request)
+        items = await planner.enrich(await db._all("SELECT * FROM videos WHERE id=?", (vid,)))
+        assert [task["site"] for task in items[0][1]["targets"]] == ["missav"]
+        await db.upsert_detail("missav", SourceDetail(key="abc-001", code="ABC-001", title="ABC"), "abc-001", store.current.site_rank)
+        await db._write("UPDATE sources SET status='removed' WHERE site='missav'")
+        items = await planner.enrich(await db._all("SELECT * FROM videos WHERE id=?", (vid,)))
+        assert items[0][1]["targets"] == []
+        with pytest.raises(ValueError):
+            Planner(engine, {"kind": "selection", "payload": {"action": "probe", "ids": [vid], "sites": "missav"}})
+    asyncio.run(run())
+
+
+def test_batch_probe_yields_to_subscription_tasks(make_store, boot):
+    async def run():
+        from hls2strm.engine import PRIORITY_DETAIL, PRIORITY_LIST
+        db, store = await make_store()
+        vid = await seed(db, store, "abc-001")
+        engine = build(db, store, boot, FakeFetcher("", {}))
+        await engine.reload_libraries()
+        preview_id = await engine.operations.create({"kind": "selection", "payload": {
+            "action": "probe", "ids": [vid], "sites": ["missav"]}})
+        await engine.operations.preview(await db.get_job(preview_id), {})
+        await db.update_job(preview_id, status="done")
+        preview = await db.get_job(preview_id)
+        job_id = await engine.operations.approve(preview_id, preview["state"]["preview_token"])
+        await engine.operations.selected(await db.get_job(job_id), {})
+        await db._write("UPDATE tasks SET status='done' WHERE kind IN ('preview','selection_prepare')")
+        probe = await db._one("SELECT * FROM tasks WHERE job_id=? AND kind='probe'", (job_id,))
+        assert probe["priority"] == PRIORITY_DETAIL
+        listing = await db.create_job("crawl", "订阅增量", {})
+        await db.add_tasks(listing, "list", [1], PRIORITY_LIST, "missav")
+        assert (await db.claim_task([]))["kind"] == "list"
+        assert (await db.claim_task([]))["id"] == probe["id"]
+    asyncio.run(run())
+
+
 def test_selection_aliases_frozen_targets_and_duplicate_confirmation(make_store,boot):
     async def run():
         db,store = await make_store()

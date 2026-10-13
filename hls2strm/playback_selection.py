@@ -12,7 +12,7 @@ from .errors import FetchError, NotFound, ParseError, PoolBusy
 from .cache import AsyncCache
 from .fetcher import close_stream
 from .quality import filter_master
-from .runtime import deadline, traffic, trace
+from .runtime import deadline, traffic, trace, play_discovery, background
 
 
 def candidate_key(resolved) -> tuple[int, int]:
@@ -24,6 +24,8 @@ class PlaybackSelection:
         self.resolver = resolver
         self.checked = AsyncCache(resolver.store.current.preflight_cache_entries)
         self.cooling = OrderedDict()
+        self.repairs = set()
+        self.repair_after = OrderedDict()
         resolver.store.on_change(self._on_settings)
 
     def _on_settings(self, old, new):
@@ -32,7 +34,43 @@ class PlaybackSelection:
         self.cooling.clear()
 
     async def close(self):
+        for task in self.repairs:
+            task.cancel()
+        await asyncio.gather(*self.repairs, return_exceptions=True)
         await self.checked.close()
+
+    def repair(self, slug):
+        """播放失败只排后台任务，限流并保留任务引用；不占起播时间预算。"""
+        callback = self.resolver.on_play_failure
+        if not callback or not self.resolver.store.current.play_discover:
+            return
+        if self.repair_after.get(slug, 0) > time.monotonic():
+            return
+        self.repair_after[slug] = time.monotonic() + 3600
+        while len(self.repair_after) > self.resolver.store.current.preflight_cache_entries:
+            self.repair_after.popitem(last=False)
+        async def run():
+            with background():
+                try:
+                    await callback(slug)
+                except Exception:
+                    import logging
+                    logging.getLogger(__name__).exception("播放失败后的后台补源排队失败：%s", slug)
+        task = asyncio.create_task(run())
+        self.repairs.add(task)
+        task.add_done_callback(self.repairs.discard)
+
+    async def failed(self, resolved, message):
+        key = candidate_key(resolved)
+        self.checked.clear()
+        self.cooling[key] = time.monotonic() + self.resolver.store.current.preflight_failure_cooldown
+        self.cooling.move_to_end(key)
+        while len(self.cooling) > self.resolver.store.current.preflight_cache_entries:
+            self.cooling.popitem(last=False)
+        if resolved.line:
+            await self.resolver.db.line_failed(resolved.line["id"], message)
+        else:
+            await self.resolver.db.source_failed(resolved.source["id"], message)
 
     async def probe(self, resolved, want=None):
         fetcher = self.resolver.fetcher
@@ -95,7 +133,14 @@ class PlaybackSelection:
         resolver = self.resolver
         limit = deadline.get() or time.monotonic() + resolver.store.current.resolve_timeout
         dt, tt = deadline.set(limit), traffic.set("play")
+        prior_discovery = options.pop("_discovered", False)
+        discovery_token = play_discovery.set(set()) if play_discovery.get() is None else None
+        if prior_discovery:
+            v = await resolver.db.get_video(slug)
+            if v:
+                play_discovery.get().add(v["id"])
         blocked = set(excluded)
+        tried = set(excluded)
         # 显式试播指定站点/线路仍允许重试，普通自动选源暂时避开近期坏候选。
         cooling = {key for key, until in self.cooling.items() if until > time.monotonic()} if not options.get("site") else set()
         blocked.update(cooling)
@@ -107,6 +152,8 @@ class PlaybackSelection:
                 while True:
                     try:
                         resolved = await resolver.resolve(slug, excluded=frozenset(blocked), **options)
+                    except PoolBusy:
+                        raise
                     except (NotFound, FetchError, ParseError):
                         if cooling:
                             # 没有更好的源时重试冷却源，保留本轮失败和用户排除。
@@ -118,7 +165,7 @@ class PlaybackSelection:
                         raise
                     key = candidate_key(resolved)
                     try:
-                        await self.probe(resolved, options.get("want"))
+                        await asyncio.wait_for(self.probe(resolved, options.get("want")), resolver.store.current.resolve_attempt_timeout)
                     except PoolBusy:
                         resolver.metrics.inc("play_preflight_busy")
                         raise
@@ -127,21 +174,27 @@ class PlaybackSelection:
                         trace(f"媒体预检失败，换下一个：{resolved.site.label} {resolved.source['key']}：{message}")
                         failures.append(f"{resolved.site.label} {resolved.line['line'] if resolved.line else ''}：{message}")
                         blocked.add(key)
+                        tried.add(key)
                         cooling.discard(key)
-                        self.cooling[key] = time.monotonic() + resolver.store.current.preflight_failure_cooldown
-                        self.cooling.move_to_end(key)
-                        while len(self.cooling) > resolver.store.current.preflight_cache_entries:
-                            self.cooling.popitem(last=False)
-                        if resolved.line:
-                            await resolver.db.line_failed(resolved.line["id"], message)
-                        else:
-                            await resolver.db.source_failed(resolved.source["id"], message)
+                        await self.failed(resolved, message)
                         resolver.metrics.inc("play_preflight_failover")
                         continue
                     self.cooling.pop(key, None)
+                    resolved.playback_options = {**options, "excluded": [list(k) for k in tried],
+                                                 "_discovered": bool(play_discovery.get())}
                     return resolved
         except TimeoutError:
+            if not options.get("site"):
+                self.repair(slug)
             raise FetchError("播放选源与媒体预检超过总时间预算") from None
+        except PoolBusy:
+            raise
+        except (FetchError, NotFound, ParseError):
+            if not options.get("site"):
+                self.repair(slug)
+            raise
         finally:
+            if discovery_token is not None:
+                play_discovery.reset(discovery_token)
             deadline.reset(dt)
             traffic.reset(tt)

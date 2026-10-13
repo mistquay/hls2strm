@@ -16,6 +16,7 @@ deadline: ContextVar[float | None] = ContextVar("deadline", default=None)
 traffic: ContextVar[str] = ContextVar("traffic", default="background")
 log_area: ContextVar[str] = ContextVar("log_area", default="")  # 日志分区（见 observability.log_area_of），空的按流量和模块判断
 attempt_wait_state: ContextVar[dict | None] = ContextVar("attempt_wait_state", default=None)
+play_discovery: ContextVar[set | None] = ContextVar("play_discovery", default=None)
 request_trace: ContextVar[list | None] = ContextVar("request_trace", default=None)
 TRACE_STEPS = 40
 
@@ -107,6 +108,7 @@ class RequestTelemetry:
                   request_trace.set([] if playback else None))
         budget = time.monotonic() + ctx.store.current.resolve_timeout if playback else None
         dt = deadline.set(budget)
+        discovery_token = play_discovery.set(set() if playback else None)
         started, status = time.monotonic(), 500
         headers_sent = False
         timer = asyncio.timeout_at(budget)
@@ -151,6 +153,7 @@ class RequestTelemetry:
                 logging.getLogger(__name__).info("请求 %s %s %s HTTP %d %.0fms", request_id.get(), scope["method"],
                                                  getattr(scope.get("route"), "path", "other"), status, elapsed)
             deadline.reset(dt)
+            play_discovery.reset(discovery_token)
             request_trace.reset(tokens[2])
             traffic.reset(tokens[1])
             request_id.reset(tokens[0])

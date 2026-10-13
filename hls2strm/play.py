@@ -38,7 +38,8 @@ from .codes import edition
 from .sites import SITES, Site, SourceDetail, StreamTraits, find_by_code, get_site
 from .runtime import deadline as request_deadline, traffic, stage, measured_lock, attempt_wait_state, trace
 from .playback import PlaybackSessions
-from .playback_selection import PlaybackSelection
+from .playback_selection import PlaybackSelection, candidate_key
+from .runtime import play_discovery
 from .hls_relay import HLSUpstreamStatus, playlist_bytes
 from .play_history import attempt as history_attempt, delivery as history_delivery
 
@@ -80,6 +81,10 @@ class Resolved:
     allow_direct: bool = False
     requested: dict | None = None  # 版本起播备用：请求影片和实际供源影片分别保留。
 
+    playback_options: dict | None = None  # 创建会话时保留显式选源、版本与画质限制。
+    started: bool = False  # 已交付媒体的会话不允许跨源。
+    replacement: str = ""  # 首次交付失败后的固定新会话地址。
+
     @property
     def traits(self) -> StreamTraits:
         if self.line is None:
@@ -119,6 +124,7 @@ class Resolver:
         self.sessions = PlaybackSessions(store.current.play_session_entries, store.current.play_session_hours)
         store.on_change(self._on_settings)
         self.selection = PlaybackSelection(self)
+        self.on_play_failure = None
 
     def _on_settings(self, old, new):
         self.sessions.capacity = new.play_session_entries
@@ -309,7 +315,7 @@ class Resolver:
         timeout = self.store.current.resolve_timeout
         deadline = request_deadline.get() or time.monotonic() + timeout
         if not ranked:
-            if not site and not excluded and (r := await self._discover_for(v, deadline, direct_only=direct_only)):
+            if not site and (r := await self._discover_for(v, deadline, direct_only=direct_only, remote=remote, want=want, relay=relay, excluded=excluded)):
                 return r
             if excluded:
                 raise FetchError("没有剩余可用源或线路")
@@ -330,11 +336,10 @@ class Resolver:
             wait_state = {}
             wait_token = attempt_wait_state.set(wait_state)
             try:
-                attempts = 2 if get_site(src["site"]).multi_line else 1
                 need = 60 if relay and not get_site(src["site"]).multi_line else self._need(owner, min_remaining)
                 r = await asyncio.wait_for(self._ensure(owner, src, need, line=line if site else None,
                                                         direct_only=direct_only, remote=remote, height=want,
-                                                        excluded=excluded), min(left, self.store.current.resolve_attempt_timeout * attempts))
+                                                        excluded=excluded), min(left, self.store.current.resolve_attempt_timeout))
             except (NotFound, VideoGone) as e:
                 await self.db.mark_source_gone(src["site"], src["key"])
                 gone += 1
@@ -381,7 +386,7 @@ class Resolver:
                 self.metrics.inc("play_failover")
                 log.info("%s 前 %d 个源不可用，改用 %s", slug, i, label)
             return r
-        if not site and not excluded and (r := await self._discover_for(v, deadline, direct_only=direct_only)):
+        if not site and (r := await self._discover_for(v, deadline, direct_only=direct_only, remote=remote, want=want, relay=relay, excluded=excluded)):
             return r
         if gone == len(ranked):
             raise NotFound(f"{slug} 的源都已下架")
@@ -389,7 +394,9 @@ class Resolver:
             raise blocked
         raise FetchError("；".join(errors) or "没有剩余可用源或线路")
 
-    async def _discover_for(self, v: dict, deadline: float, *, direct_only: bool = False) -> Resolved | None:
+    async def _discover_for(self, v: dict, deadline: float, *, direct_only: bool = False,
+                            remote: bool = False, want: int | None = None, relay: bool = False,
+                            excluded=frozenset()) -> Resolved | None:
         """现场找源：已知的源都不能用时，按番号到还没有源的站点各找一次，找到就加成源并用它。
 
         最近查过、没有这部片的站点跳过（probe_recheck_days）；字幕不回退时，找到的源字幕不合偏好也不用。
@@ -397,6 +404,11 @@ class Resolver:
         s = self.store.current
         if not s.play_discover or not v.get("code_key"):
             return None
+        discovered = play_discovery.get()
+        if discovered is not None:
+            if v["id"] in discovered:
+                return None
+            discovered.add(v["id"])
         have = {src["site"] for src in await self.db.get_sources(v["id"])}
         cutoff = time.time() - s.probe_recheck_days * 86400
         for name in s.site_priority:
@@ -416,6 +428,8 @@ class Resolver:
                     find_by_code(site, self.fetcher.site(name), v["code"], edition(v["code"], v["uncensored"], v["maker"]), priority=True, prefixes=self.db.prefixes, maker=v["maker"]), min(left, s.resolve_attempt_timeout))
             except (NotFound, VideoGone):
                 found = []  # 搜索页 404 也是这个站没有，不能让整个解析变成「影片不存在」
+            except PoolBusy:
+                raise
             except (Blocked, FetchError, ParseError, TimeoutError) as e:
                 log.info("现场找源 %s：%s 失败：%s", v["slug"], site.label, e)
                 continue
@@ -429,7 +443,7 @@ class Resolver:
                 continue
             self.metrics.inc("play_discovered")
             v = await self.db.get_video_by_id(v["id"]) or v
-            usable = [src for src in self.rank(await self.db.get_sources(v["id"]), direct_only=direct_only) if src["site"] == name]
+            usable = [src for src in self.rank(await self.db.get_sources(v["id"]), direct_only=direct_only, remote=remote, want=want) if src["site"] == name]
             if not usable:
                 log.info("现场找源 %s：在 %s 找到了，但字幕不合偏好（字幕不回退），不用", v["slug"], site.label)
                 continue
@@ -439,7 +453,9 @@ class Resolver:
             try:
                 if left <= 0:
                     return None
-                return await asyncio.wait_for(self._ensure(v, usable[0], self._need(v, None), direct_only=direct_only), min(left, s.resolve_attempt_timeout))
+                return await asyncio.wait_for(self._ensure(v, usable[0], 60 if relay else self._need(v, None), direct_only=direct_only, remote=remote, height=want, excluded=excluded), min(left, s.resolve_attempt_timeout))
+            except PoolBusy:
+                raise
             except (NotFound, VideoGone, Blocked, FetchError, ParseError, TimeoutError) as e:
                 log.info("现场找源 %s：%s 的源取地址失败：%s", v["slug"], site.label, e)
         return None
@@ -620,6 +636,9 @@ class Resolver:
             return r
         refreshed = await self.ensure_source(source_id, stale=stale, line_id=r.line["id"] if r.line else None)
         refreshed.requested = r.requested
+        refreshed.playback_options = r.playback_options
+        refreshed.started = r.started
+        refreshed.replacement = r.replacement
         self.sessions.update(session, refreshed)
         return refreshed
 
@@ -764,8 +783,7 @@ async def play(name: str, request: Request, t: str = "", proxy: int = 0, src: st
     if proxied:
         history_delivery(request,r,mode="proxy")
         ctx.metrics.inc("play_proxy")
-        resp = await (_proxy_playlist(request, r, t, want, all_variants=variants == "all") if _is_hls(r.url)
-                      else _proxy_file(request, r))
+        resp = await _proxy_start(request, r, t, want, all_variants=variants == "all")
     else:
         history_delivery(request,r,mode="redirect")
         ctx.metrics.inc("play_redirect")
@@ -1017,6 +1035,21 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
     if resp.status_code not in (200, 206):
         await close_stream(resp)
         raise _cdn_error(request, r, f"直链返回 HTTP {resp.status_code}")
+    if any(kind in resp.headers.get("content-type", "").lower() for kind in ("text/html", "application/json")):
+        await close_stream(resp)
+        raise _cdn_error(request, r, "直链返回错误页面而非媒体")
+    first = b""
+    chunks = resp.aiter_content()
+    if request.method != "HEAD":
+        try:
+            async with asyncio.timeout(ctx.store.current.resolve_attempt_timeout):
+                while not first:
+                    first = await anext(chunks)
+        except (Exception, asyncio.CancelledError) as e:
+            await close_stream(resp)
+            if isinstance(e, asyncio.CancelledError):
+                raise
+            raise _cdn_error(request, r, f"读取媒体首包失败：{str(e) or type(e).__name__}") from None
     ctx.resolver.health.record(r.host, True)
     out = {k: v for k in ("content-length", "content-range", "accept-ranges")
            if (v := resp.headers.get(k))}
@@ -1029,7 +1062,10 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
     async def body():
         sent = 0
         try:
-            async for chunk in resp.aiter_content():
+            sent += len(first)
+            ctx.metrics.inc("relay_bytes", len(first))
+            yield first
+            async for chunk in chunks:
                 sent += len(chunk)
                 ctx.metrics.inc("relay_bytes", len(chunk))
                 yield chunk
@@ -1046,28 +1082,87 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
                              media_type=resp.headers.get("content-type") or "video/mp4")
 
 
+def _starting_range(request: Request) -> bool:
+    value = request.headers.get("range", "")
+    return not value or bool(re.fullmatch(r"bytes=0-\d*", value.strip()))
+
+
+async def _recover_start(request: Request, r: Resolved, error: HTTPException, want=None) -> Resolved:
+    """仅响应尚未开始的 502 可以选下一个；局部拥塞、显式选源和续播均原样报错。"""
+    ctx = _ctx(request)
+    options = dict(r.playback_options or {})
+    if error.status_code != 502 or r.started or options.get("site") or not _starting_range(request):
+        raise error
+    excluded = {tuple(key) for key in options.pop("excluded", [])}
+    excluded.add(candidate_key(r))
+    if len(excluded) > 64:
+        raise error
+    # 绑定会话跨请求恢复时，也不能重复现场找源。
+    discovered = options.pop("_discovered", False)
+    if discovered and (state := play_discovery.get()) is not None:
+        state.add((r.requested or r.video)["id"])
+    await ctx.resolver.selection.failed(r, str(error.detail))
+    options.update(want=want, relay=True)
+    ctx.metrics.inc("play_startup_failover")
+    trace(f"媒体首包失败，排除 {candidate_key(r)} 后重新选源")
+    return await _resolve_or_http(request, (r.requested or r.video)["slug"], excluded=frozenset(excluded), **options)
+
+
+async def _proxy_start(request: Request, r: Resolved, t: str, want=None, *, all_variants=False):
+    while True:
+        try:
+            # 单次交付预算不能吃光整次起播预算，剩余时间给其他源。
+            async with asyncio.timeout(_ctx(request).store.current.resolve_attempt_timeout):
+                return await (_proxy_playlist(request, r, t, want, all_variants=all_variants)
+                              if _is_hls(r.url) else _proxy_file(request, r))
+        except TimeoutError:
+            error = _cdn_error(request, r, "媒体首包超时")
+        except HTTPException as e:
+            error = e
+        r = await _recover_start(request, r, error, want)
+
+
 @router.api_route("/media/{source_id}", methods=["GET", "HEAD"])
 async def media_file(source_id: int, request: Request, s: str, t: str = "", want: int | None = None,
                      variants: str = ""):
     """网页播放：清单、Range/拖动保持源、线路和地址快照一致。"""
     _check_token(request, t)
     history_attempt(request,"")
-    try:
-        r = await _ctx(request).resolver.session_source(source_id, s)
-    except (NotFound, VideoGone):
-        raise HTTPException(404, "播放会话不存在或已失效，请重新试播") from None
-    except PoolBusy as e:
-        raise HTTPException(503, str(e), headers={"Retry-After": "1"}) from None
-    except (Blocked, FetchError, ParseError) as e:
-        raise HTTPException(502, f"刷新播放地址失败：{e}") from None
-    history_delivery(request,r)
-    if _is_hls(r.url):
-        response = await _proxy_playlist(request, r, t, want, all_variants=variants == "all")
-    else:
-        response = await _proxy_file(request, r)
-    if request.headers.get("origin"):
-        response.headers.update(CORS_HEADERS)
-    return response
+    ctx = _ctx(request)
+    async with ctx.resolver.sessions.lock(s):
+        try:
+            r = await ctx.resolver.sessions.restore(ctx.db, s, source_id)
+        except (NotFound, VideoGone):
+            raise HTTPException(404, "播放会话不存在或已失效，请重新试播") from None
+        if r.replacement:
+            response = RedirectResponse(r.replacement, status_code=307)
+            if request.headers.get("origin"):
+                response.headers.update(CORS_HEADERS)
+            return response
+        try:
+            r = await ctx.resolver.session_source(source_id, s)
+            history_delivery(request,r)
+            async with asyncio.timeout(ctx.store.current.resolve_attempt_timeout):
+                response = await (_proxy_playlist(request, r, t, want, all_variants=variants == "all")
+                                  if _is_hls(r.url) else _proxy_file(request, r))
+        except PoolBusy as e:
+            raise HTTPException(503, str(e), headers={"Retry-After": "1"}) from None
+        except (HTTPException, Blocked, FetchError, ParseError, TimeoutError, NotFound) as e:
+            error = e if isinstance(e, HTTPException) else _cdn_error(request, r, f"起播失败：{e}")
+            # 旧会话没有保存限制时保守固定；新会话恢复到新地址，不改写原快照。
+            if r.playback_options is None:
+                raise error
+            replacement = await _recover_start(request, r, error, want)
+            r.replacement = await _media_location(request, replacement, want)
+            await ctx.db._write("UPDATE play_sessions SET data=json_set(data,'$.replacement',?) WHERE id=?", (r.replacement, s))
+            ctx.resolver.sessions.update(s, r)
+            history_delivery(request, replacement)
+            response = RedirectResponse(r.replacement, status_code=307)
+        if request.method != "HEAD":
+            await ctx.resolver.sessions.mark_started(ctx.db, s, r)
+        if request.headers.get("origin"):
+            response.headers.update(CORS_HEADERS)
+        return response
 
 
 async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | None = None,
@@ -1087,9 +1182,15 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
     unsafe = any("?" in urljoin(r.url, ref) or not urljoin(r.url, ref).startswith(root) for ref in refs)
     if not r.site.multi_line and r.traits.expires and (r.expires or 0)-time.time() < required and unsafe:
         requested = r.requested
-        r = await _resolve_or_http(request, (requested or r.video)["slug"], min_remaining=required,
-                                   site=request.query_params.get("src") or None, line=request.query_params.get("line") or None,
-                                   want=want, edition_only=request.query_params.get("edition_only") in ("1", "true", "True"))
+        if r.started or request.url.path.startswith("/media/"):
+            previous = r
+            r = await ctx.resolver.ensure_source(r.source["id"], min_remaining=required,
+                                                line_id=r.line["id"] if r.line else None)
+            r.playback_options, r.started = previous.playback_options, previous.started
+        else:
+            r = await _resolve_or_http(request, (requested or r.video)["slug"], min_remaining=required,
+                                       site=request.query_params.get("src") or None, line=request.query_params.get("line") or None,
+                                       want=want, edition_only=request.query_params.get("edition_only") in ("1", "true", "True"))
         if requested and r.video["id"] != requested["id"]:
             r.requested = requested
         history_delivery(request,r)

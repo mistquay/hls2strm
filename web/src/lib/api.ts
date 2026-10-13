@@ -439,6 +439,7 @@ export interface Rule {
   models: string[];
   quality: string[];
   keywords: string[];
+  edition?: "" | "u" | "normal";
   match: "any" | "all";
 }
 

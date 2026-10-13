@@ -223,7 +223,7 @@ function LibrariesPanel() {
       <div className="py-3">
         <Help summary="输出库、外部整理库、来源库和排除库怎么用">
           <p>库目录不能互相嵌套。改目录或模板会自动排一个重写任务，把已有文件搬到新位置；改规则会自动排一个重新归库任务，不再符合规则的影片会从库里移除（只移除规则加入的，任务和订阅加入的保留）。组内多个值满足任一即可；分类、标签按站点上的名称或 slug 匹配。</p>
-          <p>外部整理库：strm 只在影片第一次入库时写进库目录（不写 nfo、封面），之后由外部工具移走、改名、刮削，本服务不再在库目录补写，也不搬文件。默认每 10 分钟自动同步位置，启动后也同步一次；可在「定时任务」调整间隔、改为 cron 或停用，需要立即更新时点「同步位置」。同步按 strm 内容在库目录和外部整理目录里找回每部影片的文件；开启多画质版本的库会在新位置补齐版本文件。重写输出会先同步位置，再原地改 strm 内容；删除库时只删 strm。清空外部整理目录就改回由本服务管理。</p>
+          <p>外部整理库：strm 只在影片第一次入库时写进库目录（不写 nfo、封面），之后由外部工具移走、改名、刮削，本服务不再在库目录补写。开启「换库时搬运已整理的目录」后，换到排除库时可连同刮削文件搬运，冲突或挂载异常会保留原文件并报错。默认每 10 分钟自动同步位置，启动后也同步一次；可在「定时任务」调整间隔、改为 cron 或停用，需要立即更新时点「同步位置」。同步按 strm 内容在库目录和外部整理目录里找回每部影片的文件；开启多画质版本的库会在新位置补齐版本文件。重写输出会先同步位置，再原地改 strm 内容；删除库时只删 strm。清空外部整理目录就改回由本服务管理。</p>
           <p>影片移出外部整理库（被排除库分走、不再符合规则、手动移出）时，删掉 strm，它独占的整理目录（外部工具生成的 nfo、图片）整个移进整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除。以前留下的只剩 nfo、图片的目录，用「清理残留目录」处理，可在「定时任务」调整自动清理计划。目录里还有别的影片文件（多部片放一个目录）时不动。</p>
           <p>来源库、排除库：比如「其他」的来源选「全部」、排除「中文字幕」「无码」，就得到剩下的影片，每部只在一个库里，外部工具不会重复刮削。有排除库的库收到新片后先不写文件，等排除库的定时订阅都跑完一轮、确认它不属于排除库再写（最多晚一个订阅周期）。排除库的订阅请按「最近更新」排序。</p>
         </Help>
@@ -262,6 +262,7 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
     models: join(lib?.rule?.models),
     quality: join(lib?.rule?.quality),
     keywords: join(lib?.rule?.keywords),
+    edition: lib?.rule?.edition ?? "",
     match: lib?.rule?.match ?? "any",
   });
   const { data: facets } = useQuery({
@@ -275,9 +276,9 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
     setF(p => ({ ...p, [key]: p[key].includes(id) ? p[key].filter(x => x !== id) : [...p[key], id] }));
 
   const ruleKeys = ["categories","tags","models","quality","keywords"] as const;
-  const normalizedRule = useRule ? {...Object.fromEntries(ruleKeys.map(k=>[k,rule[k].replace(/，/g,",").split(",").map(v=>v.trim()).filter(Boolean)])),match:rule.match} : null;
+  const normalizedRule = useRule ? {...Object.fromEntries(ruleKeys.map(k=>[k,rule[k].replace(/，/g,",").split(",").map(v=>v.trim()).filter(Boolean)])),edition:rule.edition,match:rule.match} : null;
   const body = {...f,rule:normalizedRule};
-  const originalRule = lib?.rule ? {...Object.fromEntries(ruleKeys.map(k=>[k,lib.rule![k] ?? []])),match:lib.rule.match} : null;
+  const originalRule = lib?.rule ? {...Object.fromEntries(ruleKeys.map(k=>[k,lib.rule![k] ?? []])),edition:lib.rule.edition ?? "",match:lib.rule.match} : null;
   const needsPreview = lib ? !!lib.operation_pending || Object.keys(f).filter(k=>k!=="name").some(k=>JSON.stringify(f[k as keyof typeof f])!==JSON.stringify(lib[k as keyof Library])) || JSON.stringify(normalizedRule)!==JSON.stringify(originalRule) : !!(useRule || f.sources.length || f.excludes.length);
   const save = async () => {
     const r = await run(
@@ -384,6 +385,17 @@ function LibraryForm({ lib, libs, onDone }: { lib: Library | null; libs: Library
                 )}
               </Field>
             ))}
+            <Field label="版本（原生无码的番号算普通版）">
+              <Segmented
+                value={rule.edition}
+                onChange={v => setRule({ ...rule, edition: v })}
+                options={[
+                  { value: "", label: "不限" },
+                  { value: "u", label: "-U 版（流出 / 破解）" },
+                  { value: "normal", label: "普通版" },
+                ]}
+              />
+            </Field>
             <Field label="几组条件之间">
               <Segmented
                 value={rule.match}

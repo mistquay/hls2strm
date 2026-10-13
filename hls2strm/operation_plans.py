@@ -64,6 +64,8 @@ def context(engine, request):
         common["site_priority"] = settings.site_priority
     if request["kind"] == "dedupe":
         common["trash_days"] = settings.trash_days
+    if request["kind"] == "library":
+        common["relocate_scraped"] = settings.relocate_scraped
     return common
 
 
@@ -119,6 +121,10 @@ class Planner:
                 raise ValueError("按筛选结果仅支持补源、刷新详情和加入输出库；文件移出/删源需显式选择影片")
             if action in ("add","remove"):
                 engine._library(self.root)
+            if action=="probe" and "sites" in self.payload:
+                sites = self.payload["sites"]
+                if not isinstance(sites, list) or any(not isinstance(n, str) or n not in SITES for n in sites):
+                    raise ValueError("sites 必须是已知站点名称列表")
             self.query = selection_query(self.payload)
 
     async def batches(self):
@@ -174,8 +180,8 @@ class Planner:
             action,settings = self.payload["action"],self.e.store.current
             targets = []
             if action=="probe":
-                have = {s["site"] for s in sources}
-                targets = [{"kind":"probe","site":n,"target":f"{n}:{v['id']}"} for n in settings.site_priority if settings.site(n).enabled and SITES[n].can_lookup and n not in have]
+                have,only = {s["site"] for s in sources},self.payload.get("sites") or []  # sites：只到这些站点找
+                targets = [{"kind":"probe","site":n,"target":f"{n}:{v['id']}"} for n in settings.site_priority if settings.site(n).enabled and SITES[n].can_lookup and n not in have and (not only or n in only)]
             elif action=="refresh":
                 targets = [{"kind":"detail","site":s["site"],"target":s["key"]} for s in sources if s["status"]=="active" and settings.site(s["site"]).enabled]
             elif action=="add" and v["status"]=="active" and not (set(outputs)&set(self.libs[self.root]["excludes"])):
@@ -228,6 +234,11 @@ class Planner:
             action = "add" if not before and current else "remove" if before and not current else "rewrite" if before and current and lid==self.root and self.rewrite else None
             if action:
                 item["effects"].append({"library_id":lid,"action":action,"via":current["via"] if current else "","had_file":bool(before and before["strm_path"]),"external":bool(self.libs[lid]["external_dir"]),"waiting":bool(current and not current["strm_path"])})
+        # 换到排除库的外部整理库影片：执行时先加入再移出，整理好的目录会搬过去（实际能不能搬执行时按目录核对）
+        adds = {e["library_id"] for e in item["effects"] if e["action"]=="add" and e["external"]}
+        for effect in item["effects"]:
+            if effect["action"]=="remove" and effect["external"] and effect["had_file"] and self.e.store.current.relocate_scraped and adds & set(self.libs[effect["library_id"]]["excludes"]):
+                effect["relocate"] = True
         item["input"] = digest({"video":video_input(v),"other_outputs":{i:o for i,o in outputs.items() if i not in self.affected}})
         item["before"] = {i:outputs[i] for i in self.affected if i in outputs}
         return item

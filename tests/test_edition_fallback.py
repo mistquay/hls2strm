@@ -125,7 +125,7 @@ def test_no_own_sources_uses_siblings_best_subtitle(make_store):
     asyncio.run(run())
 
 
-def test_discovery_only_requested_edition_and_no_excluded(make_store, monkeypatch):
+def test_discovery_only_requested_edition_even_with_excluded(make_store, monkeypatch):
     async def run():
         db, store = await make_store()
         normal, _ = await seed(db, store)
@@ -143,7 +143,7 @@ def test_discovery_only_requested_edition_and_no_excluded(make_store, monkeypatc
         assert discovered == [normal]
         with pytest.raises(FetchError):
             await resolver.resolve("luxu-1850", excluded=frozenset({(999, 0)}))
-        assert discovered == [normal]
+        assert discovered == [normal, normal]
     asyncio.run(run())
 
 

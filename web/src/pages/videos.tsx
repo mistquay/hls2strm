@@ -453,10 +453,24 @@ function BatchBar({ ids, onDone,filter,allMatching,total }: { ids: number[]; onD
         {allMatching ? "当前筛选全部" : "跨页已选"} <b>{allMatching ? total : ids.length}</b> 部
       </span>
       <div className="mx-1 h-4 w-px bg-line" />
-      <Button size="sm" onClick={() => batch({ action: "probe" })}>
-        <Search />
-        查找其他源
-      </Button>
+      <Menu>
+        <MenuTrigger asChild>
+          <Button size="sm">
+            <Search />
+            查找其他源
+          </Button>
+        </MenuTrigger>
+        <MenuContent align="start">
+          <MenuItem onSelect={() => batch({ action: "probe" })}>所有还没有源的站点</MenuItem>
+          <MenuSeparator />
+          <MenuLabel>只到这个站找</MenuLabel>
+          {Object.entries(meta.sites).map(([site, m]) => (
+            <MenuItem key={site} onSelect={() => batch({ action: "probe", sites: [site] })}>
+              {m.label}
+            </MenuItem>
+          ))}
+        </MenuContent>
+      </Menu>
       <Button size="sm" onClick={() => batch({ action: "refresh" })}>
         <RefreshCw />
         刷新详情

@@ -86,9 +86,10 @@ def test_find_orphans(tmp_path):
 
 def test_leaving_external_library_retires_scraped_dir(make_store, boot, tmp_path):
     """影片后来进了中文字幕：「其他」里 mdcng 刮好的目录整个移进回收区，不留只剩 nfo、图片的残留；
-    记录的路径还是收件目录（mdcng 在上次同步位置之后才挪走）也能找到。"""
+    记录的路径还是收件目录（mdcng 在上次同步位置之后才挪走）也能找到。换库时搬运整理目录见 test_relocate。"""
     async def run():
         db, store = await make_store()
+        await store.update({"relocate_scraped": False})
         html, ids = model_fixture()
         fetcher = FakeFetcher(html, ids)
         engine = Engine(db, fetcher, OutputWriter(store), store, Metrics(), boot)

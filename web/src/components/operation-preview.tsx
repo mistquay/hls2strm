@@ -12,7 +12,7 @@ import { Mono, Notice } from "./ui/data";
 export interface OperationRequest { kind:"library"|"retirement"|"selection"|"dedupe"; payload:Record<string,unknown> }
 interface Preview { attention?:DedupeGroup[]; counts:Record<string,number>; samples:{video_id:number;slug:string;title:string;reason:string;effects:{library_id:number;action:string}[]}[]; warnings:string[]; library_names:Record<string,string>; configuration?:{before:Record<string,unknown>|null;after:Record<string,unknown>} }
 interface Receipt { job:Job; preview:Preview|null; preview_token:string|null }
-const COUNTS:Record<string,string> = {groups:"重复 / 更正组",selected_groups:"将执行组数",merged_videos:"并入影片",strm_files:"删除 STRM（含画质附件）",retire_dirs:"回收整理目录",missing_outputs:"未找到输出",library_changes:"预计换库组",conflict_groups:"疑似冲突组",edition_corrections:"版本标记更正",matched:"匹配影片",requested:"显式选择",added:"新加入归属",removed:"移出",rewritten:"重写输出",archived:"预计归档输出",kept:"保持现状",unknown:"实际位置待核实",skipped:"不适用",already_exists:"已在输出库",tasks:"预计处理子任务"};
+const COUNTS:Record<string,string> = {groups:"重复 / 更正组",selected_groups:"将执行组数",merged_videos:"并入影片",strm_files:"删除 STRM（含画质附件）",retire_dirs:"回收整理目录",missing_outputs:"未找到输出",library_changes:"预计换库组",conflict_groups:"疑似冲突组",edition_corrections:"版本标记更正",matched:"匹配影片",requested:"显式选择",added:"新加入归属",removed:"移出",rewritten:"重写输出",archived:"预计归档输出",kept:"保持现状",unknown:"实际位置待核实",relocated:"候选搬运（执行时核对）",skipped:"不适用",already_exists:"已在输出库",tasks:"预计处理子任务"};
 const EFFECTS:Record<string,string> = {add:"加入",remove:"移出",rewrite:"重写",archive:"归档"};
 
 function configValue(key:string,value:unknown,names:Record<string,string>):string {
@@ -22,7 +22,9 @@ function configValue(key:string,value:unknown,names:Record<string,string>):strin
   if(key==="rule" && typeof value==="object") {
     const rule = value as Record<string,unknown>;
     const labels:Record<string,string> = {categories:"分类",tags:"标签",models:"女优",quality:"画质",keywords:"关键词"};
-    return Object.entries(labels).filter(([k])=>Array.isArray(rule[k]) && (rule[k] as unknown[]).length).map(([k,label])=>`${label}：${(rule[k] as string[]).join("、")}`).join(rule.match==="all" ? " 且 " : " 或 ");
+    const parts = Object.entries(labels).filter(([k])=>Array.isArray(rule[k]) && (rule[k] as unknown[]).length).map(([k,label])=>`${label}：${(rule[k] as string[]).join("、")}`);
+    if (rule.edition) parts.push(`版本：${rule.edition==="u" ? "-U 版" : "普通版"}`);
+    return parts.join(rule.match==="all" ? " 且 " : " 或 ");
   }
   return typeof value==="string" ? value : JSON.stringify(value);
 }

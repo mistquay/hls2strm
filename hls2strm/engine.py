@@ -95,6 +95,7 @@ class Engine:
         self.metrics = metrics
         self.resolver = Resolver(db, fetcher, store, metrics)  # 播放和画质探测共用：同一个源取地址只抓一次
         self.resolver.quality.on_change = self._quality_changed
+        self.resolver.on_play_failure = self._queue_play_probe
         self.snapshot_dir = boot.data_dir / "snapshots"
         self.paused = False
         self.blocked: dict[str, float] = {}  # 站点 -> 被拦截到什么时候
@@ -445,6 +446,11 @@ class Engine:
             old_strm = out["strm_path"] if out else ""
         if not old_strm and lib["excludes"] and not settle:
             return  # 有排除库的库：新片等归并确认它不属于排除库后再写
+        if not old_strm and lib["external_dir"] and (donor := await self._relocation_donor(v["id"], lib)):
+            src, out = donor
+            if moved := await self._relocate(v, src, lib, out["strm_path"]):
+                await self.db.delete_output(v["id"], src["id"])
+                old_strm = moved  # 下面原地更新它的内容，不往收件目录写新的
         if self.store.current.play_mode == "direct":
             v = {**v, "stream_url": await self.db.cached_stream_url(v["id"])}
         strm = await asyncio.to_thread(self.writer.write, v, lib, old_strm, self.keep_dirs())
@@ -459,11 +465,19 @@ class Engine:
         if versions or (versions is None and lib["versions"]):
             await self.sync_versions(v, lib, str(strm))
 
-    async def _remove_files(self, lib: dict, video_id: int, slug: str, strm_path: str) -> None:
+    async def _remove_files(self, lib: dict, video_id: int, slug: str, strm_path: str, *,
+                            relocate: bool = False) -> None:
+        lock = self._output_locks.setdefault(video_id, asyncio.Lock())
+        async with lock:
+            await self._remove_files_locked(lib, video_id, slug, strm_path, relocate=relocate)
+
+    async def _remove_files_locked(self, lib: dict, video_id: int, slug: str, strm_path: str, *,
+                                   relocate: bool = False) -> None:
         """删掉一部影片在某个库里的文件（只删本程序生成的）。
 
         外部整理库只删 strm，先按内容找到它现在在哪（外部工具可能在上次同步位置之后又挪过、改过名）；
         已经整理过的，它独占的影片目录（外部工具生成的 nfo、图片）整个移进回收区，免得留在整理目录里没用还占地方。
+        relocate：影片是换到本库的某个排除库（那边还在等写出）时，整理好的目录搬过去（见 _relocate），不进回收区。
         """
         keep = self.keep_dirs()
         ext = self.writer.external_root(lib)
@@ -471,6 +485,16 @@ class Engine:
             if strm_path:
                 await asyncio.to_thread(self.writer.remove, Path(strm_path), keep, False, slug)
             return
+        if relocate and (dst := await self._relocation_target(video_id, lib)):
+            v = await self.db.get_video_by_id(video_id)
+            if v and (await self.db.in_libraries(video_id, dst["excludes"])
+                      or v["created_at"] >= self._seen_before(dst, await self._subscription_cutoffs())):
+                raise ValueError("目标库仍等待排除库确认，保留已整理目录，稍后重试归并")
+            if v is not None and (moved := await self._relocate(v, lib, dst, strm_path)):
+                await self.db.set_output(video_id, dst["id"], moved)
+                if dst["versions"]:
+                    await self.sync_versions(v, dst, moved)
+                return
         days = self.store.current.trash_days
         for p in map(Path, await self.strm.paths_of(lib, video_id, strm_path)):
             await asyncio.to_thread(self.writer.remove, p, keep, True, slug)
@@ -483,6 +507,55 @@ class Engine:
             except OSError as e:
                 log.warning("「%s」移出 %s：整理目录 %s 没能移进回收区：%s", lib["name"], slug, p.parent, e)
         self.strm.forget(lib, video_id)
+
+    async def _relocation_donor(self, video_id: int, lib: dict) -> tuple[dict, dict] | None:
+        """影片要在外部整理库 lib 里新写出时，它在哪个外部整理库里有文件、而那个库排除 lib（之后会被移出）。
+        只有一个这样的库才返回 (库, 输出)。"""
+        found = [(src, out) for out in await self.db.get_outputs(video_id)
+                 if out["strm_path"] and (src := self.libs.get(out["library_id"])) and src["id"] != lib["id"]
+                 and src["external_dir"] and lib["id"] in src["excludes"]]
+        return found[0] if len(found) == 1 else None
+
+    async def _relocation_target(self, video_id: int, lib: dict) -> dict | None:
+        """影片移出外部整理库 lib 时，它要换去的库：lib 的排除库里、外部整理库、还在等写出的那个（只有一个才算）。"""
+        found = [dst for out in await self.db.get_outputs(video_id)
+                 if not out["strm_path"] and (dst := self.libs.get(out["library_id"]))
+                 and dst["external_dir"] and dst["id"] in lib["excludes"]]
+        return found[0] if len(found) == 1 else None
+
+    async def _relocate(self, v: dict, src: dict, dst: dict, strm_path: str) -> str:
+        """影片从外部整理库 src 换到 dst：外部工具在 src 整理好的影片目录原样搬到 dst 整理目录下同样的相对位置，
+        src 收件目录里没整理的副本删掉，返回搬过去的 strm；共享目录或未整理返回空串，冲突和 I/O 错误保留现场。
+
+        保留原来的相对目录和 nfo、图片，目标库必须采用相容的命名模板。
+        只搬独占影片目录；冲突、挂载不可用或移动失败时抛出，保留现场。
+        """
+        src_ext, dst_ext = self.writer.external_root(src), self.writer.external_root(dst)
+        if not self.store.current.relocate_scraped or src_ext is None or dst_ext is None:
+            return ""
+        from .relocate import transfer
+        journal = self.store.boot.data_dir / "relocations" / f"{v['id']}-{src['id']}-{dst['id']}.json"
+        paths = [Path(p) for p in await self.strm.paths_of(src, v["id"], strm_path)]
+        scraped = [p for p in paths if inside(p, src_ext)]
+        if len(scraped) > 1:
+            raise ValueError(f"{v['slug']} 有多个已整理副本，保留原文件，请先核对")
+        if not scraped and not journal.exists():
+            if strm_path and inside(Path(strm_path), src_ext):
+                raise ValueError(f"{v['slug']} 的已整理文件不可访问，请检查挂载，不自动删旧写新")
+            return ""
+        moved = await asyncio.to_thread(transfer, scraped[0] if scraped else None,
+                                        src_ext, dst_ext, v["slug"], journal)
+        if not moved:
+            return ""
+        # 路径先落库；进程在文件移动后崩溃，可以凭 journal 找回，不会再写一份收件文件。
+        await self.db.set_output(v["id"], dst["id"], moved)
+        self.strm.forget(src, v["id"])
+        self.strm.remember(dst, v["id"], moved)
+        for p in paths:
+            if not inside(p, src_ext):
+                await asyncio.to_thread(self.writer.remove, p, self.keep_dirs(), True, v["slug"])
+        log.info("「%s」→「%s」：%s 已整理目录搬到 %s", src["name"], dst["name"], v["slug"], Path(moved).parent)
+        return moved
 
     def archive_root(self) -> Path:
         root = self.store.archive_dir
@@ -872,6 +945,32 @@ class Engine:
         self.notify()
         return job_id
 
+    async def _queue_play_probe(self, slug: str) -> None:
+        """失败影片补源使用正常任务队列，尊重负缓存、删源记录和一小时去重。"""
+        v = await self.db.get_video(slug)
+        if not v or v["status"] == "removed":
+            return
+        recent = await self.db._one("SELECT id FROM jobs WHERE json_extract(params,'$.play_video_id')=? AND created_at>? LIMIT 1",
+                                    (v["id"], int(time.time()) - 3600))
+        if recent:
+            return
+        have = {src["site"] for src in await self.db.get_sources(v["id"])}
+        settings = self.store.current
+        sites = []
+        for name in settings.site_priority:
+            if name in have or not settings.site(name).enabled or not SITES[name].can_lookup:
+                continue
+            check = await self.db.get_source_check(v["id"], name)
+            if check and not check["found"] and check["checked_at"] > time.time() - settings.probe_recheck_days * 86400:
+                continue
+            sites.append(name)
+        if not sites:
+            return
+        job = await self.db.create_job("probe", f"播放失败补源：{v['slug']}", {"play_video_id": v["id"], "sites": sites, "count": 1})
+        for name in sites:
+            await self.db.add_tasks(job, "probe", [f"{name}:{v['id']}"], PRIORITY_DETAIL, name)
+        self.notify()
+
     async def create_probe_videos(self, video_ids: list[int]) -> int:
         """选中的影片排队补源：每部到每个启用、还没有它的源的站点找一次（不管之前查过没有），按站点限速执行。"""
         cfg = self.store.current.sites
@@ -965,7 +1064,7 @@ class Engine:
                 continue
             if out["strm_path"]:
                 v = await self.db.get_video_by_id(vid)
-                await self._remove_files(lib, vid, v["slug"] if v else "", out["strm_path"])
+                await self._remove_files(lib, vid, v["slug"] if v else "", out["strm_path"], relocate=True)
             await self.db.delete_output(vid, library_id)
             removed += 1
         log.info("输出库「%s」：手动移出 %d 部", lib["name"], removed)
@@ -1356,7 +1455,7 @@ class Engine:
             await self.strm.index(lib, max_age=0)  # 外部工具刚挪过的也要找到：重扫一遍，后面每部直接查
         for out in drop:
             if out["strm_path"]:
-                await self._remove_files(lib, out["video_id"], out["slug"], out["strm_path"])
+                await self._remove_files(lib, out["video_id"], out["slug"], out["strm_path"], relocate=True)
             await self.db.delete_output(out["video_id"], lib["id"])
         pulled = await self.db.pull_from_sources(lib["id"], lib["sources"], lib["excludes"])
         written = 0
