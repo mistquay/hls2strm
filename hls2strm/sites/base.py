@@ -110,6 +110,14 @@ class Site:
     presets: list[dict] = []
     default_sort = ""
     source_hint = ""  # 列表地址的写法说明，显示在任务页
+    keyword_source = ""  # 支持分页关键词搜索时声明列表模板，关键词由接口统一编码。
+
+    def prefix_source(self, prefix: str) -> str:
+        from urllib.parse import quote
+        if not self.keyword_source:
+            raise ValueError(f"{self.label} 不支持前缀搜索")
+        keyword = "FC2" if prefix == "FC2PPV" else prefix
+        return self.normalize_source(self.keyword_source.format(keyword=quote(keyword, safe="")))
 
     def detail_path(self, key: str) -> str:
         raise NotImplementedError

@@ -140,6 +140,16 @@ def numbered_prefix(code: str) -> tuple[str, str] | None:
     return None
 
 
+def series_prefix(key: str) -> str:
+    """从规范化匹配键提取系列；日期型厂牌和不完整番号不猜前缀。"""
+    if key.startswith("TOKYOHOT-") and re.fullmatch(r"TOKYOHOT-[NK]\d{4}", key):
+        return "TOKYOHOT"
+    if key.partition("-")[0] in STUDIOS:
+        return ""
+    match = re.fullmatch(r"([A-Z0-9]*[A-Z][A-Z0-9]*)-\d+(?:-[A-Z0-9]+)*", key)
+    return match.group(1) if match else ""
+
+
 class Prefixes(dict):
     """从不同的作品番号学数字前缀；重复抓取同一番号不重复计票。"""
     def __init__(self):

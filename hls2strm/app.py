@@ -101,6 +101,8 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     app.add_middleware(PlaybackHistoryMiddleware)
     app.add_middleware(JsonCompression)
     app.include_router(operation_api.router,prefix="/api",dependencies=[Depends(api.require_auth)])
+    from . import prefix_api
+    app.include_router(prefix_api.router, prefix="/api", dependencies=[Depends(api.require_auth)])
     app.include_router(play.router)
     app.include_router(api.public)
     app.include_router(api.router)

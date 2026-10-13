@@ -24,7 +24,7 @@ async def remaining_tasks(db, jobs):
 
 
 def remaining_text(engine, groups):
-    names = {"list": "列表抓取", "detail": "详情", "probe": "补源", "cover": "封面", "quality": "画质探测"}
+    names = {"list": "列表抓取", "detail": "详情", "probe": "补源", "cover": "封面", "quality": "画质探测", "prefix_list": "前缀列表", "prefix_detail": "前缀详情"}
     parts = []
     now = time.time()
     for group in groups:
@@ -120,6 +120,9 @@ async def details(engine, job):
             if isinstance(value, int):
                 summary[key] = summary.get(key, 0) + value * row["n"]
     job["results"] = summary
+    if job["kind"] == "prefix_crawl":
+        from .prefix_store import progress
+        job["prefix_progress"] = await progress(db, job["id"])
     return job
 
 

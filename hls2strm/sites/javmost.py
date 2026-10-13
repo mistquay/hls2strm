@@ -54,6 +54,7 @@ def split_variant(key: str) -> tuple[str, bool]:
 
 
 class JavMostSite(Site):
+    keyword_source = "/search/{keyword}"
     name = "javmost"
     label = "JAVMost"
     default_domains = ["https://www.javmost.ws"]

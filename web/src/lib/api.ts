@@ -246,6 +246,7 @@ export interface LineSpecMeta {
 }
 
 export interface SiteMeta {
+  prefix_search?: boolean;
   label: string;
   presets: { name: string; source: string; sort: string }[];
   sorts: Record<string, string>;
@@ -266,6 +267,7 @@ export type JobStatus = "running" | "paused" | "done" | "cancelled";
 export type TaskStatus = "pending" | "running" | "done" | "failed" | "gone" | "cancelled";
 
 export interface Job {
+  prefix_progress?: {items: PrefixRun[]; summary: {seen: number; new: number; sources_added: number; skipped: number}};
   phase?: string;
   phase_detail?: string;
   pending_groups?: {kind: string; site: string; count: number}[];
@@ -283,6 +285,13 @@ export interface Job {
   finished_at: number | null;
   tasks: QueueCounts;
   crawl?: { seen: number; new: number; existing: number; added: number; excluded: number } | null;
+}
+
+export interface PrefixRun {
+  site: string; prefix: string; source: string; last_page: number | null; pages_done?: number;
+  seen?: number; new?: number; sources_added?: number; mismatch?: number; outside?: number;
+  removed?: number; excluded?: number; failed?: number; pending?: number; running?: number;
+  cancelled: number; scan_status: "scanning" | "complete" | "limited" | "failed" | "cancelled";
 }
 
 export interface CrawlItem {

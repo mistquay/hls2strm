@@ -47,6 +47,7 @@ def parse_title(title: str) -> tuple[str, str, bool]:
 
 
 class JavGuruSite(Site):
+    keyword_source = "/search/{keyword}"
     name = "javguru"
     label = "JavGuru"
     default_domains = ["https://jav.guru"]

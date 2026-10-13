@@ -1055,7 +1055,7 @@ def _line_specs(site) -> list[dict]:
 async def meta():
     return {"sites": {name: {"label": s.label, "presets": s.presets, "sorts": s.sorts, "default_sort": s.default_sort,
                              "hint": s.source_hint, "direct": s.stream.direct, "ip_bound": s.stream.ip_bound,
-                             "lines": _line_specs(s)}
+                             "lines": _line_specs(s), "prefix_search": bool(s.keyword_source)}
                       for name, s in SITES.items()}}
 
 

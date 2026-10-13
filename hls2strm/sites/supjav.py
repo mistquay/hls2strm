@@ -70,6 +70,7 @@ def claimed_height(title: str) -> int:
 
 
 class SupJavSite(Site):
+    keyword_source = "/zh/search/{keyword}"
     name = "supjav"
     label = "SupJav"
     default_domains = ["https://supjav.com", "https://supjav.net"]  # supjav.org 已被停放，会把访客引到广告站

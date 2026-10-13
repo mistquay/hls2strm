@@ -4,6 +4,7 @@ import { type ReactNode, useState } from "react";
 import { ErrorText, Pager, QueryNotice } from "@/components/common";
 import { ask } from "@/components/confirm";
 import { CrawlResults, JobLogs } from "@/components/job-history";
+import { PrefixProgress } from "@/components/prefix-crawl";
 import { OperationPreview, type OperationRequest } from "@/components/operation-preview";
 import { navigate } from "@/lib/route";
 import { defaultVerifyOptions, verifyHint, VerifyOptions, verifyParams } from "@/components/verify-options";
@@ -33,7 +34,7 @@ const KINDS: { value: Kind; label: string }[] = [
 export const jobTotal = (j: Job) => Object.values(j.tasks).reduce((a, b) => a + (b ?? 0), 0);
 export const jobFinished = (j: Job) => (j.tasks.done ?? 0) + (j.tasks.failed ?? 0) + (j.tasks.gone ?? 0) + (j.tasks.cancelled ?? 0);
 const PHASES: Record<string,string> = {queued:"排队中",executing:"执行中",background_running:"列表完成 · 后续处理中",background_waiting:"列表完成 · 等待后续处理",following_up:"后续处理进行中",waiting_retry:"等待重试",scheduler_paused:"调度已暂停",pausing:"暂停调度，当前步骤收尾中",partial_failure:"完成 · 部分失败",partial_cancelled:"完成 · 部分取消"};
-const jobLabel = (j:Job) => PHASES[j.phase ?? ""] || (j.status==="done" && j.state.partial_failure ? "完成 · 部分失败" : JOB_STATUS[j.status][0]);
+const jobLabel = (j:Job) => PHASES[j.phase ?? ""] || (j.status==="done" && j.state.partial_failure ? "完成 · 部分失败" : j.status==="done" && j.state.limited ? "完成 · 达到页数上限" : JOB_STATUS[j.status][0]);
 // 同片整理执行时预览后有变化、没处理的组
 const skippedGroups = (j:Job) => ((j.state as Record<string,unknown>).skipped_groups as {group_id:number;code_key?:string;reason:string}[] | undefined) ?? [];
 
@@ -419,6 +420,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
         />
 
         {(job.kind === "crawl" || job.kind === "incremental") && <CrawlResults job={job} />}
+        {job.kind === "prefix_crawl" && <><PrefixProgress job={job} /><CrawlResults job={job} /></>}
         <JobLogs key={`${job.id}-${logTask}`} job={job} taskId={logTask} onClear={() => setLogTask(null)} />
 
         <section>

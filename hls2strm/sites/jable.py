@@ -8,6 +8,7 @@ from .base import ListPage, Site, SourceDetail, SourceItem, StreamTraits
 
 
 class JableSite(Site):
+    keyword_source = "/search/{keyword}/"
     name = "jable"
     label = "Jable"
     default_domains = ["https://fs1.app", "https://jable.tv"]

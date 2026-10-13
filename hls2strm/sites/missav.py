@@ -113,6 +113,7 @@ def _person(name: str) -> str:
 
 
 class MissAVSite(Site):
+    keyword_source = "/cn/search/{keyword}"
     name = "missav"
     label = "MissAV"
     default_domains = ["https://missav123.com", "https://missav.live", "https://njavtv.com", "https://missav.ws"]

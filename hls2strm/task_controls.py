@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Literal, get_args
 
-CancellableKind = Literal["list", "detail", "probe", "cover", "quality"]
+CancellableKind = Literal["list", "detail", "probe", "cover", "quality", "prefix_list", "prefix_detail"]
 CANCELLABLE_KINDS = get_args(CancellableKind)
 log = logging.getLogger(__name__)
 

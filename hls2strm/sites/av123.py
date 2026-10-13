@@ -86,6 +86,7 @@ def _slug(href: str) -> str:
 
 
 class AV123Site(Site):
+    keyword_source = "/cn/search/{keyword}"
     name = "123av"
     label = "123AV"
     default_domains = ["https://123av.com"]

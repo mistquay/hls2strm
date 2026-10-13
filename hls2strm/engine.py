@@ -266,6 +266,7 @@ class Engine:
                          f"（排队了 {_fmt_secs(waited)}）" if waited >= 10 else "")
             log.info("子任务 #%d %s %s 开始（第 %d 次）", tid, task["kind"], task["target"], task["attempts"])
             handler = {"list": self._do_list, "detail": self._do_detail, "probe": self._do_probe,
+                       "prefix_list": self._do_prefix_list, "prefix_detail": self._do_prefix_detail,
                        "rewrite": self._do_rewrite, "verify": self._do_verify, "cover": self._do_cover,
                        "purge": self._do_purge, "reclassify": self._do_reclassify,
                        "scan": self.strm.do_scan, "adopt": self.strm.do_adopt,
@@ -286,10 +287,13 @@ class Engine:
         except TaskStopped as e:
             await self.db.finish_task(tid, e.status, "任务暂停后恢复" if e.status == "pending" else "任务已取消", refund_attempt=True)
             log.info("子任务 #%d：%s", tid, "任务暂停后恢复" if e.status == "pending" else "任务已取消")
+            finished = e.status == "cancelled"
         except (NotFound, VideoGone) as e:
             await self.db.finish_task(tid, "gone", f"已下架：{e}")
             if task["kind"] == "detail":
                 await self.db.mark_source_gone(task["site"] or "jable", task["target"])
+            elif task["kind"] == "prefix_detail":
+                await self.db.mark_source_gone(task["site"], task["target"].split("/", 2)[2])
             self.metrics.inc("task_gone")
             log.info("%s %s 已下架：%s", task["kind"], task["target"], e)
             finished = True
@@ -379,6 +383,12 @@ class Engine:
         if job["kind"] in ("crawl", "incremental"):
             row = await self.db._one("SELECT COUNT(*) AS n, SUM(status!='done') AS bad FROM tasks WHERE job_id=? AND kind='list'", (job_id,))
             state["list_complete"] = bool(row["n"] and not row["bad"])
+            if not state["list_complete"]:
+                state["partial_failure"] = True
+        elif job["kind"] == "prefix_crawl":
+            rows = await self.db._all("SELECT listing_complete,limited,cancelled FROM prefix_runs WHERE job_id=?", (job_id,))
+            state["list_complete"] = bool(rows) and all(r["listing_complete"] and not r["cancelled"] for r in rows)
+            state["limited"] = any(r["limited"] for r in rows)
             if not state["list_complete"]:
                 state["partial_failure"] = True
         await self.db.update_job(job_id, status="done", finished_at=finished, state=state)
@@ -670,6 +680,15 @@ class Engine:
     async def upsert_detail(self, site: Site, d: SourceDetail) -> dict:
         vid = await self.db.upsert_detail(site.name, d, self._slug_for(site, d.key, d.code, d.uncensored, d.maker), self._rank)
         return await self.db.get_video_by_id(vid)
+
+    @guarded
+    async def _do_prefix_list(self, job: dict, task: dict) -> None:
+        from .prefix_crawl import do_list
+        await do_list(self, job, task)
+
+    async def _do_prefix_detail(self, job: dict, task: dict) -> None:
+        from .prefix_crawl import do_detail
+        await do_detail(self, job, task)
 
     @guarded
     async def _do_list(self, job: dict, task: dict) -> None:

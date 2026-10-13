@@ -21,7 +21,7 @@ from typing import Any
 
 import aiosqlite
 
-from .codes import Prefixes, code_key, compatible_keys, edition, is_native, legacy_code_key, work_slug
+from .codes import Prefixes, code_key, compatible_keys, edition, is_native, legacy_code_key, series_prefix, work_slug
 from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
 from .cache import AsyncCache
 from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18, migrate_v19 as _migrate_v19
@@ -29,6 +29,7 @@ from .job_history import JobHistory, migrate_v13 as _migrate_v13
 from .play_history import migrate_v20 as _migrate_v20
 from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
 from .schedule_store import migrate_v21 as _migrate_v21
+from .prefix_store import migrate_v25 as _migrate_v25
 from .runtime import stage
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
@@ -376,7 +377,7 @@ async def _migrate_v24(conn: aiosqlite.Connection) -> None:
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21, _migrate_v22, _migrate_v23, _migrate_v24]
+              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21, _migrate_v22, _migrate_v23, _migrate_v24, _migrate_v25]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -459,6 +460,7 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = await aiosqlite.connect(self.path, isolation_level=None)
         self.conn.row_factory = aiosqlite.Row
+        await self.conn.create_function("series_prefix", 1, series_prefix, deterministic=True)
         await self.conn.execute("PRAGMA journal_mode=WAL")
         await self.conn.execute("PRAGMA synchronous=NORMAL")
         await self._migrate()
@@ -467,6 +469,7 @@ class Database:
         for attr in ("reader", "bulk_reader"):
             conn = await aiosqlite.connect(self.path, isolation_level=None)
             conn.row_factory = aiosqlite.Row
+            await conn.create_function("series_prefix", 1, series_prefix, deterministic=True)
             await conn.execute("PRAGMA query_only=ON")
             setattr(self, attr, conn)
 
@@ -672,9 +675,11 @@ class Database:
         await self.conn.execute(f"UPDATE videos SET {cols} WHERE id=?", (*sets.values(), video_id))
 
     async def upsert_item(self, site: str, it: SourceItem, slug: str, rank: Callable[[str], int],
-                          video_id: int | None = None, *, crawl: tuple[int, int, int] | None = None) -> tuple[int, bool]:
+                          video_id: int | None = None, *, crawl: tuple[int, int, int] | None = None,
+                          prefix_hit: tuple[int, str, int] | None = None) -> tuple[int, bool]:
         """列表页数据入库：找到或新建作品，记下这个源。返回 (作品 id, 是否新作品)。video_id 见 _attach。"""
         async with self._tx():
+            prior = await self._one("SELECT status FROM sources WHERE site=? AND key=?", (site, it.key)) if prefix_hit else None
             video_id, _, created, removed = await self._attach(site, it.key, it.code, it.uncensored, slug,
                                                                it.site_vid, it.title, it.subtitle, video_id)
             async with self.conn.execute("SELECT * FROM videos WHERE id=?", (video_id,)) as cur:
@@ -689,6 +694,14 @@ class Database:
                     "INSERT OR IGNORE INTO crawl_items(job_id,video_id,task_id,site,source_key,page,slug,title,is_new) "
                     "VALUES(?,?,?,?,?,?,?,?,?)",
                     (job_id, video_id, task_id, site, it.key, page, work["slug"], it.title, int(created)),
+                )
+            if prefix_hit:
+                job_id, prefix, page = prefix_hit
+                await self.conn.execute(
+                    """INSERT OR IGNORE INTO prefix_hits(job_id,site,source_key,prefix,page,video_id,new_video,new_source,outcome)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (job_id, site, it.key, prefix, page, video_id, int(created), int(prior is None and not removed),
+                     "removed" if removed else "accepted"),
                 )
         return video_id, created
 
@@ -1630,6 +1643,8 @@ class Database:
         async with self._tx(invalidate=False):
             await self.conn.execute("DELETE FROM job_logs WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM crawl_items WHERE job_id=?", (job_id,))
+            await self.conn.execute("DELETE FROM prefix_hits WHERE job_id=?", (job_id,))
+            await self.conn.execute("DELETE FROM prefix_runs WHERE job_id=?", (job_id,))
             await self.conn.execute("DELETE FROM scan_staging WHERE scan_id=?", (job_id,))
             await self.conn.execute("DELETE FROM operation_items WHERE preview_id=?", (job_id,))
             await self.conn.execute("DELETE FROM operation_requests WHERE job_id=?",(job_id,))
