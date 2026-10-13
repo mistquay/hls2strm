@@ -1,6 +1,6 @@
 services:
   hls2strm:
-    image: ghcr.io/zyd16888/hls2strm:nightly   # 或 :latest、:v0.2.0；本地构建把这行换成 build: .
+    image: ghcr.io/mistquay/hls2strm:nightly   # 或 :latest、:v0.2.0；本地构建把这行换成 build: .
     container_name: hls2strm
     restart: unless-stopped
     ports:
