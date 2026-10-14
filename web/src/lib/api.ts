@@ -291,7 +291,7 @@ export interface PrefixRun {
   site: string; prefix: string; source: string; last_page: number | null; pages_done?: number;
   seen?: number; new?: number; sources_added?: number; mismatch?: number; outside?: number;
   removed?: number; excluded?: number; failed?: number; pending?: number; running?: number;
-  cancelled: number; scan_status: "scanning" | "complete" | "limited" | "failed" | "cancelled";
+  cancelled: number; scan_status: "queued" | "waiting" | "scanning" | "complete" | "limited" | "failed" | "cancelled";
 }
 
 export interface CrawlItem {

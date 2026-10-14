@@ -29,7 +29,7 @@ from .job_history import JobHistory, migrate_v13 as _migrate_v13
 from .play_history import migrate_v20 as _migrate_v20
 from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
 from .schedule_store import migrate_v21 as _migrate_v21
-from .prefix_store import migrate_v25 as _migrate_v25
+from .prefix_store import migrate_v25 as _migrate_v25, PREFIX_HEADS_SQL, PREFIX_CLAIM_SQL
 from .runtime import stage, measured_lock
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
@@ -1704,10 +1704,12 @@ class Database:
         async with self._lock:
             async with self.conn.execute(
                 f"""
+                {PREFIX_HEADS_SQL}
                 UPDATE tasks SET status='running', attempts=attempts+1, updated_at=?
                 WHERE id = (
                   SELECT t.id FROM tasks t JOIN jobs j ON j.id = t.job_id
                   WHERE t.status='pending' AND t.next_run_at<=? AND j.status='running' {cond}
+                  {PREFIX_CLAIM_SQL}
                   ORDER BY t.priority DESC, t.id LIMIT 1)
                 RETURNING *
                 """,

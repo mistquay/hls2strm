@@ -126,7 +126,7 @@ function PrefixForm({filter, ids, onDone}: {filter: Record<string, unknown>; ids
       <Pager page={page} size={50} total={rows.length} onPage={setPage} />
     </>}
     <Field label="手动补充前缀" hint="每行一个，也可以用空格或逗号分隔；与勾选结果合并去重。"><Textarea aria-label="手动补充前缀" value={manual} onChange={e => setManual(e.target.value)} placeholder={"JUFE\nMDBK"} /></Field>
-    <div className="flex flex-wrap gap-3"><span className="text-sm text-muted">同时抓取其他目标源：</span>{enabled.filter(s => s !== site).map(s => <Check key={s} checked={extraSites.includes(s)} onChange={v => setExtraSites(prev => v ? [...prev,s] : prev.filter(n => n !== s))}>{meta.label(s)}</Check>)}</div>
+    <div className="flex flex-wrap gap-3"><span className="text-sm text-muted">其他目标源：</span>{enabled.filter(s => s !== site).map(s => <Check key={s} checked={extraSites.includes(s)} onChange={v => setExtraSites(prev => v ? [...prev,s] : prev.filter(n => n !== s))}>{meta.label(s)}</Check>)}</div>
     <div className="grid gap-3 sm:grid-cols-3">
       <Field label="收录模式"><Select aria-label="收录模式" value={mode} onChange={e => setMode(e.target.value)}><option value="expand">补源并扩库</option><option value="existing">仅给快照内影片补源</option></Select></Field>
       {mode === "expand" && <Field label="新片输出库"><Select aria-label="新片输出库" value={library} onChange={e => setLibrary(e.target.value)}>{libraries.map(l => <option key={l.id} value={l.id}>{l.name}</option>)}</Select></Field>}
@@ -135,12 +135,18 @@ function PrefixForm({filter, ids, onDone}: {filter: Record<string, unknown>; ids
     <div className="flex flex-wrap gap-4"><Check checked={strict} onChange={setStrict}>仅收录番号前缀符合的结果</Check><Check checked={detail} onChange={setDetail}>抓取新源详情</Check></div>
     {!strict && <p className="text-sm text-warn">关闭前缀核验后，标题等字段命中的其他系列也会按所选模式处理。</p>}
     {prefixes.some(p => ["FC2", "FC2PPV", "FC2-PPV"].includes(p)) && <p className="text-sm text-warn">FC2 搜索结果可能很多，建议设置页数上限。</p>}
-    <p className="text-sm text-muted">已有影片保留输出库归属；新片遵守排除规则。页面可以关闭，任务在后台继续。</p>
+    <p className="text-sm text-muted">按站点、前缀名称顺序逐个抓取，当前前缀的列表和详情处理结束后再抓下一个。已有影片保留输出库归属；新片遵守排除规则。页面可以关闭，任务在后台继续。</p>
     <Button variant="primary" disabled={run.busy || !!statsJob || !stats || !prefixes.length || !enabled.includes(site) || !Number.isInteger(Number(maxPages)) || Number(maxPages) < 0 || Number(maxPages) > 10000} onClick={create}>创建批次：{prefixes.length} 个前缀 × {extraSites.length + 1} 个源</Button>
   </div>;
 }
 
-const scanLabels = {scanning: "扫描中", complete: "完整扫描", limited: "达到页数上限", failed: "部分失败", cancelled: "已取消"};
+const scanLabels = {queued: "待抓取", waiting: "等待继续", scanning: "扫描中", complete: "完整扫描", limited: "达到页数上限", failed: "部分失败", cancelled: "已取消"};
+
+interface PrefixSummary {
+  seen: number; new: number; sources_added: number; skipped: number;
+  sequence: {total: number; finished: number; waiting: number; failed: number; cancelled: number;
+    current: {site: string; prefix: string; position: number} | null};
+}
 
 export function PrefixProgress({job}: {job: Job}) {
   const meta = useMeta();
@@ -148,16 +154,31 @@ export function PrefixProgress({job}: {job: Job}) {
   const [q, setQ] = useState("");
   const [search,setSearch] = useState("");
   const [page,setPage] = useState(1);
+  const [state,setState] = useState("");
   useEffect(()=>{const timer=setTimeout(()=>{setSearch(q);setPage(1);},250);return ()=>clearTimeout(timer);},[q]);
   const active = job.status==="running" || job.status==="paused";
-  const progressQuery = useQuery({queryKey:["prefix-progress",job.id,search,page,job.status],queryFn:({signal})=>api.get<Page<PrefixRun>>(`/api/prefixes/jobs/${job.id}/progress?q=${encodeURIComponent(search)}&limit=50&offset=${(page-1)*50}`,signal),refetchInterval:active ? 3000 : false,placeholderData:keepPreviousData});
-  const summary = useQuery({queryKey:["prefix-summary",job.id,job.status],queryFn:({signal})=>api.get<{seen:number;new:number;sources_added:number;skipped:number}>(`/api/prefixes/jobs/${job.id}/summary`,signal),refetchInterval:active ? 5000 : false});
+  const progressQuery = useQuery({queryKey:["prefix-progress",job.id,search,page,job.status,state],queryFn:({signal})=>api.get<Page<PrefixRun>>(`/api/prefixes/jobs/${job.id}/progress?q=${encodeURIComponent(search)}&limit=50&offset=${(page-1)*50}&state=${state}`,signal),refetchInterval:active ? 3000 : false,placeholderData:keepPreviousData});
+  const summary = useQuery({queryKey:["prefix-summary",job.id,job.status],queryFn:({signal})=>api.get<PrefixSummary>(`/api/prefixes/jobs/${job.id}/summary`,signal),refetchInterval:active ? 3000 : false});
   const progress = progressQuery.data;
+  const sequence = summary.data?.sequence;
   return <div className="space-y-2">
     <h4 className="font-semibold">前缀抓取进度</h4>
     <QueryNotice query={summary} label="前缀汇总" />
+    {sequence && <div className="space-y-2 rounded border border-line p-3">
+      <p className="text-sm">已结束 {sequence.finished} / {sequence.total} 个站点前缀（{sequence.total ? Math.round(sequence.finished / sequence.total * 100) : 0}%） · 待抓取 / 继续 {sequence.waiting} 个 · 有失败 {sequence.failed} 个 · 已取消 {sequence.cancelled} 个</p>
+      <progress aria-label="前缀处理进度" className="h-2 w-full" value={sequence.finished} max={sequence.total || 1} />
+      {sequence.current && <div className="flex flex-wrap items-center gap-2 text-sm">
+        <span>{job.status === "paused" ? "暂停于" : job.status === "cancelled" ? "停止于" : "当前前缀"}：第 {sequence.current.position} 个 · {meta.label(sequence.current.site)} / {sequence.current.prefix}</span>
+        <Button size="sm" onClick={()=>{setQ(sequence.current!.prefix);setPage(1);setState("");}}>查看当前前缀</Button>
+      </div>}
+    </div>}
     {summary.data && <p className="text-sm">匹配影片 {summary.data.seen} 部 · 新影片 {summary.data.new} 部 · 新增源 {summary.data.sources_added} 个 · 跳过 {summary.data.skipped} 条</p>}
-    <Input aria-label="筛选前缀任务" placeholder="筛选前缀任务" value={q} onChange={e => setQ(e.target.value)} />
+    <div className="flex flex-wrap gap-2">
+      <Input aria-label="筛选前缀任务" placeholder="筛选前缀任务" value={q} onChange={e => setQ(e.target.value)} className="w-48" />
+      <Select aria-label="前缀任务状态" value={state} onChange={e=>{setState(e.target.value);setPage(1);}}>
+        <option value="">全部前缀</option><option value="unfinished">尚未结束</option><option value="queued">尚未开始</option><option value="failed">有失败项</option>
+      </Select>
+    </div>
     <QueryNotice query={progressQuery} label="前缀进度" />
     <div className="max-h-80 overflow-auto"><Table className="min-w-[900px] [&_td]:whitespace-nowrap"><thead><tr><Th>目标源 / 前缀</Th><Th>扫描状态</Th><Th>已抓页数</Th><Th>影片 / 新片</Th><Th>新增源</Th><Th>不符 / 范围外</Th><Th>删源 / 排除</Th><Th>后续任务</Th><Th>操作</Th></tr></thead><tbody>
       {progress?.items.map(row => <tr key={`${row.site}/${row.prefix}`}>
@@ -172,6 +193,6 @@ export function PrefixProgress({job}: {job: Job}) {
       {progress && !progress.items.length && <EmptyRow cols={9}>没有符合筛选的前缀</EmptyRow>}
     </tbody></Table></div>
     <Pager page={page} size={50} total={progress?.total ?? 0} onPage={setPage} />
-    <p className="text-xs text-muted">批次汇总去重；完整扫描表示列表处理完成，详情失败仍单独记录，新增源未必已通过播放验证。</p>
+    <p className="text-xs text-muted">按站点、前缀名称顺序执行；已结束包含成功、达到页数上限、失败和取消，失败项可另行重试。完整扫描表示列表处理完成，当前前缀的详情可能仍在执行。各前缀页数不同，处理比例不代表剩余耗时。批次汇总去重，新增源未必已通过播放验证。</p>
   </div>;
 }

@@ -305,6 +305,10 @@ def test_prefix_api_auth_validation_and_idempotency(tmp_path):
         assert first.status_code == 200, first.text
         repeated = client.post("/api/prefixes/jobs", auth=auth, headers=headers, json=value)
         assert repeated.json() == first.json()
+        jid = first.json()["job_id"]
+        assert client.get(f"/api/prefixes/jobs/{jid}/summary", auth=auth).json()["sequence"]["total"] == 1
+        assert client.get(f"/api/prefixes/jobs/{jid}/progress?state=queued", auth=auth).status_code == 200
+        assert client.get(f"/api/prefixes/jobs/{jid}/progress?state=invalid", auth=auth).status_code == 422
         assert client.post("/api/prefixes/jobs", auth=auth, json={**value, "max_pages": -1}).status_code == 422
         assert client.post("/api/prefixes/jobs", auth=auth, json={**value, "prefixes": ["../oops"]}).status_code == 400
         assert client.post("/api/prefixes/stats", auth=auth, json={"query": {"unknown": "foo"}}).status_code == 400

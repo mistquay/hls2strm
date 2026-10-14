@@ -65,13 +65,15 @@ async def _prefix_job(request, job_id):
 
 
 @router.get("/prefixes/jobs/{job_id}/progress")
-async def progress(job_id: int, request: Request, q: str = "", limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
-    return await prefix_store.progress_page(await _prefix_job(request, job_id), job_id, q, limit, offset)
+async def progress(job_id: int, request: Request, q: str = "", limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0),
+                   state: Literal["", "unfinished", "queued", "failed"] = ""):
+    return await prefix_store.progress_page(await _prefix_job(request, job_id), job_id, q, limit, offset, state)
 
 
 @router.get("/prefixes/jobs/{job_id}/summary")
 async def summary(job_id: int, request: Request):
-    return await prefix_store.progress_summary(await _prefix_job(request, job_id), job_id)
+    db = await _prefix_job(request, job_id)
+    return {**await prefix_store.progress_summary(db, job_id), "sequence": await prefix_store.sequence_progress(db, job_id)}
 
 
 @router.post("/prefixes/jobs")

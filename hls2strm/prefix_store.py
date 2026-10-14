@@ -6,6 +6,30 @@ from .codes import code_key, edition, is_native, series_prefix
 
 TASK_PREFIX = "substr(target,instr(target,'/')+1,instr(substr(target,instr(target,'/')+1),'/')-1)"
 
+# 每个批次只领取第一个仍有列表/详情工作的站点前缀，包括等待重试的任务。
+# +r.prefix 去掉列的 TEXT affinity，让 SQLite 使用完整的表达式索引。
+PREFIX_HEADS_SQL = f"""WITH prefix_heads AS MATERIALIZED (
+    SELECT j.id AS job_id, (
+        SELECT r.site || '/' || r.prefix FROM prefix_runs r
+        WHERE r.job_id=j.id AND EXISTS (
+            SELECT 1 FROM tasks p INDEXED BY tasks_prefix_progress
+            WHERE p.job_id=r.job_id AND p.site=r.site
+              AND {TASK_PREFIX}=+r.prefix
+              AND p.kind IN ('prefix_list','prefix_detail') AND p.status IN ('pending','running'))
+        ORDER BY r.site,r.prefix LIMIT 1
+    ) AS head FROM jobs j WHERE j.kind='prefix_crawl' AND j.status='running'
+)"""
+PREFIX_CLAIM_SQL = f"""AND (t.kind NOT IN ('prefix_list','prefix_detail') OR (
+    t.site || '/' || {TASK_PREFIX.replace('target', 't.target')} =
+        (SELECT head FROM prefix_heads WHERE job_id=t.job_id)
+    AND NOT EXISTS (
+        SELECT 1 FROM tasks busy WHERE busy.job_id=t.job_id AND busy.status='running'
+          AND busy.kind IN ('prefix_list','prefix_detail')
+          AND busy.site || '/' || {TASK_PREFIX.replace('target', 'busy.target')} !=
+              t.site || '/' || {TASK_PREFIX.replace('target', 't.target')}
+    )
+))"""
+
 
 async def migrate_v25(conn):
     for sql in (
@@ -92,7 +116,9 @@ def _progress_items(runs, counts, tasks):
         item["scan_status"] = ("cancelled" if item["cancelled"] or item.get("cancelled_tasks") else
                                "failed" if item.get("failed") else
                                "limited" if item["listing_complete"] and item["limited"] else
-                               "complete" if item["listing_complete"] else "scanning")
+                               "complete" if item["listing_complete"] else
+                               "scanning" if item.get("running") else
+                               "waiting" if item.get("started") or item["last_page"] else "queued")
         items.append(item)
     return items
 
@@ -110,7 +136,8 @@ async def progress(db, job_id):
         """SELECT site,substr(target,instr(target,'/')+1,instr(substr(target,instr(target,'/')+1),'/')-1) AS prefix,
            SUM(kind='prefix_list' AND status='done') AS pages_done,
            SUM(status='failed' OR status='gone') AS failed,
-           SUM(status='pending') AS pending,SUM(status='running') AS running,SUM(status='cancelled') AS cancelled_tasks
+           SUM(status='pending') AS pending,SUM(status='running') AS running,SUM(status='cancelled') AS cancelled_tasks,
+           SUM(attempts>0 OR status='done' OR last_error!='') AS started
            FROM tasks WHERE job_id=? AND kind IN ('prefix_list','prefix_detail') GROUP BY site,prefix""", (job_id,), bulk=True)
     summary = await db._one(
         """SELECT COUNT(DISTINCT video_id) AS seen,COUNT(DISTINCT CASE WHEN new_video=1 THEN video_id END) AS new,
@@ -131,13 +158,49 @@ async def progress_summary(db, job_id):
     return await db.job_cache.get(("prefix_summary", job_id), load, 5)
 
 
-async def progress_page(db, job_id, q="", limit=50, offset=0):
+async def sequence_progress(db, job_id):
+    async def load():
+        rows = await db._all(f"""
+            WITH work AS (
+                SELECT site,{TASK_PREFIX} AS prefix,
+                    SUM(status IN ('pending','running')) AS open,
+                    SUM(status IN ('failed','gone')) AS failed,
+                    SUM(status='cancelled') AS cancelled
+                FROM tasks WHERE job_id=? AND kind IN ('prefix_list','prefix_detail') GROUP BY site,prefix
+            )
+            SELECT r.site,r.prefix,r.cancelled,COALESCE(w.open,0) AS open,
+                COALESCE(w.failed,0) AS failed,COALESCE(w.cancelled,0) AS cancelled_tasks
+            FROM prefix_runs r LEFT JOIN work w ON w.site=r.site AND w.prefix=r.prefix
+            WHERE r.job_id=? ORDER BY r.site,r.prefix
+        """, (job_id, job_id), bulk=True)
+        current = next(({"site": r["site"], "prefix": r["prefix"], "position": i}
+                        for i, r in enumerate(rows, 1) if r["open"]), None)
+        finished = sum(not r["open"] for r in rows)
+        return {"total": len(rows), "finished": finished,
+                "waiting": len(rows) - finished - int(current is not None),
+                "failed": sum(bool(r["failed"]) for r in rows),
+                "cancelled": sum(bool(r["cancelled"] or r["cancelled_tasks"]) for r in rows),
+                "current": current}
+    return await db.job_cache.get(("prefix_sequence", job_id), load, 3)
+
+
+async def progress_page(db, job_id, q="", limit=50, offset=0, state=""):
     async def load():
         search = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         args = (job_id, f"%{search}%", limit, offset)
-        page_sql = "SELECT * FROM prefix_runs WHERE job_id=? AND prefix LIKE ? ESCAPE '\\' ORDER BY site,prefix LIMIT ? OFFSET ?"
+        task_match = f"""SELECT 1 FROM tasks t INDEXED BY tasks_prefix_progress
+            WHERE t.job_id=r.job_id AND t.site=r.site AND {TASK_PREFIX.replace('target', 't.target')}=+r.prefix
+              AND t.kind IN ('prefix_list','prefix_detail')"""
+        state_sql = {
+            "": "",
+            "unfinished": f" AND EXISTS ({task_match} AND t.status IN ('pending','running'))",
+            "queued": f" AND r.cancelled=0 AND r.last_page IS NULL AND EXISTS ({task_match} AND t.status='pending') AND NOT EXISTS ({task_match} AND (t.attempts>0 OR t.status!='pending' OR t.last_error!=''))",
+            "failed": f" AND EXISTS ({task_match} AND t.status IN ('failed','gone'))",
+        }[state]
+        where = "r.job_id=? AND r.prefix LIKE ? ESCAPE '\\'" + state_sql
+        page_sql = f"SELECT r.* FROM prefix_runs r WHERE {where} ORDER BY r.site,r.prefix LIMIT ? OFFSET ?"
         runs = await db._all(page_sql, args, browse=True)
-        total = (await db._one("SELECT COUNT(*) AS n FROM prefix_runs WHERE job_id=? AND prefix LIKE ? ESCAPE '\\'", args[:2], browse=True))["n"]
+        total = (await db._one(f"SELECT COUNT(*) AS n FROM prefix_runs r WHERE {where}", args[:2], browse=True))["n"]
         if not runs:
             return {"items": [], "total": total}
         # 每个前缀使用参数精确查找。表达式索引与 TEXT 列关联时可能只用到 job/site，
@@ -156,10 +219,10 @@ async def progress_page(db, job_id, q="", limit=50, offset=0):
                        SUM(kind='prefix_list' AND status='done') AS pages_done,
                        SUM(status='failed' OR status='gone') AS failed,
                        SUM(status='pending') AS pending,SUM(status='running') AS running,
-                       SUM(status='cancelled') AS cancelled_tasks
+                       SUM(status='cancelled') AS cancelled_tasks,SUM(attempts>0 OR status='done' OR last_error!='') AS started
                 FROM tasks INDEXED BY tasks_prefix_progress
                 WHERE job_id=? AND site=? AND {TASK_PREFIX}=?
                   AND kind IN ('prefix_list','prefix_detail')""" for _ in runs),
             [value for key in keys for value in key], browse=True)
         return {"items": _progress_items(runs, counts, tasks), "total": total}
-    return await db.job_cache.get(("prefix_page", job_id, q.strip(), limit, offset), load, 3)
+    return await db.job_cache.get(("prefix_page", job_id, q.strip(), limit, offset, state), load, 3)
