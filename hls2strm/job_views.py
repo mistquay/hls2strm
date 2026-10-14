@@ -7,11 +7,13 @@ from .sites import SITES
 from .task_controls import CANCELLABLE_KINDS
 
 
-async def remaining_tasks(db, jobs):
+async def remaining_tasks(db, jobs, *, cached=False):
     """一页任务共用一次汇总查询，只读取未结束子任务。"""
     ids = [j["id"] for j in jobs if j["status"] in ("running", "paused")]
     if not ids:
         return {}
+    if cached:
+        return await db.job_cache.get(("remaining", tuple(ids)), lambda: remaining_tasks(db, jobs), 5)
     rows = await db._all(
         f"""SELECT job_id,kind,site,SUM(status='pending') AS pending,SUM(status='running') AS running,
                    MIN(CASE WHEN status='pending' THEN next_run_at END) AS next_run_at
@@ -104,23 +106,30 @@ async def describe(engine, job, remaining=None):
     return job
 
 
-async def details(engine, job):
+async def _summary(db, job_id):
+    tasks = await db.task_counts(job_id)
+    crawl = (await db.history.counts([job_id])).get(job_id)
+    row = await db._one("SELECT MIN(next_run_at) AS next_at FROM tasks WHERE job_id=? AND status='pending'", (job_id,), bulk=True)
+    results = await db._all("SELECT result,COUNT(*) AS n FROM tasks WHERE job_id=? AND status='done' AND result!='{}' GROUP BY result", (job_id,), bulk=True)
+    summary = {}
+    for result in results:
+        for key, value in json.loads(result["result"]).items():
+            if isinstance(value, int):
+                summary[key] = summary.get(key, 0) + value * result["n"]
+    remaining = (await remaining_tasks(db, [{"id": job_id, "status": "running"}])).get(job_id, [])
+    return {"tasks": tasks, "crawl": crawl, "next_retry_at": row["next_at"] if row else None, "results": summary, "_remaining": remaining}
+
+
+async def details(engine, job, *, summary_only=False):
     db = engine.db
-    job["tasks"] = await db.task_counts(job["id"])
-    job["crawl"] = (await db.history.counts([job["id"]])).get(job["id"])
-    row = await db._one("SELECT MIN(next_run_at) AS next_at FROM tasks WHERE job_id=? AND status='pending'", (job["id"],), bulk=True)
-    job["next_retry_at"] = row["next_at"] if row else None
-    await describe(engine, job)
+    if summary_only:
+        job.update(await db.job_cache.get(("summary", job["id"], job["status"]), lambda: _summary(db, job["id"]), 5))
+    else:
+        job.update(await _summary(db, job["id"]))
+    await describe(engine, job, remaining=job.pop("_remaining"))
     if job["phase"] == "queued" and job["next_retry_at"] and job["next_retry_at"] > time.time():
         job["phase"] = "waiting_retry"
-    results = await db._all("SELECT result,COUNT(*) AS n FROM tasks WHERE job_id=? AND status='done' AND result!='{}' GROUP BY result", (job["id"],), bulk=True)
-    summary = {}
-    for row in results:
-        for key, value in json.loads(row["result"]).items():
-            if isinstance(value, int):
-                summary[key] = summary.get(key, 0) + value * row["n"]
-    job["results"] = summary
-    if job["kind"] == "prefix_crawl":
+    if job["kind"] == "prefix_crawl" and not summary_only:
         from .prefix_store import progress
         job["prefix_progress"] = await progress(db, job["id"])
     return job
@@ -135,7 +144,7 @@ async def task_page(db, job_id, status="", q="", limit=100, offset=0):
         where.append("(target LIKE ? OR id=?)")
         params.extend((f"%{q.strip()}%", q.strip()))
     condition = " AND ".join(where)
-    total = (await db._one(f"SELECT COUNT(*) AS n FROM tasks WHERE {condition}", params, bulk=True))["n"]
-    rows = await db._all(f"SELECT * FROM tasks WHERE {condition} ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?", (*params,limit,offset), bulk=True)
+    total = (await db._one(f"SELECT COUNT(*) AS n FROM tasks WHERE {condition}", params, browse=True))["n"]
+    rows = await db._all(f"SELECT * FROM tasks WHERE {condition} ORDER BY updated_at DESC,id DESC LIMIT ? OFFSET ?", (*params,limit,offset), browse=True)
     items = [{**dict(row), "result": json.loads(row["result"])} for row in rows]
     return {"items": items, "total": total}

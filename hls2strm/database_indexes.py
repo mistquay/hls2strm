@@ -2,6 +2,18 @@
 
 import aiosqlite
 
+async def migrate_v26(conn: aiosqlite.Connection) -> None:
+    from .prefix_store import TASK_PREFIX
+    for sql in (
+        "CREATE INDEX tasks_job_recent ON tasks(job_id,updated_at DESC,id DESC)",
+        "CREATE INDEX tasks_job_status_recent ON tasks(job_id,status,updated_at DESC,id DESC)",
+        "CREATE INDEX crawl_items_page ON crawl_items(job_id,page,video_id)",
+        f"CREATE INDEX tasks_prefix_progress ON tasks(job_id,site,({TASK_PREFIX}),kind,status) "
+        "WHERE kind IN ('prefix_list','prefix_detail')",
+        "ALTER TABLE prefix_scopes ADD COLUMN ready INTEGER NOT NULL DEFAULT 1",
+    ):
+        await conn.execute(sql)
+
 async def migrate_v19(conn: aiosqlite.Connection) -> None:
     await conn.execute("ALTER TABLE libraries ADD COLUMN operation_job_id INTEGER")
     await conn.execute("ALTER TABLE libraries ADD COLUMN operation_pending INTEGER NOT NULL DEFAULT 0")

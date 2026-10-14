@@ -1,6 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { Pause, Play, RotateCw, Trash2, X, XCircle } from "lucide-react";
-import { type ReactNode, useState } from "react";
+import { type ReactNode, useEffect, useState } from "react";
 import { ErrorText, Pager, QueryNotice } from "@/components/common";
 import { ask } from "@/components/confirm";
 import { CrawlResults, JobLogs } from "@/components/job-history";
@@ -42,6 +42,7 @@ function progressText(j: Job): string {
   let text = `${fmtNum(jobFinished(j))} / ${fmtNum(jobTotal(j))}`;
   const st = j.state;
   if (st.queued != null) text += `，已排队 ${fmtNum(Number(st.queued))} 项`;
+  if (j.kind === "prefix_stats" && st.total != null) text += `，已统计 ${fmtNum(Number(st.processed ?? 0))} / ${fmtNum(Number(st.total))} 部影片`;
   const n = (k: string) => fmtNum(Number(st[k] ?? 0));
   if (st.last_page) text += `，共 ${st.last_page} 页`;
   if (j.crawl) text += `，已识别 ${fmtNum(j.crawl.seen)} 部，新增 ${fmtNum(j.crawl.new)}，重复 ${fmtNum(j.crawl.existing)}`;
@@ -87,7 +88,7 @@ export default function Jobs() {
   const jobs = jobsQuery.data?.items ?? [];
   const { data: status } = useStatus();
   const now = status?.now ?? Date.now() / 1000;
-  const detail = useQuery({queryKey:["jobs","detail",openId],queryFn:({signal})=>api.get<Job>(`/api/jobs/${openId}`,signal),enabled:!!openId,refetchInterval:q=>(q.state.data?.status==="done" || q.state.data?.status==="cancelled") && q.state.data?.phase!=="following_up" ? false : 3000});
+  const detail = useQuery<Job>({queryKey:["jobs","detail",openId],queryFn:({signal})=>api.get<Job>(`/api/jobs/${openId}?summary=true`,signal),enabled:!!openId,placeholderData:()=>jobs.find(j=>j.id===openId),refetchInterval:q=>(q.state.data?.status==="done" || q.state.data?.status==="cancelled") && q.state.data?.phase!=="following_up" ? false : 3000});
   const open = detail.data;
 
   return (
@@ -303,20 +304,24 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
   const meta = useMeta();
   const [filter, setFilter] = useState<"" | TaskStatus>(job.tasks.failed ? "failed" : "");
   const [logTask, setLogTask] = useState<number | null>(null);
+  const [section,setSection] = useState(job.kind==="prefix_crawl" ? "progress" : "tasks");
   const [page,setPage] = useState(1);
   const [target,setTarget] = useState("");
+  const [targetSearch,setTargetSearch] = useState("");
+  useEffect(()=>{const timer=setTimeout(()=>setTargetSearch(target),250);return ()=>clearTimeout(timer);},[target]);
   const [cancelSite, setCancelSite] = useState("*");
   const [cancelKind, setCancelKind] = useState("*");
   const taskQuery = useQuery({
-    queryKey: ["tasks", job.id, filter, job.status,page,target],
-    queryFn: ({ signal }) => api.get<Page<Task>>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=100&paged=true&offset=${(page-1)*100}&q=${encodeURIComponent(target)}`, signal),
+    queryKey: ["tasks", job.id, filter, job.status,page,targetSearch],
+    queryFn: ({ signal }) => api.get<Page<Task>>(`/api/jobs/${job.id}/tasks?status=${filter}&limit=100&paged=true&offset=${(page-1)*100}&q=${encodeURIComponent(targetSearch)}`, signal),
+    enabled:section==="tasks",
     refetchInterval: job.status === "running" ? 3000 : false,
   });
   const tasks = taskQuery.data?.items ?? [];
   const [, stTone] = JOB_STATUS[job.status];
   const total = jobTotal(job);
   const act = (action: string, success: string) =>
-    run(() => api.post(`/api/jobs/${job.id}/${action}`), { success, invalidate: [["jobs"], ["status"], ["tasks", job.id]] });
+    run(() => api.post(`/api/jobs/${job.id}/${action}`), { success, invalidate: [["jobs"], ["status"], ["tasks", job.id],["prefix-progress",job.id],["prefix-summary",job.id]] });
   const active = job.status === "running" || job.status === "paused";
   const pendingGroups = job.pending_groups ?? [];
   const cancelCount = pendingGroups.filter(g => (cancelSite === "*" || g.site === cancelSite) && (cancelKind === "*" || g.kind === cancelKind)).reduce((sum, g) => sum + g.count, 0);
@@ -324,7 +329,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
     if (!await ask(`取消${scope}？`, `预计取消 ${fmtNum(count)} 个当前待处理子任务。已完成结果和文件保留，正在执行的子任务继续完成。取消后仍可查看记录；以后新生成的任务不受影响。`, {confirmText: "确认取消", danger: true})) return;
     const result = await run(() => api.post<{cancelled: number}>(`/api/jobs/${job.id}/tasks/cancel-pending`, body), {
       success: r => r.cancelled ? `已取消 ${fmtNum(r.cancelled)} 个待处理子任务` : "没有可取消的待处理子任务，可能已开始执行或结束",
-      invalidate: [["jobs"], ["status"], ["tasks", job.id]],
+      invalidate: [["jobs"], ["status"], ["tasks", job.id],["prefix-progress",job.id],["prefix-summary",job.id]],
     });
     if (result) {
       setCancelSite("*");
@@ -419,11 +424,17 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
           ]}
         />
 
-        {(job.kind === "crawl" || job.kind === "incremental") && <CrawlResults job={job} />}
-        {job.kind === "prefix_crawl" && <><PrefixProgress job={job} /><CrawlResults job={job} /></>}
-        <JobLogs key={`${job.id}-${logTask}`} job={job} taskId={logTask} onClear={() => setLogTask(null)} />
+        <Segmented value={section} onChange={setSection} options={[
+          ...(job.kind==="prefix_crawl" ? [{value:"progress",label:"前缀进度"}] : []),
+          {value:"tasks",label:"子任务"},
+          ...(["crawl","incremental","prefix_crawl"].includes(job.kind) ? [{value:"results",label:"抓取结果"}] : []),
+          {value:"logs",label:"执行日志"},
+        ]} className="flex-wrap" />
+        {section==="progress" && <PrefixProgress job={job} />}
+        {section==="results" && <CrawlResults job={job} />}
+        {section==="logs" && <JobLogs key={`${job.id}-${logTask}`} job={job} taskId={logTask} onClear={() => setLogTask(null)} />}
 
-        <section>
+        {section==="tasks" && <section>
           <div className="mb-2 flex flex-wrap items-center gap-2">
             <h4 className="text-sm font-semibold">子任务</h4>
             <Segmented size="sm" value={filter} onChange={v=>{setFilter(v);setPage(1);}} options={TASK_FILTERS} className="ml-auto flex-wrap" />
@@ -457,7 +468,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
             <tbody>
               {tasks.map(t => (
                 <tr key={t.id}>
-                  <Td className="align-top text-muted">{t.id}<Button size="sm" variant="ghost" onClick={() => setLogTask(t.id)}>日志</Button></Td>
+                  <Td className="align-top text-muted">{t.id}<Button size="sm" variant="ghost" onClick={() => {setLogTask(t.id);setSection("logs");}}>日志</Button></Td>
                   <Td className="align-top">
                     <div className="text-xs text-muted">
                       {kindName(t.kind)}
@@ -483,7 +494,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
             </tbody>
           </Table>
           <Pager page={page} size={100} total={taskQuery.data?.total ?? 0} onPage={setPage} />
-        </section>
+        </section>}
       </div>
     </>
   );

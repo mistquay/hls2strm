@@ -1,6 +1,7 @@
 """一次性前缀批次：沿用引擎队列、站点限速、文件保护和重试。"""
 
 import logging
+import asyncio
 import time
 
 from .codes import code_key, series_prefix
@@ -13,9 +14,9 @@ log = logging.getLogger(__name__)
 
 async def create(engine, body):
     db = engine.db
-    scope = await db._one("SELECT fingerprint FROM prefix_scopes WHERE id=?", (body["scope_id"],))
+    scope = await db._one("SELECT fingerprint FROM prefix_scopes WHERE id=? AND ready=1", (body["scope_id"],))
     if scope is None:
-        raise ValueError("统计快照已过期，请重新统计")
+        raise ValueError("统计快照尚未完成或已过期，请重新统计")
     prefixes = normalize_prefixes(body["prefixes"])
     sites = sorted(set(body["sites"]))
     for site in sites:
@@ -51,14 +52,17 @@ async def create(engine, body):
                 raise ValueError(f"{SITES[duplicate['site']].label} / {duplicate['prefix']} 已有进行中的任务 #{duplicate['id']}")
         # 初始化期间暂不领取；中断后同一提交标识可以继续补齐计划。
         jid = existing["id"] if existing else await db.create_job("prefix_crawl", f"按前缀抓取：{len(prefixes)} 个前缀 → " + "、".join(SITES[s].label for s in sites), params, status="paused")
-        async with db._tx(invalidate=False) as conn:
-            for site in sites:
-                for prefix in prefixes:
-                    await conn.execute("INSERT OR IGNORE INTO prefix_runs(job_id,site,prefix,source) VALUES(?,?,?,?)",
-                                       (jid, site, prefix, SITES[site].prefix_source(prefix)))
-                    await conn.execute("INSERT OR IGNORE INTO tasks(job_id,kind,target,priority,status,site,updated_at) VALUES(?,'prefix_list',?,10,'pending',?,?)",
-                                       (jid, f"{site}/{prefix}/1", site, int(time.time())))
-            await conn.execute("UPDATE jobs SET status='running' WHERE id=?", (jid,))
+        planned = [(site, prefix, SITES[site].prefix_source(prefix)) for site in sites for prefix in prefixes]
+        for start in range(0, len(planned), 256):
+            batch = planned[start:start + 256]
+            async with db._tx(invalidate=False) as conn:
+                await conn.executemany("INSERT OR IGNORE INTO prefix_runs(job_id,site,prefix,source) VALUES(?,?,?,?)",
+                                       [(jid, site, prefix, source) for site, prefix, source in batch])
+                await conn.executemany("INSERT OR IGNORE INTO tasks(job_id,kind,target,priority,status,site,updated_at) VALUES(?,'prefix_list',?,10,'pending',?,?)",
+                                       [(jid, f"{site}/{prefix}/1", site, int(time.time())) for site, prefix, _ in batch])
+            await asyncio.sleep(0)
+        await db._write("UPDATE jobs SET status='running' WHERE id=? AND status='paused'", (jid,), invalidate=False)
+        db.job_cache.clear()
     engine.notify()
     return jid
 
@@ -177,4 +181,6 @@ async def cancel(engine, job_id, site, prefix):
             await conn.execute("UPDATE tasks SET status='cancelled',last_error='用户取消此站点前缀',updated_at=? WHERE job_id=? AND site=? AND kind IN ('prefix_list','prefix_detail') AND target LIKE ? AND status='pending'",
                                (int(time.time()), job_id, site, f"{site}/{prefix}/%"))
         await engine._maybe_finish_job(job_id, allow_paused=True)
+    engine.db.job_cache.clear()
+    engine.db.stats_cache.clear()
     engine.notify()

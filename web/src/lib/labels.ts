@@ -21,6 +21,7 @@ export const KIND_NAMES: Record<string, string> = {
   tidy: "清理残留",
   crawl: "列表抓取",
   prefix_crawl: "按前缀批量抓取",
+  prefix_stats: "统计影片前缀",
   prefix_list: "前缀列表页",
   prefix_detail: "前缀详情页",
   incremental: "增量",

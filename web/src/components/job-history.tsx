@@ -54,12 +54,16 @@ export function CrawlResults({ job }: { job: Job }) {
 export function JobLogs({ job, taskId, onClear }: { job: Job; taskId: number | null; onClear: () => void }) {
   const [before, setBefore] = useState(0);
   const box = useRef<HTMLElement>(null);
-  const { data, error, isPending } = useQuery({
+  const terminalSince = useRef<number | null>(null);
+  const active = job.status==="running" || job.status==="paused";
+  if (active) terminalSince.current=null;
+  else terminalSince.current ??= Date.now();
+  const { data, error, isPending, refetch } = useQuery({
     queryKey: ["job-logs", job.id, taskId, before],
     queryFn: ({ signal }) => api.get<{ items: (LogItem & { task_id: number })[]; next_before: number | null }>(
       `/api/jobs/${job.id}/logs?before=${before}${taskId ? `&task_id=${taskId}` : ""}`, signal),
-    // 终态之后也刷新当前页，接收结束时的最后一批日志。
-    refetchInterval: before ? false : 3000,
+    // 终态后保留十秒收尾，接收最后一批日志，然后停止轮询。
+    refetchInterval: () => before ? false : active || Date.now()-(terminalSince.current ?? Date.now())<10_000 ? 3000 : false,
   });
   useEffect(() => { if (taskId) box.current?.scrollIntoView({ behavior: "smooth", block: "nearest" }); }, [taskId]);
   return <section ref={box} className="space-y-2">
@@ -67,6 +71,7 @@ export function JobLogs({ job, taskId, onClear }: { job: Job; taskId: number | n
       <h4 className="text-sm font-semibold">执行日志{taskId ? ` · 子任务 #${taskId}` : ""}</h4>
       {taskId && <Button size="sm" onClick={onClear}>全部子任务日志</Button>}
       <div className="ml-auto flex gap-1">
+        <Button size="sm" onClick={()=>refetch()}>刷新日志</Button>
         <Button size="sm" disabled={!data?.next_before} onClick={() => setBefore(data!.next_before!)}>更早日志</Button>
         <Button size="sm" disabled={!before} onClick={() => setBefore(0)}>回到最新</Button>
       </div>

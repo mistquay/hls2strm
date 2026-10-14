@@ -38,6 +38,8 @@ async def cancel_pending(engine, job_id, *, task_ids=None, site=None, kind=None)
             await engine._update_list_completion(job_id)
             await engine._maybe_finish_job(job_id, allow_paused=True)
     if count:
+        engine.db.job_cache.clear()
+        engine.db.stats_cache.clear()
         log.info("任务 #%d：用户取消 %d 个待处理子任务（站点 %s，类型 %s）", job_id, count,
                  site if site is not None else "全部", kind or "全部抓取类型")
         engine.notify()

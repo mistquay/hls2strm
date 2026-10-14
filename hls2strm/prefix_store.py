@@ -1,12 +1,10 @@
 """前缀统计快照、批次计划及幂等抓取结果；不改变影片身份规则。"""
 
-import hashlib
 import re
-import time
-import uuid
 
 from .codes import code_key, edition, is_native, series_prefix
-from .operation_plans import selection_query
+
+TASK_PREFIX = "substr(target,instr(target,'/')+1,instr(substr(target,instr(target,'/')+1),'/')-1)"
 
 
 async def migrate_v25(conn):
@@ -42,37 +40,14 @@ def normalize_prefixes(values):
     return sorted(out)
 
 
-async def snapshot(db, query, ids=None):
-    scope_id = uuid.uuid4().hex
-    condition, params = selection_query({"query": query}).where()
-    if ids is not None and (not ids or any(type(v) is not int or v < 1 for v in ids)):
-        raise ValueError("显式选择必须是非空的影片 ID 列表")
-    async with db._tx(invalidate=False) as conn:
-        # 未被任何任务引用的统计快照保留一天；抓取任务的快照随记录保留。
-        expired = "SELECT id FROM prefix_scopes WHERE created_at<? AND NOT EXISTS(SELECT 1 FROM jobs WHERE json_extract(params,'$.scope_id')=prefix_scopes.id)"
-        await conn.execute(f"DELETE FROM prefix_scope_videos WHERE scope_id IN ({expired})", (int(time.time()) - 86400,))
-        await conn.execute(f"DELETE FROM prefix_scopes WHERE id IN ({expired})", (int(time.time()) - 86400,))
-        await conn.execute("INSERT INTO prefix_scopes(id,created_at) VALUES(?,?)", (scope_id, int(time.time())))
-        sql = "INSERT INTO prefix_scope_videos SELECT ?,id,series_prefix(code_key),code FROM videos WHERE "
-        if ids is None:
-            await conn.execute(sql + condition, (scope_id, *params))
-        else:
-            ids = sorted(set(ids))
-            for offset in range(0, len(ids), 200):
-                chunk = ids[offset:offset + 200]
-                await conn.execute(sql + f"id IN ({','.join('?' for _ in chunk)})", (scope_id, *chunk))
-        fingerprint = hashlib.sha256()
-        async with conn.execute("SELECT video_id FROM prefix_scope_videos WHERE scope_id=? ORDER BY video_id", (scope_id,)) as cursor:
-            while rows := await cursor.fetchmany(2000):
-                for row in rows:
-                    fingerprint.update(str(row[0]).encode() + b",")
-        await conn.execute("UPDATE prefix_scopes SET fingerprint=? WHERE id=?", (fingerprint.hexdigest(), scope_id))
-    return scope_id
+async def snapshot(db, query, ids=None, **options):
+    from .prefix_snapshot import build
+    return await build(db, query, ids, **options)
 
 
 async def statistics(db, scope_id, site):
-    if not await db._one("SELECT 1 FROM prefix_scopes WHERE id=?", (scope_id,)):
-        raise ValueError("统计快照已过期，请重新统计")
+    if not await db._one("SELECT 1 FROM prefix_scopes WHERE id=? AND ready=1", (scope_id,)):
+        raise ValueError("统计快照尚未完成或已过期，请重新统计")
     rows = await db._all(
         """SELECT sv.prefix,COUNT(*) AS total,MIN(sv.code) AS sample,
            SUM(EXISTS(SELECT 1 FROM sources s WHERE s.video_id=sv.video_id AND s.site=? AND s.status='active')) AS covered,
@@ -107,6 +82,21 @@ async def record_skip(db, job_id, site, prefix, page, item, outcome):
                     (job_id, site, item.key, prefix, page, outcome), invalidate=False)
 
 
+def _progress_items(runs, counts, tasks):
+    by_run = {(r["site"], r["prefix"]): dict(r) for r in counts}
+    by_task = {(r["site"], r["prefix"]): dict(r) for r in tasks}
+    items = []
+    for row in runs:
+        key = row["site"], row["prefix"]
+        item = {**dict(row), **by_run.get(key, {}), **by_task.get(key, {})}
+        item["scan_status"] = ("cancelled" if item["cancelled"] or item.get("cancelled_tasks") else
+                               "failed" if item.get("failed") else
+                               "limited" if item["listing_complete"] and item["limited"] else
+                               "complete" if item["listing_complete"] else "scanning")
+        items.append(item)
+    return items
+
+
 async def progress(db, job_id):
     runs = await db._all("SELECT * FROM prefix_runs WHERE job_id=? ORDER BY site,prefix", (job_id,), bulk=True)
     counts = await db._all(
@@ -116,24 +106,60 @@ async def progress(db, job_id):
            SUM(outcome='outside') AS outside,SUM(outcome='removed') AS removed,
            SUM(outcome='excluded') AS excluded
            FROM prefix_hits WHERE job_id=? GROUP BY site,prefix""", (job_id,), bulk=True)
-    by_run = {(r["site"], r["prefix"]): dict(r) for r in counts}
     tasks = await db._all(
         """SELECT site,substr(target,instr(target,'/')+1,instr(substr(target,instr(target,'/')+1),'/')-1) AS prefix,
            SUM(kind='prefix_list' AND status='done') AS pages_done,
            SUM(status='failed' OR status='gone') AS failed,
            SUM(status='pending') AS pending,SUM(status='running') AS running,SUM(status='cancelled') AS cancelled_tasks
            FROM tasks WHERE job_id=? AND kind IN ('prefix_list','prefix_detail') GROUP BY site,prefix""", (job_id,), bulk=True)
-    by_task = {(r["site"], r["prefix"]): dict(r) for r in tasks}
-    items = []
-    for row in runs:
-        item = {**dict(row), **by_run.get((row["site"], row["prefix"]), {}), **by_task.get((row["site"], row["prefix"]), {})}
-        item["scan_status"] = ("cancelled" if item["cancelled"] or item.get("cancelled_tasks") else
-                               "failed" if item.get("failed") else
-                               "limited" if item["listing_complete"] and item["limited"] else
-                               "complete" if item["listing_complete"] else "scanning")
-        items.append(item)
     summary = await db._one(
         """SELECT COUNT(DISTINCT video_id) AS seen,COUNT(DISTINCT CASE WHEN new_video=1 THEN video_id END) AS new,
            COALESCE(SUM(new_source),0) AS sources_added,
            COALESCE(SUM(outcome!='accepted'),0) AS skipped FROM prefix_hits WHERE job_id=?""", (job_id,), bulk=True)
-    return {"items": items, "summary": dict(summary)}
+    return {"items": _progress_items(runs, counts, tasks), "summary": dict(summary)}
+
+
+async def progress_summary(db, job_id):
+    async def load():
+        row = await db._one(
+            """SELECT COUNT(DISTINCT video_id) AS seen,
+               COUNT(DISTINCT CASE WHEN new_video=1 THEN video_id END) AS new,
+               COALESCE(SUM(new_source),0) AS sources_added,
+               COALESCE(SUM(outcome!='accepted'),0) AS skipped FROM prefix_hits WHERE job_id=?""",
+            (job_id,), bulk=True)
+        return dict(row)
+    return await db.job_cache.get(("prefix_summary", job_id), load, 5)
+
+
+async def progress_page(db, job_id, q="", limit=50, offset=0):
+    async def load():
+        search = q.strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        args = (job_id, f"%{search}%", limit, offset)
+        page_sql = "SELECT * FROM prefix_runs WHERE job_id=? AND prefix LIKE ? ESCAPE '\\' ORDER BY site,prefix LIMIT ? OFFSET ?"
+        runs = await db._all(page_sql, args, browse=True)
+        total = (await db._one("SELECT COUNT(*) AS n FROM prefix_runs WHERE job_id=? AND prefix LIKE ? ESCAPE '\\'", args[:2], browse=True))["n"]
+        if not runs:
+            return {"items": [], "total": total}
+        # 每个前缀使用参数精确查找。表达式索引与 TEXT 列关联时可能只用到 job/site，
+        # 参数匹配则能使用完整的 job/site/prefix 索引，工作量只随本页增长。
+        keys = [(row["site"], row["prefix"], job_id, row["site"], row["prefix"]) for row in runs]
+        counts = await db._all(
+            " UNION ALL ".join("""SELECT ? AS site,? AS prefix,COUNT(DISTINCT video_id) AS seen,
+                       COUNT(DISTINCT CASE WHEN new_video=1 THEN video_id END) AS new,
+                       SUM(new_source) AS sources_added,SUM(outcome='mismatch') AS mismatch,
+                       SUM(outcome='outside') AS outside,SUM(outcome='removed') AS removed,
+                       SUM(outcome='excluded') AS excluded
+                FROM prefix_hits WHERE job_id=? AND site=? AND prefix=?""" for _ in runs),
+            [value for key in keys for value in key], browse=True)
+        tasks = await db._all(
+            " UNION ALL ".join(f"""SELECT ? AS site,? AS prefix,
+                       SUM(kind='prefix_list' AND status='done') AS pages_done,
+                       SUM(status='failed' OR status='gone') AS failed,
+                       SUM(status='pending') AS pending,SUM(status='running') AS running,
+                       SUM(status='cancelled') AS cancelled_tasks
+                FROM tasks INDEXED BY tasks_prefix_progress
+                WHERE job_id=? AND site=? AND {TASK_PREFIX}=?
+                  AND kind IN ('prefix_list','prefix_detail')""" for _ in runs),
+            [value for key in keys for value in key], browse=True)
+        return {"items": _progress_items(runs, counts, tasks), "total": total}
+    return await db.job_cache.get(("prefix_page", job_id, q.strip(), limit, offset), load, 3)

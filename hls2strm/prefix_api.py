@@ -2,7 +2,8 @@
 
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Request, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from . import prefix_crawl, prefix_store
@@ -17,6 +18,7 @@ class PrefixStats(BaseModel):
     ids: list[int] | None = None
     scope_id: str | None = None
     site: str = "missav"
+    background: bool = False
 
 
 class PrefixBatch(BaseModel):
@@ -40,10 +42,36 @@ async def stats(body: PrefixStats, request: Request):
     db = request.app.state.ctx.db
     try:
         get_site(body.site)
+        if body.background:
+            result = await execute(request, body.model_dump(), lambda: _create_stats(request, body))
+            return JSONResponse(result, status_code=202)
         scope_id = body.scope_id or await prefix_store.snapshot(db, body.query, body.ids)
         return await prefix_store.statistics(db, scope_id, body.site)
     except ValueError as error:
         raise HTTPException(400, str(error)) from None
+
+
+async def _create_stats(request, body):
+    from .prefix_snapshot import create
+    return {"job_id": await create(request.app.state.ctx.engine, body.model_dump())}
+
+
+async def _prefix_job(request, job_id):
+    db = request.app.state.ctx.db
+    job = await db.get_job(job_id)
+    if not job or job["kind"] != "prefix_crawl":
+        raise HTTPException(404, "前缀批次不存在")
+    return db
+
+
+@router.get("/prefixes/jobs/{job_id}/progress")
+async def progress(job_id: int, request: Request, q: str = "", limit: int = Query(50, ge=1, le=100), offset: int = Query(0, ge=0)):
+    return await prefix_store.progress_page(await _prefix_job(request, job_id), job_id, q, limit, offset)
+
+
+@router.get("/prefixes/jobs/{job_id}/summary")
+async def summary(job_id: int, request: Request):
+    return await prefix_store.progress_summary(await _prefix_job(request, job_id), job_id)
 
 
 @router.post("/prefixes/jobs")

@@ -274,7 +274,8 @@ class Engine:
                        "locate": self.strm.do_locate, "quality": self._do_quality, "prepare": self._do_prepare,
                        "membership": self._do_membership, "tidy": self.strm.do_tidy,
                        "source_remove": self._do_source_remove, "source_restore": self._do_source_restore,
-                       "preview":self.operations.preview,"apply_preview":self.operations.apply,"selection_prepare":self.operations.selected}[task["kind"]]
+                       "preview":self.operations.preview,"apply_preview":self.operations.apply,"selection_prepare":self.operations.selected,
+                       "prefix_stats":self._do_prefix_stats}[task["kind"]]
             result = await handler(job, task)
             await self.db.finish_task(tid, "done", duration_ms=int((time.monotonic() - t0) * 1000), result=result if isinstance(result,dict) else None)
             log.info("子任务 #%d %s %s 完成（%.1fs）", tid, task["kind"], task["target"], time.monotonic() - t0)
@@ -1237,7 +1238,7 @@ class Engine:
         await self.count_missing()
 
     async def checkpoint(self, job_id: int) -> None:
-        job = await self.db.get_job(job_id)
+        job = await self.db._one("SELECT status FROM jobs WHERE id=?", (job_id,))
         if job is None or job["status"] == "cancelled":
             raise TaskStopped("cancelled")
         if self.paused or job["status"] != "running":
@@ -1874,6 +1875,10 @@ class Engine:
 
     # ---- job 控制 ----
 
+    async def _do_prefix_stats(self, job, task):
+        from .prefix_snapshot import run
+        return await run(self, job, task)
+
     async def set_job_status(self, job_id: int, action: str) -> None:
         job = await self.db.get_job(job_id)
         if job is None:
@@ -1884,8 +1889,10 @@ class Engine:
             await self.db.update_job(job_id, status="running")
             await self._update_list_completion(job_id)
         elif action == "cancel" and job["status"] in ("running", "paused"):
-            await self.db.cancel_open_tasks(job_id)
-            await self.db.update_job(job_id, status="cancelled", finished_at=int(time.time()))
+            # 与领取和分批初始化串行，避免取消之后又留下新插入的待处理项。
+            async with self._claim_lock:
+                await self.db.cancel_open_tasks(job_id)
+                await self.db.update_job(job_id, status="cancelled", finished_at=int(time.time()))
         elif action == "retry":
             n = await self.db.retry_failed_tasks(job_id)
             await self.db.update_job(job_id, status="running", finished_at=None)

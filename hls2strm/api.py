@@ -113,9 +113,9 @@ async def status(request: Request):
         "sites": [sf.status() for sf in c.fetcher.sites.values()],
         "solver": c.store.current.solver_url,
         "videos": await c.db.video_stats(),
-        "queue": await c.db.cache.get("queue_stats", c.db.queue_stats, 2),
+        "queue": await c.db.stats_cache.get("queue_stats", c.db.queue_stats, 5),
         "metrics": c.metrics.snapshot(),
-        "failures": await c.db.cache.get("recent_failures", lambda: c.db.recent_failures(8), 2),
+        "failures": await c.db.stats_cache.get("recent_failures", lambda: c.db.recent_failures(8), 5),
         "subscriptions": await c.db.list_subscriptions(),
         "missing": sum(c.engine.missing.values()),
         "output_dir": str(c.store.output_dir),
@@ -288,8 +288,9 @@ async def list_jobs(request: Request, limit: int = 50, offset: int = 0,
                     status: Literal["", "active", "problem", "done"] = "", kind: str = "", q: str = "", paged: bool = False):
     db = _ctx(request).db
     jobs = await db.list_jobs(limit=max(1,min(limit, 200)), offset=max(0,offset), status=status, kind=kind, q=q)
-    counts = await db.history.counts([j["id"] for j in jobs])
-    remaining = await job_views.remaining_tasks(db, jobs)
+    ids = tuple(j["id"] for j in jobs)
+    counts = await db.job_cache.get(("crawl_counts", ids), lambda: db.history.counts(ids), 5)
+    remaining = await job_views.remaining_tasks(db, jobs, cached=True)
     for job in jobs:
         job["crawl"] = counts.get(job["id"])
         await job_views.describe(_ctx(request).engine, job, remaining.get(job["id"], []))
@@ -514,12 +515,12 @@ async def video_detail(slug: str, request: Request):
 
 
 @router.get("/jobs/{job_id}")
-async def job_detail(job_id: int, request: Request):
+async def job_detail(job_id: int, request: Request, summary: bool = False):
     db = _ctx(request).db
     job = await db.get_job(job_id)
     if job is None:
         raise HTTPException(404, "任务不存在")
-    return await job_views.details(_ctx(request).engine,job)
+    return await job_views.details(_ctx(request).engine, job, summary_only=summary)
 
 
 class VideoBatch(BaseModel):

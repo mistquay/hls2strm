@@ -4,7 +4,7 @@
 源的状态：active 可用、gone 下架（站点再列出来就恢复）、removed 用户删掉的（能抓到地址但播不了之类），
 以后列表、详情、补源再抓到也不启用，只能手动恢复。作品删源后没有可用的源时状态是 removed，不进任何输出库；
 别的站点以后抓到新源会回到 active。
-写入、快速读取、批量查询分连接；写操作串行，事务内读取使用原连接。
+写入、播放快速读取、管理交互、后台批量查询分连接；写操作串行，事务内读取使用原连接。
 表结构用 PRAGMA user_version 做版本化迁移，见 MIGRATIONS。
 """
 
@@ -24,13 +24,13 @@ import aiosqlite
 from .codes import Prefixes, code_key, compatible_keys, edition, is_native, legacy_code_key, series_prefix, work_slug
 from .queries import FACET_FIELDS, VIDEO_SORTS, VideoQuery  # API 和旧调用方保持导入兼容
 from .cache import AsyncCache
-from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18, migrate_v19 as _migrate_v19
+from .database_indexes import migrate_v12 as _migrate_v12, migrate_v18 as _migrate_v18, migrate_v19 as _migrate_v19, migrate_v26 as _migrate_v26
 from .job_history import JobHistory, migrate_v13 as _migrate_v13
 from .play_history import migrate_v20 as _migrate_v20
 from .subscription_schedule import migrate_v14 as _migrate_v14, next_run_at
 from .schedule_store import migrate_v21 as _migrate_v21
 from .prefix_store import migrate_v25 as _migrate_v25
-from .runtime import stage
+from .runtime import stage, measured_lock
 from .quality import TRUST, Quality, parse_heights
 from .sites import SourceDetail, SourceItem
 
@@ -377,7 +377,8 @@ async def _migrate_v24(conn: aiosqlite.Connection) -> None:
 
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
-              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21, _migrate_v22, _migrate_v23, _migrate_v24, _migrate_v25]
+              _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21, _migrate_v22, _migrate_v23, _migrate_v24, _migrate_v25,
+              _migrate_v26]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -448,12 +449,16 @@ class Database:
         self.conn: aiosqlite.Connection | None = None
         self.reader: aiosqlite.Connection | None = None
         self.bulk_reader: aiosqlite.Connection | None = None
+        self.browse_reader: aiosqlite.Connection | None = None
         self._transaction_owner = None
         self.cache = AsyncCache()
         self.stats_cache = AsyncCache(16)  # 概览统计：写库时不清，按时间过期（播放时写库很频繁，跟着清就缓存不住）
+        self.job_cache = AsyncCache()
+        self.snapshot_lock = asyncio.Lock()
         self.metrics = None
         self.subscription_schedule_started_at = 0
         self._lock = asyncio.Lock()
+        self._read_locks = {name: asyncio.Lock() for name in ("read", "bulk", "browse")}
         self.prefixes = Prefixes()
 
     async def open(self) -> None:
@@ -466,7 +471,7 @@ class Database:
         await self._migrate()
         for row in await self._all("SELECT DISTINCT code FROM videos WHERE code GLOB '[0-9][0-9][0-9][A-Z]*'"):
             self.prefixes.add(row["code"])
-        for attr in ("reader", "bulk_reader"):
+        for attr in ("reader", "bulk_reader", "browse_reader"):
             conn = await aiosqlite.connect(self.path, isolation_level=None)
             conn.row_factory = aiosqlite.Row
             await conn.create_function("series_prefix", 1, series_prefix, deterministic=True)
@@ -492,7 +497,8 @@ class Database:
     async def close(self) -> None:
         await self.cache.close()
         await self.stats_cache.close()
-        for attr in ("reader", "bulk_reader"):
+        await self.job_cache.close()
+        for attr in ("reader", "bulk_reader", "browse_reader"):
             conn = getattr(self, attr)
             if conn is not None:
                 await conn.close()
@@ -503,8 +509,18 @@ class Database:
 
     # ---- 基础 ----
 
+    @asynccontextmanager
+    async def _write_lock(self):
+        if self.metrics is None:
+            async with self._lock:
+                yield
+        else:
+            async with measured_lock(self.metrics, self._lock, "db.write_wait"):
+                with stage(self.metrics, "db.write"):
+                    yield
+
     async def _write(self, sql: str, params: Iterable[Any] = (), *, invalidate: bool = True) -> aiosqlite.Cursor:
-        async with self._lock:
+        async with self._write_lock():
             result = await self.conn.execute(sql, tuple(params))
             if invalidate and any(name in sql.lower() for name in ("videos", "outputs", "sources")):
                 self.cache.clear()
@@ -513,7 +529,7 @@ class Database:
     @asynccontextmanager
     async def _tx(self, *, invalidate=True):
         """持锁的事务：查找再插入这类需要原子性的写操作用。"""
-        async with self._lock:
+        async with self._write_lock():
             self._transaction_owner = asyncio.current_task()
             try:
                 await self.conn.execute("BEGIN")
@@ -533,7 +549,7 @@ class Database:
                     self.cache.clear()
 
     async def _write_many(self, sql: str, rows: list[tuple]) -> int:
-        async with self._lock:
+        async with self._write_lock():
             try:
                 await self.conn.execute("BEGIN")
                 before = self.conn.total_changes
@@ -547,18 +563,26 @@ class Database:
                     pass
                 raise
 
-    async def _one(self, sql: str, params: Iterable[Any] = (), *, bulk: bool = False) -> aiosqlite.Row | None:
-        rows = await self._all(sql, params, bulk=bulk)
+    async def _one(self, sql: str, params: Iterable[Any] = (), *, bulk: bool = False, browse: bool = False) -> aiosqlite.Row | None:
+        rows = await self._all(sql, params, bulk=bulk, browse=browse)
         return rows[0] if rows else None
 
-    async def _all(self, sql: str, params: Iterable[Any] = (), *, bulk: bool = False) -> list[aiosqlite.Row]:
+    async def _all(self, sql: str, params: Iterable[Any] = (), *, bulk: bool = False, browse: bool = False) -> list[aiosqlite.Row]:
         # 执行和取结果放在同一次线程调用里：分两步的话，中间别的协程在同一连接上改了表（比如 worker 领子任务），
         # 读到一半的 GROUP BY 会把挪了位置的行数两次
-        conn = self.conn if self._transaction_owner is asyncio.current_task() else ((self.bulk_reader if bulk else self.reader) or self.conn)
+        reader = self.browse_reader if browse else self.bulk_reader if bulk else self.reader
+        conn = self.conn if self._transaction_owner is asyncio.current_task() else (reader or self.conn)
+        if conn is self.conn:
+            return list(await conn.execute_fetchall(sql, tuple(params)))
+        kind = "browse" if browse else "bulk" if bulk else "read"
+        lock = self._read_locks[kind]
         if self.metrics is None:
-            return list(await conn.execute_fetchall(sql, tuple(params)))
-        with stage(self.metrics, "db.bulk" if bulk else "db.read"):
-            return list(await conn.execute_fetchall(sql, tuple(params)))
+            async with lock:
+                return list(await conn.execute_fetchall(sql, tuple(params)))
+        with stage(self.metrics, f"db.{kind}"):
+            async with measured_lock(self.metrics, lock, f"db.{kind}_wait"):
+                with stage(self.metrics, f"db.{kind}_execute"):
+                    return list(await conn.execute_fetchall(sql, tuple(params)))
 
     async def _update(self, table: str, row_id: int, fields: dict) -> None:
         if fields:
@@ -1118,9 +1142,9 @@ class Database:
 
     async def search_videos(self, query: VideoQuery, offset: int = 0, limit: int = 50):
         cond, params = query.where()
-        total = (await self._one(f"SELECT COUNT(*) AS n FROM videos WHERE {cond}", params, bulk=True))["n"]
+        total = (await self._one(f"SELECT COUNT(*) AS n FROM videos WHERE {cond}", params, browse=True))["n"]
         rows = await self._all(
-            f"SELECT * FROM videos WHERE {cond} ORDER BY {query.order()} LIMIT ? OFFSET ?", params + [limit, offset], bulk=True
+            f"SELECT * FROM videos WHERE {cond} ORDER BY {query.order()} LIMIT ? OFFSET ?", params + [limit, offset], browse=True
         )
         return [_video_row(r) for r in rows], total
 
@@ -1610,6 +1634,9 @@ class Database:
         if "state" in fields:
             fields["state"] = json.dumps(fields["state"], ensure_ascii=False)
         await self._update("jobs", job_id, fields)
+        if "status" in fields:
+            self.job_cache.clear()
+            self.stats_cache.clear()
 
     JOB_FILTERS = {  # 任务列表的状态筛选
         "active": "status IN ('running', 'paused')",
@@ -1626,10 +1653,11 @@ class Database:
         if jobs:
             ids = [j["id"] for j in jobs]
             marks = ",".join("?" * len(ids))
-            counts = await self._all(
-                f"SELECT job_id, status, COUNT(*) AS n FROM tasks WHERE job_id IN ({marks}) GROUP BY job_id, status",
-                ids, bulk=True,
-            )
+            async def load_counts():
+                return [dict(r) for r in await self._all(
+                    f"SELECT job_id, status, COUNT(*) AS n FROM tasks WHERE job_id IN ({marks}) GROUP BY job_id, status",
+                    ids, bulk=True)]
+            counts = await self.job_cache.get(("job_list_counts", tuple((j["id"],j["status"]) for j in jobs)), load_counts, 5)
             by_job: dict[int, dict] = {i: {} for i in ids}
             for c in counts:
                 by_job[c["job_id"]][c["status"]] = c["n"]

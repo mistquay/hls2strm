@@ -54,7 +54,7 @@ class JobHistory:
         if before:
             where += " AND id<?"
             args.append(before)
-        rows = await self.db._all(f"SELECT * FROM job_logs WHERE {where} ORDER BY id DESC LIMIT ?", (*args, limit + 1))
+        rows = await self.db._all(f"SELECT * FROM job_logs WHERE {where} ORDER BY id DESC LIMIT ?", (*args, limit + 1), browse=True)
         items = [dict(r) for r in rows[:limit]][::-1]
         return {"items": items, "next_before": items[0]["id"] if len(rows) > limit else None}
 
@@ -72,10 +72,10 @@ class JobHistory:
     async def items(self, job_id, status="", limit=50, offset=0):
         condition = {"": "", "new": " AND is_new=1", "existing": " AND is_new=0", "excluded": " AND excluded=1"}[status]
         where = "job_id=?" + condition
-        total = await self.db._one(f"SELECT COUNT(*) AS n FROM crawl_items WHERE {where}", (job_id,), bulk=True)
+        total = await self.db._one(f"SELECT COUNT(*) AS n FROM crawl_items WHERE {where}", (job_id,), browse=True)
         rows = await self.db._all(
             f"SELECT * FROM crawl_items WHERE {where} ORDER BY page,video_id LIMIT ? OFFSET ?",
-            (job_id, limit, offset), bulk=True,
+            (job_id, limit, offset), browse=True,
         )
         return {"items": [dict(r) for r in rows], "total": total["n"]}
 
