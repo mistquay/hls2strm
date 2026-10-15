@@ -12,6 +12,7 @@ from .codes import code_key, edition
 from .maintenance_files import walk, area_size
 from .trash import TRASH_DIR
 from .storage import safe_directory, next_batch
+from .maintenance_progress import ScanProgress
 
 
 def source_metadata(video):
@@ -106,32 +107,37 @@ async def save_asset(db, scan_id, library_id, root, data, metadata, effective, n
     return counts
 
 
-async def scan(manager, job, task):
+async def scan(manager, job, task, *, progress=None):
     e, db = manager.e, manager.db
+    progress = progress or ScanProgress(e, job["id"])
+    base_counts = progress.counts.copy()
     generation = job.get("_generation", job["id"])
     lid = int(task["target"])
     lib = e._library(lid)
-    keys, cdn = dict((slug, vid) for vid, slug in await db.video_keys()), await db.cdn_video_map()
+    keys = dict((slug, vid) for vid, slug in await progress.wait(db.video_keys()))
+    cdn = await progress.wait(db.cdn_video_map())
     total = Counter()
     for root in manager.roots(lib):
         await e.checkpoint(job["id"])
+        await progress.phase("walking", root=str(root))
         previous_root = await db._one("SELECT * FROM maintenance_roots WHERE library_id=? AND root=?", (lid, str(root)))
         stats, found, has_strm = Counter(), set(), False
         try:
             root_id = await asyncio.to_thread(safe_directory, root)
             await db._write("DELETE FROM asset_facets WHERE asset_id IN (SELECT id FROM library_assets WHERE scan_id=? AND library_id=? AND root=?)", (generation, lid, str(root)))
             await db._write("DELETE FROM library_assets WHERE scan_id=? AND library_id=? AND root=?", (generation, lid, str(root)))
-            iterator = walk(root, keys, cdn)
+            iterator = walk(root, keys, cdn, visiting=progress.visiting)
             try:
-                while rows := await next_batch(iterator):
+                while rows := await progress.wait(next_batch(iterator)):
                     await e.checkpoint(job["id"])
                     for data in rows:
                         await e.checkpoint(job["id"])
                         data["root_identity"] = root_id
                         vid = data["video_id"]
                         video = await db.get_video_by_id(vid) if vid else None
-                        old = await db._one("SELECT * FROM library_assets WHERE library_id=? AND root=? AND path=? AND scan_id!=? ORDER BY id DESC LIMIT 1",
-                                            (lid, str(root), data["path"], generation))
+                        # 直接命中唯一索引；只复用已发布基线，不在大库中逐项倒查所有扫描代。
+                        old = await db._one("SELECT * FROM library_assets WHERE scan_id=? AND library_id=? AND root=? AND path=?",
+                                            (previous_root["scan_id"], lid, str(root), data["path"])) if previous_root and previous_root["scan_id"] is not None else None
                         old = decode_asset(old) if old else None
                         if old and old["data"].get("manual_binding") and not vid and data["status"] == "unmanaged":
                             vid = old["video_id"]
@@ -145,26 +151,36 @@ async def scan(manager, job, task):
                         stats["assets"] += 1
                         stats["files"] += len(data["files"])
                         stats["nfo_" + status] += 1
+                        progress.counts = base_counts + total + stats
+                        progress.visiting(root / data["path"])
+                        await progress.publish()
                         if vid and data["strms"]:
                             found.add(vid)
                         has_strm = has_strm or bool(data["strms"])
-                    await db.update_job(job["id"], state={**dict(total + stats), "root": str(root)})
+                    await progress.publish()
             finally:
                 iterator.close()
             if root_id != await asyncio.to_thread(safe_directory, root):
                 raise ValueError("扫描期间根目录身份改变")
             try:
-                stats["trash_bytes"] = await asyncio.to_thread(area_size, root / TRASH_DIR)
+                await progress.phase("trash", root=str(root))
+                stats["trash_bytes"] = await progress.wait(asyncio.to_thread(area_size, root / TRASH_DIR, progress.visiting))
             except (OSError, ValueError):
                 stats["trash_unavailable"] = 1
             # 只由保存过输出路径的记录生成缺失项，待归库不参与。
+            await progress.phase("reconciling", root=str(root))
             async for video, out in db.iter_outputs(lid):
+                stats["outputs_checked"] += 1
+                if stats["outputs_checked"] % 100 == 0:
+                    await e.checkpoint(job["id"])
+                    progress.counts = base_counts + total + stats
+                    await progress.publish()
                 if not out["strm_path"] or video["id"] in found:
                     continue
                 path = Path(out["strm_path"])
                 if not path.is_relative_to(root):
                     continue
-                missing_status = "conflict" if path.exists() else "missing"
+                missing_status = "conflict" if await asyncio.to_thread(path.exists) else "missing"
                 data = {"path": str(path.parent.relative_to(root)), "video_id": video["id"], "status": missing_status,
                         "files": [], "folders": [], "strms": [], "recorded_path": str(path), "root_identity": root_id}
                 existing = await db._one("SELECT * FROM library_assets WHERE scan_id=? AND library_id=? AND root=? AND path=?",
@@ -181,6 +197,8 @@ async def scan(manager, job, task):
                     await save_asset(db, generation, lid, root, data, {}, source_metadata(video), "missing")
                 stats["missing"] += 1
             baseline = bool(has_strm or previous_root and previous_root["baseline"] and json.loads(previous_root["identity"]) == root_id)
+            progress.counts = base_counts + total + stats
+            await progress.phase("publishing", root=str(root))
             await db._write("""INSERT INTO maintenance_roots(library_id,root,scan_id,identity,health,error,checked_at,stats,baseline)
                 VALUES(?,?,?,?,?,'',?,?,?) ON CONFLICT(library_id,root) DO UPDATE SET scan_id=excluded.scan_id,
                 identity=excluded.identity,health=excluded.health,error='',checked_at=excluded.checked_at,stats=excluded.stats,baseline=excluded.baseline""",
@@ -196,10 +214,12 @@ async def scan(manager, job, task):
             await db.set_output_paths(lid, updates)
         except (OSError, ValueError) as error:
             stats["failed_roots"] += 1
+            progress.state.setdefault("root_errors", []).append({"root": str(root), "error": str(error)})
             await db._write("""INSERT INTO maintenance_roots(library_id,root,health,error,checked_at) VALUES(?,?,'unavailable',?,?)
                 ON CONFLICT(library_id,root) DO UPDATE SET health='unavailable',error=excluded.error,checked_at=excluded.checked_at""",
                 (lid, str(root), str(error), int(time.time())))
         total.update(stats)
+        progress.counts = base_counts + total
+        await progress.publish(force=True)
     e.strm._index.pop(lid, None)
-    await db.update_job(job["id"], state=dict(total))
     return total

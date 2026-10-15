@@ -102,10 +102,10 @@ def test_nfo_failure_keeps_snapshot_and_failed_scan_keeps_baseline(make_store, b
             assert assets['items'][0]['details']['historical_metadata']['title'] == '本地标题'
             assert (await list_assets(db, AssetFilter(library_ids=[lid], categories=['类型A'])))['total'] == 0
             original = maintenance_scan.walk
-            def fail(root, *args):
+            def fail(root, *args, **kwargs):
                 if root == directory.parents[1]:
                     raise PermissionError('scan unavailable')
-                return original(root, *args)
+                return original(root, *args, **kwargs)
             monkeypatch.setattr(maintenance_scan, 'walk', fail)
             job = await run_handler(e, 'maintenance_scan', {'library_ids': [lid]})
             assert job['state']['failed_roots'] == 1

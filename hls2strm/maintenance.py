@@ -11,6 +11,7 @@ import time
 from . import maintenance_execute as execute, maintenance_plan as plans, maintenance_scan as scanner
 from .maintenance_files import entries, validate, walk
 from .maintenance_query import AssetFilter, list_assets
+from .maintenance_progress import ScanProgress
 from .storage import safe_directory, next_batch
 
 
@@ -18,9 +19,11 @@ class Maintenance:
     def __init__(self, engine):
         self.e, self.db = engine, engine.db
         self.scan_lock = asyncio.Lock()
+        self.scan_create_lock = asyncio.Lock()
 
     def roots(self, lib):
-        return list(dict.fromkeys(p.absolute() for p in (self.e.writer.library_root(lib), self.e.writer.external_root(lib)) if p))
+        # 输出目录是整理前的收件目录，MDCNG 的最终目录才是维护对象。
+        return [(self.e.writer.external_root(lib) or self.e.writer.library_root(lib)).absolute()]
 
     def configuration(self):
         return [{"id": lib["id"], "roots": [str(r) for r in self.roots(lib)],
@@ -39,35 +42,54 @@ class Maintenance:
             params["library_ids"] = sorted(set(params.get("library_ids") or self.e.libs))
             for lid in params["library_ids"]:
                 self.e._library(lid)
+            async with self.scan_create_lock:
+                active = await self.db._one("SELECT id,params FROM jobs WHERE kind='maintenance_scan' AND status IN ('running','paused') ORDER BY id LIMIT 1")
+                if active:
+                    previous = json.loads(active["params"])
+                    if (previous.get("library_ids") == params["library_ids"]
+                            and (previous.get("force", False) or not params.get("force", False))):
+                        return active["id"]
+                    raise ValueError(f"扫描任务 #{active['id']} 尚未结束，请先完成或取消，再扫描其他范围")
+                job = await self.db.create_job(kind, names[kind], params)
+                await self.db.update_job(job, state={"scan_phase": "queued", "updated_at": int(time.time())})
+                await self.db.add_tasks(job, kind, ["all"], 20)
+                self.e.notify()
+                return job
         job = await self.db.create_job(kind, names[kind], params)
         await self.db.add_tasks(job, kind, ["all"], 20)
         self.e.notify()
         return job
 
     async def scan(self, job, task):
-        async with self.scan_lock:
-            total = Counter()
-            job = {**job, "_generation": -(time.time_ns() // 1000)}
-            for lid in job["params"]["library_ids"]:
-                total.update(await scanner.scan(self, job, {"target": str(lid)}))
-                # 收件目录先扫、整理目录后扫：后者找到的新位置不能留下前者的假缺失。
-                for a in await self.db._all("""SELECT a.* FROM library_assets a JOIN maintenance_roots r
-                    ON r.library_id=a.library_id AND r.root=a.root AND r.scan_id=a.scan_id
-                    WHERE a.library_id=? AND a.status='missing'""", (lid,)):
-                    data = json.loads(a["data"])
-                    out = await self.db.get_output(a["video_id"], lid)
-                    if out and out["strm_path"] != data.get("recorded_path") and Path(out["strm_path"]).is_file():
-                        if data["files"]:
-                            await self.db._write("UPDATE library_assets SET status='unmanaged',video_id=NULL WHERE id=?", (a["id"],))
-                        else:
-                            await self.db._write("DELETE FROM library_assets WHERE id=?", (a["id"],))
-            from .maintenance_files import area_size
+        progress = ScanProgress(self.e, job["id"])
+        await progress.phase("waiting_lock" if self.scan_lock.locked() else "preparing")
+        # 兼容升级前已排队的重复扫描；等待期间也响应暂停/取消。
+        while True:
+            await self.e.checkpoint(job["id"])
             try:
-                total["archive_bytes"] = await asyncio.to_thread(area_size, self.e.store.archive_dir)
+                await asyncio.wait_for(self.scan_lock.acquire(), timeout=1)
+                break
+            except asyncio.TimeoutError:
+                await progress.publish()
+        try:
+            job = {**job, "_generation": -(time.time_ns() // 1000)}
+            await self.refresh_roots()
+            lids = job["params"]["library_ids"]
+            for index, lid in enumerate(lids, 1):
+                await progress.phase("preparing", library_id=lid, library_name=self.e._library(lid)["name"],
+                                     library_index=index, library_total=len(lids), root="")
+                await scanner.scan(self, job, {"target": str(lid)}, progress=progress)
+            from .maintenance_files import area_size
+            await progress.phase("archive", root=str(self.e.store.archive_dir))
+            try:
+                progress.counts["archive_bytes"] = await progress.wait(asyncio.to_thread(area_size, self.e.store.archive_dir, progress.visiting))
             except (OSError, ValueError):
-                total["archive_unavailable"] = 1
-            await self.db.update_job(job["id"], state={**dict(total), "partial_failure": bool(total["failed_roots"])})
+                progress.counts["archive_unavailable"] = 1
+            await progress.phase("pruning", root="")
             await self.prune_snapshots()
+            await progress.phase("done", partial_failure=bool(progress.counts["failed_roots"]))
+        finally:
+            self.scan_lock.release()
 
     async def prune_snapshots(self):
         # 文件预览已完整复制资产证据，不依赖旧资产行；只保留每个根的成功基线。
@@ -103,10 +125,7 @@ class Maintenance:
                 if row["health"] == "empty" and not (allow_empty and row["baseline"]):
                     prefix = str(root).rstrip("/\\") + os.sep
                     previously_written = bool(await self.db._one("SELECT 1 FROM outputs WHERE library_id=? AND lower(substr(strm_path,1,?))=lower(?) LIMIT 1", (lid, len(prefix), prefix)))
-                    # 空的收件目录允许存在：外部整理目录有完整成功扫描时仍能验证全库位置。
-                    ext = self.e.writer.external_root(lib)
-                    other = await self.db._one("SELECT health FROM maintenance_roots WHERE library_id=? AND root=?", (lid, str(ext.absolute()))) if ext and root != ext.absolute() else None
-                    if previously_written and (not other or other["health"] != "ok"):
+                    if previously_written:
                         raise ValueError(f"目录为空，需要已有基线及单独确认整库清空：{root}")
                 if await asyncio.to_thread(safe_directory, root) != json.loads(row["identity"]):
                     raise ValueError(f"根目录身份改变，请检查挂载：{root}")
@@ -128,7 +147,10 @@ class Maintenance:
         for lid in library_ids:
             paths = {}
             try:
-                for root in self.roots(self.e._library(lid)):
+                lib = self.e._library(lid)
+                # 整片退库前仍核对收件区是否有副本；它不进入维护索引或清理清单。
+                roots = dict.fromkeys([*self.roots(lib), self.e.writer.library_root(lib).absolute()])
+                for root in roots:
                     await asyncio.to_thread(safe_directory, root)
                     iterator = walk(root, keys, cdn)
                     try:
@@ -140,7 +162,7 @@ class Maintenance:
                         iterator.close()
                 for row in await self.db._all("""SELECT a.* FROM library_assets a JOIN maintenance_roots r
                     ON r.library_id=a.library_id AND r.root=a.root AND r.scan_id=a.scan_id
-                    WHERE a.library_id=? AND json_extract(a.data,'$.manual_binding')=1 AND a.status='present'""", (lid,)):
+                    WHERE a.library_id=? AND r.health!='retired' AND json_extract(a.data,'$.manual_binding')=1 AND a.status='present'""", (lid,)):
                     a = scanner.decode_asset(row)
                     for f in a["data"]["strms"]:
                         path = Path(a["root"]) / a["path"] / f["path"]

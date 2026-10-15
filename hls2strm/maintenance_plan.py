@@ -89,7 +89,7 @@ async def _preview(manager, job, task, reader):
                     if request.scope == "library":
                         cond += " AND a.library_id=?"
                         params.append(asset["library_id"])
-                    assets = [decode_asset(r) for r in await db._all(f"SELECT a.* FROM {FROM} WHERE a.scan_id=r.scan_id AND {cond}", params)]
+                    assets = [decode_asset(r) for r in await db._all(f"SELECT a.* FROM {FROM} WHERE a.scan_id=r.scan_id AND r.health!='retired' AND {cond}", params)]
                     expected_libs = list(e.libs) if request.scope == "global" else [asset["library_id"]]
                     root_key = tuple(sorted(expected_libs))
                     if root_key not in checked_roots:

@@ -37,11 +37,13 @@ def fail(error):
     raise error
 
 
-def area_size(root):
+def area_size(root, visiting=None):
     if not root.exists():
         return 0
     total = 0
     for base, dirs, files in os.walk(root, followlinks=False, onerror=fail):
+        if visiting:
+            visiting(base)
         safe_directory(Path(base))
         dirs[:] = [name for name in dirs if not _is_link((Path(base) / name).lstat())]
         for name in files:
@@ -51,7 +53,7 @@ def area_size(root):
     return total
 
 
-def entries(directory, recursive=True):
+def entries(directory, recursive=True, visiting=None):
     result, folders = [], []
     for base, dirs, files in os.walk(directory, followlinks=False, onerror=fail):
         current = Path(base)
@@ -64,6 +66,8 @@ def entries(directory, recursive=True):
                 result.append({"path": str(p.relative_to(directory)), "kind": "protected", "size": 0})
         for name in files:
             p = current / name
+            if visiting:
+                visiting(p)
             st = p.lstat()
             protected = _is_link(st) or not stat.S_ISREG(st.st_mode)
             result.append({"path": str(p.relative_to(directory)), "kind": "protected" if protected else kind(p.relative_to(directory)),
@@ -77,9 +81,11 @@ def entries(directory, recursive=True):
     return result, folders
 
 
-def walk(root, keys, cdn):
+def walk(root, keys, cdn, visiting=None):
     for base, dirs, files in os.walk(root, followlinks=False, onerror=fail):
         directory = Path(base)
+        if visiting:
+            visiting(directory)
         safe_directory(directory)
         for name in dirs[:]:
             if name == TRASH_DIR or _is_link((directory / name).lstat()):
@@ -87,7 +93,7 @@ def walk(root, keys, cdn):
         if not files:
             continue
         movie = any(Path(n).suffix.lower() in (".strm", ".nfo") for n in files)
-        listing, folders = entries(directory, recursive=movie)
+        listing, folders = entries(directory, recursive=movie, visiting=visiting)
         if movie:
             dirs[:] = []
         vids, unknown, strms = set(), [], []

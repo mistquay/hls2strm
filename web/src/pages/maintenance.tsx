@@ -2,8 +2,9 @@ import { MaintenanceFilters } from "@/components/maintenance-filters";
 import { MaintenanceOptions } from "@/components/maintenance-options";
 import { MaintenanceAssets } from "@/components/maintenance-assets";
 import { MaintenanceSpace, type Root } from "@/components/maintenance-space";
+import { MaintenanceScan } from "@/components/maintenance-scan";
 import { maintenanceStatus } from "@/lib/maintenance";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { fmtTime } from "@/lib/format";
@@ -37,6 +38,7 @@ interface Exclusion {
 export default function Maintenance() {
   const route = useRoute();
   const run = useRun();
+  const queryClient = useQueryClient();
   const { data: libs = [] } = useLibraries(true);
   const [view, setView] = useState("assets");
   const [query, setQuery] = useState<AssetFilter>(() => {
@@ -67,6 +69,7 @@ export default function Maintenance() {
   const [excluded, setExcluded] = useState<Set<number>>(new Set());
   const [jobId, setJobId] = useState<number>();
   const [busy, setBusy] = useState(false);
+  const [scanSubmitting, setScanSubmitting] = useState(false);
   const [binding, setBinding] = useState<Asset>();
   const [cleanup, setCleanup] = useState<Omit<CleanupConfig, "query">>({
     action: "resources",
@@ -114,6 +117,14 @@ export default function Maintenance() {
       }>(`/api/maintenance/assets/query?offset=${page * 50}`, query),
     enabled: view !== "history" && view !== "space",
   });
+  const completedScan = overview.data?.jobs.find((job) => job.kind === "maintenance_scan" && job.status === "done")?.id;
+  useEffect(() => {
+    if (!completedScan) return;
+    void queryClient.invalidateQueries({ queryKey: ["maintenance-assets"] });
+    setSelection(new Set());
+    setAll(false);
+    setExcluded(new Set());
+  }, [completedScan, queryClient]);
   const bans = useQuery({
     queryKey: ["maintenance-exclusions", page],
     queryFn: () =>
@@ -144,14 +155,15 @@ export default function Maintenance() {
     ],
   };
   const scan = async (force = false) => {
-    await run(
+    setScanSubmitting(true);
+    try { await run(
       () =>
         api.post<{ job_id: number }>("/api/maintenance/scan", {
           library_ids: query.library_ids,
           force,
         }),
-      { success: (r) => `扫描任务 #${r.job_id} 已入队`, ...refresh },
-    );
+      { success: (r) => `扫描任务 #${r.job_id} 已提交（相同范围的已有任务会复用）`, ...refresh },
+    ); } finally { setScanSubmitting(false); }
   };
   const preview = async () => {
     if (!all && !selection.size) return;
@@ -196,6 +208,7 @@ export default function Maintenance() {
   const selectedCount = all
     ? Math.max(0, (assets.data?.total || 0) - excluded.size)
     : selection.size;
+  const activeScan = overview.data?.jobs.some((j) => j.kind === "maintenance_scan" && ["running", "paused"].includes(j.status));
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -226,8 +239,8 @@ export default function Maintenance() {
         title="维护范围"
         actions={
           <>
-            <Button onClick={() => scan()}>扫描磁盘与 NFO</Button>
-            <Button onClick={() => scan(true)}>强制重读 NFO</Button>
+            <Button disabled={scanSubmitting || activeScan} onClick={() => scan()}>扫描磁盘与 NFO</Button>
+            <Button disabled={scanSubmitting || activeScan} onClick={() => scan(true)}>强制重读 NFO</Button>
             <Button onClick={() => run(async () => {}, refresh)}>
               刷新结果
             </Button>
@@ -255,14 +268,15 @@ export default function Maintenance() {
           {query.library_ids?.length
             ? `已选择 ${query.library_ids.length} 个库`
             : "未限定库：扫描和筛选全部配置库"}
-          。NFO
-          读取不改写文件；源站资料与本地资料分别保留。扫描完成后点击“刷新结果”。
+          。已配置外部整理目录时只扫描外部整理目录，未配置才扫描输出目录。NFO
+          读取不改写文件；源站资料与本地资料分别保留。扫描完成后自动刷新结果。
         </p>
-        {overview.data?.jobs.some(
-          (j) => j.kind === "maintenance_scan" && j.status === "running",
-        ) && (
-          <p className="pb-3 text-accent">扫描进行中；任务页可暂停或取消。</p>
-        )}
+        <div className="space-y-1 pb-3 text-xs text-muted">
+          {libs.filter((lib) => !query.library_ids?.length || query.library_ids.includes(lib.id)).map((lib) => (
+            <p key={lib.id} className="break-all">{lib.name} · {lib.external_root ? "外部整理目录" : "输出目录"}：{lib.external_root || lib.root}</p>
+          ))}
+        </div>
+        <MaintenanceScan jobs={overview.data?.jobs || []} />
       </Panel>
       {(overview.error || assets.error || bans.error) && (
         <p className="text-err">

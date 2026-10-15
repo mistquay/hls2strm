@@ -15,6 +15,18 @@ export const maintenanceStatus: Record<string, string> = {
   restoring: "恢复中",
   expired: "回收已过期",
 };
+export const scanPhases: Record<string, string> = {
+  queued: "等待调度",
+  waiting_lock: "等待前一个扫描结束",
+  preparing: "准备影片索引",
+  walking: "扫描文件与 NFO",
+  trash: "统计回收区",
+  reconciling: "核对磁盘与数据库记录",
+  publishing: "发布扫描结果",
+  archive: "统计归档空间",
+  pruning: "清理旧索引",
+  done: "扫描结束",
+};
 export interface LocalMetadata {
   title?: string;
   code?: string;
@@ -104,8 +116,20 @@ export interface MaintenanceJob {
   status: string;
   created_at: number;
   finished_at?: number;
-  params: { request?: CleanupConfig; preview_id?: number; restore_of?: number };
+  params: { request?: CleanupConfig; preview_id?: number; restore_of?: number; library_ids?: number[]; force?: boolean };
   state: {
+    scan_phase?: string;
+    root?: string;
+    current_path?: string;
+    library_name?: string;
+    library_index?: number;
+    library_total?: number;
+    assets?: number;
+    extra_bytes?: number;
+    outputs_checked?: number;
+    elapsed_seconds?: number;
+    updated_at?: number;
+    root_errors?: { root: string; error: string }[];
     ready?: boolean;
     preview_token?: string;
     apply_job_id?: number;

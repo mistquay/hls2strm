@@ -95,6 +95,20 @@ async def describe(engine, job, remaining=None):
             elif list_complete:
                 job["phase_detail"] += "后续处理："
             job["phase_detail"] += remaining_text(engine, remaining)
+    if job["kind"] == "maintenance_scan":
+        state = job["state"]
+        phases = {"queued": "等待调度", "waiting_lock": "等待前一个扫描结束", "preparing": "准备影片索引",
+                  "walking": "扫描文件与 NFO", "trash": "统计回收区", "reconciling": "核对磁盘与数据库记录",
+                  "publishing": "发布扫描结果", "archive": "统计归档空间", "pruning": "清理旧索引", "done": "扫描结束"}
+        phase = state.get("scan_phase")
+        if phase in phases:
+            if job["status"] == "running" and not engine.paused and phase in ("queued", "waiting_lock"):
+                job["phase"] = "queued"
+            prefix = "任务已暂停；" if job["status"] == "paused" or engine.paused else ""
+            job["phase_detail"] = (f"{prefix}{phases[phase]}；已扫描 {state.get('assets', 0)} 个目录、"
+                                   f"{state.get('files', 0)} 个文件；已核对 {state.get('outputs_checked', 0)} 条记录")
+            if state.get("root"):
+                job["phase_detail"] += f"；目录：{state['root']}"
     if job["state"].get("child_job_id"):
         child = await engine.db.get_job(job["state"]["child_job_id"])
         if child:

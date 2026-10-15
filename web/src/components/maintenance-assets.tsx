@@ -60,7 +60,13 @@ export function MaintenanceAssets({
         {fmtBytes(assets.data?.bytes || 0)}，额外剧照{" "}
         {fmtBytes(assets.data?.extra_bytes || 0)}。修改筛选后重新选择。
       </p>
-      <Table>
+      <Table className="min-w-[56rem] table-fixed">
+        <colgroup>
+          <col className="w-24" />
+          <col />
+          <col className="w-[30%]" />
+          <col className="w-44" />
+        </colgroup>
         <thead>
           <tr>
             <Th>
@@ -85,12 +91,12 @@ export function MaintenanceAssets({
         <tbody>
           {assets.data?.items.map((a) => (
             <tr key={a.id}>
-              <Td>
+              <Td className="align-top">
                 <Check checked={chosen(a.id)} onChange={() => toggle(a.id)}>
                   {a.id}
                 </Check>
               </Td>
-              <Td>
+              <Td className="align-top [overflow-wrap:anywhere]">
                 <b>{a.code || "未关联"}</b>
                 {!a.video_id && a.nfo_status === "valid" && (
                   <Button size="sm" onClick={() => setBinding(a)}>
@@ -127,10 +133,12 @@ export function MaintenanceAssets({
                   </p>
                 </details>
               </Td>
-              <Td>
-                <p className="max-w-lg break-all text-xs">
-                  {libs.find((l) => l.id === a.library_id)?.name} · {a.root}/
-                  {a.path}
+              <Td className="align-top">
+                <p className="mb-1 font-medium">
+                  {libs.find((l) => l.id === a.library_id)?.name}
+                </p>
+                <p className="text-xs leading-relaxed [overflow-wrap:anywhere]">
+                  {a.root}/{a.path}
                 </p>
                 <div className="mt-1 flex flex-wrap gap-2">
                   <Chip>{assetStates[a.status]}</Chip>
@@ -140,11 +148,12 @@ export function MaintenanceAssets({
                   )}
                 </div>
               </Td>
-              <Td>
-                {fmtBytes(a.bytes)}
-                <p className="text-xs">
-                  额外剧照 {fmtBytes(a.extra_bytes)} / {a.extra_count} 张
+              <Td className="align-top tabular-nums">
+                <p className="whitespace-nowrap font-medium">{fmtBytes(a.bytes)}</p>
+                <p className="mt-1 whitespace-nowrap text-xs">
+                  额外剧照 {fmtBytes(a.extra_bytes)}
                 </p>
+                <p className="whitespace-nowrap text-xs text-muted">{fmtNum(a.extra_count)} 张</p>
               </Td>
             </tr>
           ))}
