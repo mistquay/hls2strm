@@ -1,3 +1,5 @@
+import { LocalMetadataPanel } from "./local-metadata";
+import { navigate } from "@/lib/route";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { ExternalLink, Play, RefreshCw, Search, X } from "lucide-react";
 import { useEffect, useState } from "react";
@@ -89,6 +91,7 @@ function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }
         {v.status === "removed" && <Chip tone="err">已删源</Chip>}
         {!!v.uncensored && <Chip tone="info">无码流出</Chip>}
         <div className="ml-auto flex items-center gap-1.5">
+          <Button size="sm" onClick={()=>{closeDetail();navigate("maintenance",{ids:String(v.id)});}}>维护</Button>
           <Button size="sm" variant="primary" onClick={() => playVideo(v)}>
             <Play />
             试播
@@ -106,6 +109,7 @@ function Detail({ v: initial, probe }: { v: Video; probe: ProbeResult[] | null }
           </SheetClose>
         </div>
       </header>
+      <div className="px-5 py-3"><LocalMetadataPanel videoId={v.id}/></div>
 
       <div className="scroll-thin min-h-0 flex-1 space-y-6 overflow-y-auto px-5 py-4">
         {!!v.siblings?.length && <div className="flex flex-wrap items-center gap-2 text-sm">其他版本：{v.siblings.map(other=><Button key={other.slug} size="sm" onClick={()=>run(async()=>{openDetail(await api.get<Video>(`/api/videos/${other.slug}`));})}>{other.slug} · {other.uncensored ? "-U 版" : "普通版"} · {other.status==="active" ? "可用" : other.status==="removed" ? "已删源" : "已下架"}</Button>)}</div>}

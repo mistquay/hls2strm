@@ -73,6 +73,9 @@ class VideoQuery:
             where.append("status='removed'")
         elif self.status == "active":
             where.append("status='active'")
+            where.append("NOT EXISTS (SELECT 1 FROM collection_exclusions e WHERE e.video_id=videos.id AND e.library_id=0)")
+        elif self.status == "excluded":
+            where.append("EXISTS (SELECT 1 FROM collection_exclusions e WHERE e.video_id=videos.id)")
         active = "s.video_id=videos.id AND s.status='active'"
         if self.has_site:
             where.append(f"EXISTS (SELECT 1 FROM sources s WHERE {active} AND s.site IN ({marks(self.has_site)}))")

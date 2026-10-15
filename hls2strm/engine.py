@@ -103,6 +103,10 @@ class Engine:
         self._claim_lock = asyncio.Lock()
         self.libs: dict[int, dict] = {}
         self.strm = StrmManager(self)
+        from .storage import Storage
+        self.storage = Storage(self, boot.data_dir)
+        from .maintenance import Maintenance
+        self.maintenance = Maintenance(self)
         self._workers: list[asyncio.Task] = []
         self._scheduler: asyncio.Task | None = None
         self._subscription_schedule_started_at = time.time()
@@ -273,6 +277,10 @@ class Engine:
                        "prefix": self.strm.do_prefix, "revert": self.strm.do_revert,
                        "locate": self.strm.do_locate, "quality": self._do_quality, "prepare": self._do_prepare,
                        "membership": self._do_membership, "tidy": self.strm.do_tidy,
+                       "storage_scan": self.storage.scan, "storage_clean": self.storage.clean,
+                       "maintenance_scan": self.maintenance.scan, "maintenance_preview": self.maintenance.preview,
+                       "maintenance_apply": self.maintenance.apply, "maintenance_restore_preview": self.maintenance.restore_preview,
+                       "maintenance_restore": self.maintenance.restore,
                        "source_remove": self._do_source_remove, "source_restore": self._do_source_restore,
                        "preview":self.operations.preview,"apply_preview":self.operations.apply,"selection_prepare":self.operations.selected,
                        "prefix_stats":self._do_prefix_stats}[task["kind"]]
@@ -377,7 +385,8 @@ class Engine:
         counts = await self.db.task_counts(job_id)
         finished = int(time.time())
         state = job["state"]
-        if counts.get("failed") or counts.get("cancelled"):
+        if (counts.get("failed") or counts.get("cancelled") or (job["kind"] == "storage_clean" and state.get("failed"))
+                or (job["kind"].startswith("maintenance_") and (state.get("failed") or state.get("failed_roots")))):
             state["partial_failure"] = True
         else:
             state.pop("partial_failure", None)
@@ -422,6 +431,7 @@ class Engine:
 
     async def reload_libraries(self) -> None:
         self.libs = {lib["id"]: lib for lib in await self.db.list_libraries()}
+        await self.maintenance.refresh_roots()
 
     def keep_dirs(self) -> frozenset[Path]:
         roots = [self.writer.library_root(lib) for lib in self.libs.values()]
@@ -447,7 +457,7 @@ class Engine:
         """写一部影片在某个库里的输出。versions：要不要对齐多画质版本文件，默认库开了才对齐；
         重写输出时传 True，库关了也清掉以前写的。"""
         current = await self.db.get_video_by_id(v["id"])
-        if current is None or current["status"] == "removed":
+        if current is None or current["status"] == "removed" or await self.db.collection_blocked(v["id"], library_id):
             return
         lib = self._library(library_id)
         if lib.get("operation_pending") and self.file_changes.owner is not asyncio.current_task():
@@ -455,6 +465,10 @@ class Engine:
         if old_strm is None:
             out = await self.db.get_output(v["id"], library_id)
             old_strm = out["strm_path"] if out else ""
+        if old_strm and lib.get("missing_policy") == "review" and not await asyncio.to_thread(os.path.isfile, old_strm):
+            return
+        from .collection_policy import resources
+        v = {**v, "_skip_resources": await resources(self.db, v["id"], library_id)}
         if not old_strm and lib["excludes"] and not settle:
             return  # 有排除库的库：新片等归并确认它不属于排除库后再写
         if not old_strm and lib["external_dir"] and (donor := await self._relocation_donor(v["id"], lib)):
@@ -636,6 +650,8 @@ class Engine:
     async def sync_versions(self, v: dict, lib: dict, strm_path: str) -> None:
         """对齐主 strm 旁边的多画质版本文件（库没开就清掉以前写的）。
         外部整理库：strm 还在收件目录（外部工具还没整理）时不动，整理好以后在整理后的位置旁边补。"""
+        if await self.db.collection_blocked(v["id"], lib["id"]):
+            return
         ext = self.writer.external_root(lib)
         strm = Path(strm_path)
         if not strm_path or (ext is not None and ext not in strm.parents):
@@ -730,7 +746,7 @@ class Engine:
                 continue
             for n in probe_sites if created else ():
                 await self.db.add_tasks(job["id"], "probe", [f"{n}:{v['id']}"], PRIORITY_DETAIL, n)
-            if v["status"] == "removed":
+            if v["status"] == "removed" or await self.db.collection_blocked(v["id"], lib_id):
                 # 用户删掉了这部片的源、又没有别的可用源：不收，但算作已知，增量照常停
                 state["known_streak"] = state.get("known_streak", 0) + 1
                 continue
@@ -740,7 +756,10 @@ class Engine:
                 state["known_streak"] = state.get("known_streak", 0) + 1
                 continue
             added = await self.db.ensure_output(v["id"], lib_id, crawl_job=job["id"])
-            strm_path = (await self.db.get_output(v["id"], lib_id))["strm_path"]
+            current_output = await self.db.get_output(v["id"], lib_id)
+            if current_output is None:
+                continue
+            strm_path = current_output["strm_path"]
             if not added and strm_path and not await asyncio.to_thread(os.path.isfile, strm_path):
                 # 记录在、文件不在了（换了输出目录的挂载、被删了，或者被外部刮削器挪走、改名）
                 restored[await self.restore_lost(v, lib)] += 1
@@ -799,13 +818,16 @@ class Engine:
         if library_id:
             self._library(library_id)
         site = get_site(site_name)
+        known_source = await self.db.find_source(site_name, key)
+        if known_source and await self.db.collection_blocked(known_source["video_id"], library_id or 0):
+            return await self.db.get_video_by_id(known_source["video_id"])
         try:
             d = await site.fetch_detail(self.fetcher.site(site.name), key, priority=priority)
         except ParseError as e:
             raise _with_url(e, f"{site.label} {site.detail_path(key)}", getattr(e, "html", "")) from e
         v = await self.upsert_detail(site, d)
         src = await self.db.find_source(site.name, d.key)
-        if src is not None and src["status"] == "removed":
+        if src is not None and (src["status"] == "removed" or await self.db.collection_blocked(src["video_id"])):
             log.info("详情 %s %s：这个源已经删掉了，不用", site.label, key)
             return v
         if not v["duration"] and d.stream_url:
@@ -833,6 +855,8 @@ class Engine:
         await self.db.add_tasks(job_id, "cover", targets, PRIORITY_DETAIL)
 
     async def _do_probe(self, job: dict, task: dict) -> None:
+        if await self.db.collection_blocked(int(task["target"].split(":")[-1])):
+            return
         site, _, vid = task["target"].partition(":")
         if any(s["site"]==site for s in await self.db.get_sources(int(vid))):
             return {"skipped":1}
@@ -847,7 +871,7 @@ class Engine:
         """
         v = await self.db.get_video_by_id(video_id)
         site = get_site(site_name)
-        if v is None:
+        if v is None or await self.db.collection_blocked(video_id):
             return 0
         if any(s["site"] == site.name for s in await self.db.get_sources(video_id)):
             return 0
@@ -968,7 +992,7 @@ class Engine:
     async def _queue_play_probe(self, slug: str) -> None:
         """失败影片补源使用正常任务队列，尊重负缓存、删源记录和一小时去重。"""
         v = await self.db.get_video(slug)
-        if not v or v["status"] == "removed":
+        if not v or v["status"] == "removed" or await self.db.collection_blocked(v["id"]):
             return
         recent = await self.db._one("SELECT id FROM jobs WHERE json_extract(params,'$.play_video_id')=? AND created_at>? LIMIT 1",
                                     (v["id"], int(time.time()) - 3600))
@@ -1171,7 +1195,7 @@ class Engine:
         n = 0
         for lib_id, via in libs:
             lib = self.libs.get(lib_id)
-            if v is None or lib is None or await self.db.in_libraries(video_id, lib["excludes"]):
+            if v is None or lib is None or await self.db.collection_blocked(video_id, lib_id) or await self.db.in_libraries(video_id, lib["excludes"]):
                 continue
             await self.db.ensure_output(video_id, lib_id, via=via)
             await self._output_one(v, lib_id, cover=False, old_strm=await self._unarchive(lib, v) or None)
@@ -1262,6 +1286,10 @@ class Engine:
         外部工具改了目录、加了后缀也认得出，找到就只更新路径；都找不到才写回收件目录让外部工具再整理一次。
         force：外部整理目录不存在或是空的也写回（「核对」里手动勾选）。
         """
+        if await self.db.collection_blocked(v["id"], lib["id"]):
+            return "excluded"
+        if lib.get("missing_policy") == "review":
+            return "review"
         if not lib["external_dir"]:
             await self._output_one(v, lib["id"], cover=bool(v["detail_at"]))
             return "rewritten"
@@ -1293,10 +1321,11 @@ class Engine:
             content = None
         if content is None or (s.play_mode != "direct" and content != self.writer.play_url(v)):
             problems.append("strm")
-        if s.write_nfo and v.get("detail_at") and not cover_path(strm, ".nfo").is_file():
+        if "nfo" not in v.get("_skip_resources", ()) and s.write_nfo and v.get("detail_at") and not cover_path(strm, ".nfo").is_file():
             problems.append("nfo")
         if s.download_cover and v.get("cover_url"):
             names = ["-fanart.jpg"] + (["-poster.jpg"] if s.poster_crop else [])
+            names = [n for n in names if n.removeprefix("-").removesuffix(".jpg") not in v.get("_skip_resources", ())]
             if not all(cover_path(strm, n).is_file() for n in names):
                 problems.append("cover")
         return problems
@@ -1345,6 +1374,8 @@ class Engine:
                 else:
                     st["external_missing"] += 1
                 continue
+            from .collection_policy import resources
+            v = {**v, "_skip_resources": await resources(self.db, v["id"], lib["id"])}
             problems = await asyncio.to_thread(self._output_problems, v, out["strm_path"])
             if not problems:
                 st["ok"] += 1
@@ -1407,6 +1438,8 @@ class Engine:
         """按规则库调整影片归属：命中就加入（via=rule），不再命中就移除规则加入的输出。返回 (加入, 移除)。"""
         added = removed = 0
         for lib in list(self.libs.values()):
+            if await self.db.collection_blocked(v["id"], lib["id"]):
+                continue
             if not lib["rule"] or (only_library and lib["id"] != only_library):
                 continue
             if lib.get("operation_pending") and self.file_changes.owner is not asyncio.current_task():
@@ -1474,6 +1507,8 @@ class Engine:
         if drop and lib["external_dir"]:
             await self.strm.index(lib, max_age=0)  # 外部工具刚挪过的也要找到：重扫一遍，后面每部直接查
         for out in drop:
+            if await self.db.collection_blocked(out["video_id"], lib["id"]):
+                continue
             if out["strm_path"]:
                 await self._remove_files(lib, out["video_id"], out["slug"], out["strm_path"], relocate=True)
             await self.db.delete_output(out["video_id"], lib["id"])
@@ -1894,6 +1929,9 @@ class Engine:
                 await self.db.cancel_open_tasks(job_id)
                 await self.db.update_job(job_id, status="cancelled", finished_at=int(time.time()))
         elif action == "retry":
+            if job["kind"].startswith("maintenance_"):
+                await self.maintenance.retry(job_id)
+                return
             n = await self.db.retry_failed_tasks(job_id)
             await self.db.update_job(job_id, status="running", finished_at=None)
             log.info("任务 #%d：%d 个失败子任务重新排队", job_id, n)

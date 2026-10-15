@@ -371,9 +371,23 @@ async def delete_job(job_id: int, request: Request):
         raise HTTPException(400,"清退设置尚未完成，先重试执行任务或恢复清退再删除")
     if await db._one("SELECT 1 FROM jobs WHERE json_extract(params,'$.preview_id')=? LIMIT 1",(job_id,),bulk=True):
         raise HTTPException(400,"预览仍被执行任务引用，先处理并删除关联执行任务")
+    if job["kind"].startswith("maintenance_"):
+        if await db._one("SELECT 1 FROM jobs WHERE json_extract(params,'$.restore_of')=? LIMIT 1", (job_id,)):
+            raise HTTPException(400, "清理记录仍被恢复任务引用")
+        if await db._one("SELECT 1 FROM collection_exclusions WHERE job_id=? UNION ALL SELECT 1 FROM resource_exclusions WHERE job_id=? LIMIT 1", (job_id, job_id)):
+            raise HTTPException(400, "记录仍关联停止收录或资源禁补规则，请先处理相关规则")
+        if await db._one("SELECT 1 FROM cleanup_files f JOIN maintenance_items i ON i.id=f.item_id WHERE i.preview_id=? AND f.state IN ('prepared','trashed','restoring') LIMIT 1", (job["params"].get("preview_id", job_id),)):
+            raise HTTPException(400, "存在可恢复或未完成文件，保留此清理记录")
     if await db._one("SELECT 1 FROM libraries WHERE operation_job_id=? AND operation_pending=1 LIMIT 1",(job_id,)):
         raise HTTPException(400,"输出库仍有未完成的变更，先完成或重新预览后处理")
     await db.delete_job(job_id)
+    if job["kind"] in ("maintenance_preview", "maintenance_restore_preview"):
+        await db._write("DELETE FROM cleanup_files WHERE item_id IN (SELECT id FROM maintenance_items WHERE preview_id=?)", (job_id,))
+        await db._write("DELETE FROM maintenance_items WHERE preview_id=?", (job_id,))
+    if job["kind"] == "storage_scan":
+        manifest = _ctx(request).engine.storage.manifest(job_id)
+        await asyncio.to_thread(manifest.unlink, missing_ok=True)
+        await asyncio.to_thread(manifest.with_suffix(".tmp").unlink, missing_ok=True)
     return {"ok": True}
 
 
@@ -439,7 +453,7 @@ def _video_view(c, v: dict, sources: list[dict] | None = None, lines: dict[int, 
 async def list_videos(
     request: Request,
     q: str = "",
-    filter: Literal["", "active", "no_detail", "no_output", "pending", "gone", "removed"] = "",
+    filter: Literal["", "active", "no_detail", "no_output", "pending", "gone", "removed", "excluded"] = "",
     library_id: int | None = None,
     has_site: list[str] = Query([]),
     lacks_site: list[str] = Query([]),
@@ -478,10 +492,12 @@ async def list_videos(
     outputs = await c.db.outputs_for(ids)
     srcs = await c.db.sources_for(ids)
     lines = await c.db.lines_for([s["id"] for ss in srcs.values() for s in ss])
+    local = await c.engine.maintenance.summaries(ids)
     views = []
     for v in items:
         view = _video_view(c, v, srcs.get(v["id"], []), lines)
         view["outputs"] = outputs.get(v["id"], [])
+        view["local_nfo"] = local.get(v["id"])
         views.append(view)
     return {"items": views, "total": total, "page": page, "size": size}
 
@@ -597,6 +613,7 @@ async def _full_view(c, v: dict) -> dict:
     view["outputs"] = await c.db.get_outputs(v["id"])
     view["siblings"] = [{k: other[k] for k in ("slug", "uncensored", "status")}
                         for other in await c.db.sibling_videos(v, active_only=False)]
+    view["local_nfo"] = (await c.engine.maintenance.summaries([v["id"]])).get(v["id"])
     return view
 
 

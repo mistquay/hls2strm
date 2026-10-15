@@ -375,10 +375,13 @@ async def _migrate_v24(conn: aiosqlite.Connection) -> None:
     await conn.execute("UPDATE play_history SET served_video_id=video_id")
 
 
+from .maintenance_schema import migrate as _migrate_v27
+
+
 MIGRATIONS = [_migrate_v1, _migrate_v2, _migrate_v3, _migrate_v4, _migrate_v5, _migrate_v6, _migrate_v7,
               _migrate_v8, _migrate_v9, _migrate_v10, _migrate_v11, _migrate_v12, _migrate_v13, _migrate_v14,
               _migrate_v15, _migrate_v16, _migrate_v17, _migrate_v18, _migrate_v19, _migrate_v20, _migrate_v21, _migrate_v22, _migrate_v23, _migrate_v24, _migrate_v25,
-              _migrate_v26]
+              _migrate_v26, _migrate_v27]
 WORK_LIST_FIELDS = ("title", "duration", "thumb_url", "preview_url", "views", "likes")
 WORK_DETAIL_FIELDS = ("title", "duration", "cover_url", "release_date", "quality", "views", "favs", "models",
                       "categories", "tags", "maker", "director", "series")
@@ -480,6 +483,11 @@ class Database:
 
     async def _migrate(self) -> None:
         version = (await self._one("PRAGMA user_version"))[0]
+        if 0 < version < 27 <= len(MIGRATIONS):
+            backup_path = self.path.with_name(f"{self.path.name}.pre-v27-{time.time_ns()}.bak")
+            async with aiosqlite.connect(backup_path) as backup:
+                await self.conn.backup(backup)
+            log.info("维护功能迁移前数据库备份：%s", backup_path)
         for target, step in enumerate(MIGRATIONS, start=1):
             if version >= target:
                 continue
@@ -1273,6 +1281,10 @@ class Database:
     async def get_output(self, video_id: int, library_id: int) -> dict | None:
         row = await self._one("SELECT * FROM outputs WHERE video_id=? AND library_id=?", (video_id, library_id))
         return dict(row) if row else None
+
+    async def collection_blocked(self, video_id: int, library_id: int = 0) -> bool:
+        from .collection_policy import blocked
+        return await blocked(self, video_id, library_id)
 
     async def ensure_output(self, video_id: int, library_id: int, via: str = "job", *, crawl_job: int | None = None) -> bool:
         """影片加入输出库，返回是否新加入。"""

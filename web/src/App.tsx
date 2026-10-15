@@ -22,6 +22,7 @@ const pages: { id: string; name: string; icon: ComponentType<{ className?: strin
   { id: "videos", name: "影片库", icon: Film, Page: lazy(() => import("./pages/videos")) },
   { id: "play-history", name: "播放记录", icon: History, Page: lazy(() => import("./pages/play-history")) },
   { id: "libraries", name: "输出库与订阅", icon: FolderTree, Page: lazy(() => import("./pages/libraries")) },
+  { id: "maintenance", name: "媒体库维护", icon: FolderTree, Page: lazy(() => import("./pages/maintenance")) },
   { id: "strm", name: "strm 管理", icon: FileVideo, Page: lazy(() => import("./pages/strm")) },
   { id: "settings", name: "设置", icon: Settings2, Page: lazy(() => import("./pages/settings")) },
   { id: "playback-guide", name: "播放与网关说明", icon: Monitor, Page: lazy(() => import("./pages/playback-guide")) },

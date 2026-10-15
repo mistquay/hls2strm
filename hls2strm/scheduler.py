@@ -86,6 +86,8 @@ class Scheduler:
         if self.e.paused and SYSTEM_TASKS[key].follows_pause:
             return "paused", "业务调度已暂停"
         if key in ("external_locate", "orphans", "trash"):
+            if key == "trash" and await self.db._one("SELECT 1 FROM cleanup_files WHERE state='trashed' LIMIT 1"):
+                return None  # 普通库的维护回收文件同样按保留期限处理。
             external = [lib for lib in self.e.libs.values() if lib["external_dir"]]
             if not external:
                 return "no_targets", "没有外部整理库"
@@ -231,7 +233,7 @@ class Scheduler:
                                 # 文件操作开始后等本次目录处理收尾，再释放文件变更保护。
                                 await work
                                 raise
-                result = {"removed": removed}
+                result = {"removed": removed, **{k: v for k, v in (await self.e.maintenance.purge_expired()).items() if v}}
             elif key == "play_history":
                 from .play_history import PlaybackHistory
                 result = await PlaybackHistory(self.db, self.e.store).cleanup()

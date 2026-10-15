@@ -222,7 +222,7 @@ class OutputWriter:
         if old_strm and Path(old_strm) != strm:
             self._relocate(Path(old_strm), base, keep_dirs, v["slug"])
         write_atomic(strm, url)
-        if self.store.current.write_nfo and v.get("detail_at") and not lib.get("external_dir"):
+        if self.store.current.write_nfo and v.get("detail_at") and not lib.get("external_dir") and "nfo" not in v.get("_skip_resources", ()):
             write_atomic(base.with_name(base.name + ".nfo"), build_nfo(v).encode())
         return strm
 
@@ -278,6 +278,9 @@ class OutputWriter:
         if not s.download_cover or not v.get("cover_url"):
             return False
         names = ["-fanart.jpg"] + (["-poster.jpg"] if s.poster_crop else [])
+        names = [n for n in names if n.removeprefix("-").removesuffix(".jpg") not in v.get("_skip_resources", ())]
+        if not names:
+            return True
         targets = [cover_path(strm, n) for n in names]
         if all(t.exists() for t in targets):
             return True
@@ -293,9 +296,8 @@ class OutputWriter:
             return False
 
         def save() -> None:
-            write_atomic(targets[0], data)
-            if s.poster_crop:
-                write_atomic(targets[1], crop_poster(data))
+            for name, target in zip(names, targets):
+                write_atomic(target, crop_poster(data) if name == "-poster.jpg" else data)
 
         await asyncio.to_thread(save)
         return True

@@ -1,3 +1,4 @@
+import { NfoLabel } from "@/components/local-metadata";
 import { keepPreviousData, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowDownWideNarrow,
@@ -33,7 +34,7 @@ import { api, type FacetField, type Page, type Video, qs } from "@/lib/api";
 import { fmtClockDur } from "@/lib/format";
 import { subtitleTag } from "@/lib/labels";
 import { useLibraries, useMeta, useRun } from "@/lib/queries";
-import { replaceParams, useRoute } from "@/lib/route";
+import { navigate, replaceParams, useRoute } from "@/lib/route";
 import { cn } from "@/lib/utils";
 
 // 地址栏参数：列表类可以重复（has_site=jable&has_site=missav）
@@ -56,7 +57,7 @@ const SORTS: Record<string, string> = {
   views: "观看数",
   updated: "更新时间",
 };
-const STATUS: Record<string, string> = { "": "全部影片", active: "可用的", no_detail: "缺详情", no_output: "没输出", pending: "待归入", gone: "已下架", removed: "已删源" };
+const STATUS: Record<string, string> = { "": "全部影片", active: "可用的", no_detail: "缺详情", no_output: "没输出", pending: "待归入", gone: "已下架", removed: "已删源", excluded: "已停止收录" };
 const SOURCES: Record<string, string> = { "": "不限", single: "只有一个", multi: "多个", failing: "有失败的", none: "没有可用的" };
 const SUBTITLE: Record<string, string> = { "": "不限", zh: "中字", en: "英字", none: "无字幕" };
 // 用数组：对象里 "1" 这类数字键会排到 "" 前面
@@ -473,6 +474,7 @@ function BatchBar({ ids, onDone,filter,allMatching,total }: { ids: number[]; onD
           ))}
         </MenuContent>
       </Menu>
+      <Button size="sm" onClick={() => navigate("maintenance", allMatching ? {filter:JSON.stringify(filter)} : {ids:ids.join(","),...(filter.library_id?{library:String(filter.library_id)}:{})})}>维护与清理</Button>
       <Button size="sm" onClick={() => batch({ action: "refresh" })}>
         <RefreshCw />
         刷新详情
@@ -628,7 +630,7 @@ function VideoRow({
           ))}
         </div>
       </Td>
-      <Td className="whitespace-nowrap text-right text-[13px]">{fmtClockDur(v.duration)}</Td>
+      <Td className="whitespace-nowrap text-right text-[13px]">{fmtClockDur(v.duration)}<NfoLabel meta={v.local_nfo}/></Td>
       <Td className="whitespace-nowrap text-[13px]">{v.release_date}</Td>
       <Td>
         <SourceChips v={v} />

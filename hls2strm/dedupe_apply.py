@@ -74,6 +74,8 @@ async def merge(engine, preview_id, job_id, item):
                 if metadata_empty(key, video.get(key)) and not metadata_empty(key, current_member.get(key)):
                     video[key] = current_member[key]
                     fields[key] = json.dumps(current_member[key], ensure_ascii=False) if key in ("models", "categories", "tags") else current_member[key]
+            from .collection_policy import merge as merge_policy
+            await merge_policy(conn, loser, keep)
             await conn.execute("UPDATE sources SET video_id=? WHERE video_id=?", (keep, loser))
             # source_lines 通过 source_id 关联，不改源 ID，因此线路和 removed 状态都原样保留。
             await conn.execute("""INSERT INTO source_checks(video_id,site,found,checked_at)

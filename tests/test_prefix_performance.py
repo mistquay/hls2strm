@@ -184,7 +184,9 @@ def test_background_stats_api_is_durable_idempotent_and_cancellable(tmp_path):
         assert client.post("/api/prefixes/stats",json={"background":True,"query":{"unknown":True}}).status_code == 400
 
 
-def test_v25_migration_preserves_published_scopes(make_store, boot):
+def test_v25_migration_preserves_published_scopes(make_store, boot, monkeypatch):
+    from hls2strm import db as db_module
+    monkeypatch.setattr(db_module, "MIGRATIONS", db_module.MIGRATIONS[:26])
     async def run():
         db, _ = await make_store()
         scope = await snapshot(db, {})
@@ -196,7 +198,8 @@ def test_v25_migration_preserves_published_scopes(make_store, boot):
         db=Database(boot.data_dir/"test.db")
         await db.open()
         try:
-            assert (await db._one("PRAGMA user_version"))[0] == 26
+            from hls2strm.db import MIGRATIONS
+            assert (await db._one("PRAGMA user_version"))[0] == len(MIGRATIONS)
             assert (await statistics(db,scope,"missav"))["total"] == 0
         finally:
             await db.close()

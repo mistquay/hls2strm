@@ -407,6 +407,7 @@ export interface Output {
 }
 
 export interface Video {
+  local_nfo?: import("./maintenance").LocalMetadata & {conflict?:boolean};
   siblings?: {slug:string;uncensored:number;status:string}[];
   id: number;
   slug: string;
@@ -468,6 +469,7 @@ export interface Rule {
 }
 
 export interface Library {
+  missing_policy?: "restore" | "review";
   operation_job_id?: number | null;
   operation_pending?: number;
   id: number;
