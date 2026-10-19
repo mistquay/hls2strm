@@ -32,11 +32,12 @@ from weakref import WeakValueDictionary
 from . import archive
 from .file_changes import guarded
 from .codes import edition, work_slug
-from .config import BootConfig, SettingsStore, check_path_template
+from .config import BootConfig, Settings, SettingsStore, check_path_template
 from .db import DEFAULT_LIBRARY_ID, Database
 from .fetcher import Blocked, FetchError, Fetcher, NotFound
 from .observability import Metrics
 from .job_history import capture_task_logs
+from .library_paths import check_archive_dir, check_library_paths
 from .parser import ParseError, VideoGone, m3u8_duration
 from .health import host_key, host_label, measure
 from .play import Resolver
@@ -51,6 +52,7 @@ from .strm_manage import StrmManager
 from .subscription_schedule import has_schedule
 from .trash import inside, prune, retire
 from .writer import VERSION_STYLES, OutputWriter, cover_path, sanitize
+from .workers import run_worker
 
 log = logging.getLogger(__name__)
 
@@ -66,6 +68,7 @@ TASK_STATUS_NAMES = {"done": "完成", "failed": "失败", "gone": "下架", "ca
                      "pending": "待处理"}
 PROBE_STATUS_NAMES = {"found": "找到", "none": "没有", "failed": "失败", "timeout": "超时"}
 DEFAULT_MAX_PAGES = 20
+SCHEDULER_INTERVAL = 30
 
 
 class TaskStopped(Exception):
@@ -147,7 +150,7 @@ class Engine:
     async def stop(self) -> None:
         self._stopping = True
         self.resolver.quality.cancel()
-        tasks = [t for t in self._workers if not t.done()]
+        tasks = list(self._workers)
         if self._scheduler:
             tasks.append(self._scheduler)
         if self._missing_task and not self._missing_task.done():
@@ -167,9 +170,21 @@ class Engine:
         return max(1, sum(c.concurrency for c in self.store.current.sites.values() if c.enabled))
 
     def _resize_workers(self) -> None:
-        self._workers = [t for t in self._workers if not t.done()]
-        for i in range(len(self._workers), self._worker_count()):
-            self._workers.append(asyncio.create_task(self._worker(i), name=f"worker-{i}"))
+        if self._stopping:
+            return
+        # Keep slot numbers stable when replacing a worker or shrinking the pool.
+        for i in range(self._worker_count()):
+            if i < len(self._workers) and not self._workers[i].done():
+                continue
+            if i < len(self._workers):
+                old = self._workers[i]
+                if not old.cancelled() and (error := old.exception()) is not None:
+                    log.error("worker-%d 异常退出，正在重建", i, exc_info=(type(error), error, error.__traceback__))
+            worker = asyncio.create_task(run_worker(self, i), name=f"worker-{i}")
+            if i < len(self._workers):
+                self._workers[i] = worker
+            else:
+                self._workers.append(worker)
 
     def _on_settings(self) -> None:
         self._resize_workers()
@@ -226,29 +241,6 @@ class Engine:
                 if not cfg[name].enabled or self.blocked.get(name, 0) > t or busy[name] >= cfg[name].concurrency]
 
     # ---- worker ----
-
-    async def _worker(self, idx: int) -> None:
-        while not self._stopping:
-            if idx >= self._worker_count():
-                return
-            if self.paused:
-                await self._idle(2)
-                continue
-            async with self._claim_lock:  # 算可领站点和登记 running 要原子，否则并发会超出站点上限
-                if self.paused:
-                    continue
-                task = await self.db.claim_task(self._skip_sites())
-                if task is not None:
-                    if self.paused:
-                        await self.db.finish_task(task["id"], "pending", refund_attempt=True)
-                        continue
-                    self.running[task["id"]] = {
-                        "id": task["id"], "job_id": task["job_id"], "kind": task["kind"], "site": task["site"],
-                        "target": task["target"], "attempt": task["attempts"], "started": time.time()}
-            if task is None:
-                await self._idle(2)
-                continue
-            await self._run(task)
 
     async def _run(self, task: dict) -> None:
         async with capture_task_logs(self.db.history, task):
@@ -589,13 +581,18 @@ class Engine:
 
     def check_archive_dir(self, root: Path) -> None:
         """归档目录不能和输出根目录、各库目录、外部整理目录互相嵌套：搬进去媒体库还看得到，或者被当成库里的文件。"""
-        root = root.resolve()
-        dirs = [("输出根目录", self.store.output_dir)] + [
-            (f"输出库「{lib['name']}」", d) for lib in self.libs.values()
-            for d in (self.writer.library_root(lib), self.writer.external_root(lib)) if d]
-        for name, d in dirs:
-            if _overlap(root, d.resolve()):
-                raise ValueError(f"归档目录 {root} 和{name}的目录 {d} 重叠，不能互相嵌套")
+        check_archive_dir(root, self.store.output_dir, self.libs.values())
+
+    async def update_settings(self, patch: dict) -> Settings:
+        paths_changed = bool({"output_dir", "archive_dir"} & patch.keys())
+
+        def validate(settings):
+            check_library_paths(self.libs.values(), self.store.output_dir_for(settings),
+                                self.store.archive_dir_for(settings))
+
+        guard = self.file_changes.exclusive() if paths_changed else self.file_changes.normal()
+        async with guard:
+            return await self.store.update(patch, validate=validate if paths_changed else None)
 
     async def _archive_files(self, lib: dict, v: dict, strm_path: str) -> None:
         """影片下架：它在这个库里的文件搬进归档目录（见 archive.py），记下搬到了哪里，恢复时搬回来。
@@ -1950,29 +1947,10 @@ class Engine:
             raise ValueError("库名不能为空")
         if not dir:
             raise ValueError("目录不能为空：输出根目录本身不能作为库目录，否则别的库会嵌套在里面")
-        for d in (dir, external_dir):
-            if d and not Path(d).is_absolute() and ".." in Path(d).parts:
-                raise ValueError("相对目录不能包含 ..")
         template = check_path_template(path_template) if path_template.strip() else ""
-        root = self.writer.library_root({"dir": dir}).resolve()
-        if root == self.store.output_dir.resolve():
-            raise ValueError("库目录不能是输出根目录")
-        mine = [root]
-        if external_dir:
-            ext = self.writer.library_root({"dir": external_dir}).resolve()
-            if _overlap(root, ext):
-                raise ValueError("外部整理目录和库目录不能互相嵌套，否则整理好的文件会被外部工具当成新文件再处理一遍")
-            mine.append(ext)
-        arch = self.store.archive_dir.resolve()
-        if any(_overlap(m, arch) for m in mine):
-            raise ValueError(f"目录和归档目录 {arch} 重叠，不能互相嵌套")
-        for other in self.libs.values():
-            if other["id"] == exclude_id:
-                continue
-            for o in filter(None, (self.writer.library_root(other), self.writer.external_root(other))):
-                o = o.resolve()
-                if any(_overlap(m, o) for m in mine):
-                    raise ValueError(f"目录和输出库「{other['name']}」（{o}）重叠，各库的目录、外部整理目录不能互相嵌套")
+        libraries = [lib for lib in self.libs.values() if lib["id"] != exclude_id]
+        libraries.append({"name": name, "dir": dir, "external_dir": external_dir})
+        check_library_paths(libraries, self.store.output_dir, self.store.archive_dir)
         return name, dir, template, external_dir
 
     @guarded
@@ -2066,7 +2044,8 @@ class Engine:
 
     async def _schedule_loop(self) -> None:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(SCHEDULER_INTERVAL)
+            self._resize_workers()
             try:
                 await self.scheduler.tick()
             except Exception:
@@ -2149,10 +2128,6 @@ def _with_url(e: ParseError, url: str, html: str = "") -> ParseError:
     err = type(e)(f"{e}：{url}")
     err.html = html
     return err
-
-
-def _overlap(a: Path, b: Path) -> bool:
-    return a == b or a in b.parents or b in a.parents
 
 
 def snapshot_path(boot: BootConfig, name: str) -> Path | None:

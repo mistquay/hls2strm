@@ -47,7 +47,8 @@ async def overview(request: Request):
     c = _ctx(request)
     roots = []
     configured = {(l["id"], str(r)) for l in c.engine.libs.values() for r in c.engine.maintenance.roots(l)}
-    for row in await c.db._all("SELECT * FROM maintenance_roots ORDER BY library_id,root"):
+    published = await c.db._all("SELECT * FROM maintenance_roots ORDER BY library_id,root", browse=True)
+    for row in published:
         if (row["library_id"], row["root"]) not in configured:
             continue
         item = dict(row)
@@ -59,13 +60,21 @@ async def overview(request: Request):
             item.update(disk_free=None, disk_total=None)
         item.pop("identity")
         roots.append(item)
-    jobs = await c.db._all("SELECT id,kind,name,status,state,params,created_at,finished_at FROM jobs WHERE kind LIKE 'maintenance_%' ORDER BY id DESC LIMIT 30")
-    groups = await c.db._all("""SELECT a.library_id,a.root,
-        CASE WHEN instr(replace(a.path,char(92),'/'),'/')>0 THEN substr(replace(a.path,char(92),'/'),1,instr(replace(a.path,char(92),'/'),'/')-1) ELSE a.path END AS directory,
-        SUM(a.bytes) AS bytes,SUM(a.extra_bytes) AS extra_bytes,COUNT(*) AS assets
-        FROM library_assets a JOIN maintenance_roots r ON r.library_id=a.library_id AND r.root=a.root AND r.scan_id=a.scan_id
-        GROUP BY a.library_id,a.root,directory ORDER BY bytes DESC LIMIT 100""")
-    return {"roots": roots, "groups": [dict(r) for r in groups if (r["library_id"], r["root"]) in configured],
+    jobs = await c.db._all("SELECT id,kind,name,status,state,params,created_at,finished_at FROM jobs WHERE kind LIKE 'maintenance_%' ORDER BY id DESC LIMIT 30", browse=True)
+
+    async def load_groups():
+        rows = await c.db._all("""SELECT a.library_id,a.root,
+            CASE WHEN instr(replace(a.path,char(92),'/'),'/')>0 THEN substr(replace(a.path,char(92),'/'),1,instr(replace(a.path,char(92),'/'),'/')-1) ELSE a.path END AS directory,
+            SUM(a.bytes) AS bytes,SUM(a.extra_bytes) AS extra_bytes,COUNT(*) AS assets
+            FROM library_assets a JOIN maintenance_roots r ON r.library_id=a.library_id AND r.root=a.root AND r.scan_id=a.scan_id
+            GROUP BY a.library_id,a.root,directory ORDER BY bytes DESC LIMIT 100""", bulk=True)
+        return [dict(row) for row in rows]
+
+    # A newly published scan or changed root must not reuse the previous aggregate.
+    generation = tuple((row["library_id"], row["root"], row["scan_id"]) for row in published
+                       if (row["library_id"], row["root"]) in configured)
+    groups = await c.db.stats_cache.get(("maintenance_groups", generation), load_groups, 10)
+    return {"roots": roots, "groups": [r for r in groups if (r["library_id"], r["root"]) in configured],
             "archive_root": str(c.store.archive_dir),
             "jobs": [{**dict(r), "state": json.loads(r["state"]), "params": json.loads(r["params"])} for r in jobs]}
 

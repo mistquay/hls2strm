@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from hls2strm import auth as auth_module
@@ -86,5 +87,41 @@ def test_too_many_failures_blocks_ip(tmp_path, monkeypatch):
                 assert c.post("/api/login", json={"username": "admin", "password": "x"}).status_code == 401
             r = c.post("/api/login", json={"username": "admin", "password": "pw"})
             assert r.status_code == 429 and "分钟后再试" in r.json()["detail"]
+    finally:
+        _cleanup()
+
+
+@pytest.mark.parametrize("methods", [("basic", "basic", "basic"), ("login", "basic", "login")])
+def test_basic_and_login_share_failure_limit(tmp_path, monkeypatch, methods):
+    monkeypatch.setattr(auth_module, "FAILURE_DELAY", 0)
+    monkeypatch.setattr(auth_module, "MAX_FAILURES", 3)
+    app = _client(tmp_path)
+    try:
+        with TestClient(app) as client:
+            session = app.state.ctx.auth.issue(60)
+            assert client.get("/api/libraries").status_code == 401
+            for method in methods:
+                response = (client.get("/api/libraries", auth=("admin", "wrong")) if method == "basic"
+                            else client.post("/api/login", json={"username": "admin", "password": "wrong"}))
+                assert response.status_code == 401
+            for password in ("wrong", "pw"):
+                response = client.get("/api/libraries", auth=("admin", password))
+                assert response.status_code == 429 and int(response.headers["retry-after"]) > 0
+            assert client.post("/api/login", json={"username": "admin", "password": "pw"}).status_code == 429
+            assert client.get("/api/libraries", headers={"Cookie": f"{auth_module.COOKIE}={session}"}).status_code == 200
+    finally:
+        _cleanup()
+
+
+def test_successful_basic_auth_resets_failures(tmp_path, monkeypatch):
+    monkeypatch.setattr(auth_module, "FAILURE_DELAY", 0)
+    monkeypatch.setattr(auth_module, "MAX_FAILURES", 2)
+    app = _client(tmp_path)
+    try:
+        with TestClient(app) as client:
+            assert client.get("/api/libraries", auth=("admin", "wrong")).status_code == 401
+            assert client.get("/api/libraries", auth=("admin", "pw")).status_code == 200
+            assert client.get("/api/libraries", auth=("admin", "wrong")).status_code == 401
+            assert client.post("/api/login", json={"username": "admin", "password": "pw"}).status_code == 200
     finally:
         _cleanup()

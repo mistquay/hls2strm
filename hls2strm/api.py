@@ -40,15 +40,30 @@ _basic = HTTPBasic(auto_error=False)
 _SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,80}$")
 
 
-def require_auth(request: Request, cred: HTTPBasicCredentials | None = Depends(_basic)) -> None:
+async def require_auth(request: Request, cred: HTTPBasicCredentials | None = Depends(_basic)) -> None:
     """登录页给的会话 cookie，或者 HTTP Basic（脚本、curl -u 用）。
     401 不带 WWW-Authenticate：浏览器不弹自己的登录框，由页面显示登录页。"""
     auth = request.app.state.ctx.auth
     if not auth.required or auth.verify(request.cookies.get(COOKIE)):
         return
-    if cred is not None and auth.check_password(cred.username, cred.password):
+    if cred is not None:
+        await _authenticate_password(request, cred.username, cred.password)
         return
     raise HTTPException(401, "需要登录")
+
+
+async def _authenticate_password(request: Request, user: str, password: str) -> None:
+    auth = request.app.state.ctx.auth
+    ip = request.client.host if request.client else "?"
+    if wait := auth.blocked_for(ip):
+        raise HTTPException(429, f"密码输错次数太多，{wait // 60 + 1} 分钟后再试",
+                            headers={"Retry-After": str(wait)})
+    if not auth.check_password(user, password):
+        auth.failed(ip)
+        log.warning("认证失败：用户名 %s（来自 %s）", user[:40], ip)
+        await asyncio.sleep(auth_module.FAILURE_DELAY)
+        raise HTTPException(401, "用户名或密码不对")
+    auth.succeeded(ip)
 
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_auth)])
@@ -76,14 +91,7 @@ async def login(body: LoginBody, request: Request, response: Response):
     ip = request.client.host if request.client else "?"
     if not auth.required:
         return {"user": None}
-    if wait := auth.blocked_for(ip):
-        raise HTTPException(429, f"密码输错次数太多，{wait // 60 + 1} 分钟后再试")
-    if not auth.check_password(body.username.strip(), body.password):
-        auth.failed(ip)
-        log.warning("登录失败：用户名 %s（来自 %s）", body.username.strip()[:40], ip)
-        await asyncio.sleep(auth_module.FAILURE_DELAY)
-        raise HTTPException(401, "用户名或密码不对")
-    auth.succeeded(ip)
+    await _authenticate_password(request, body.username.strip(), body.password)
     ttl = REMEMBER_TTL if body.remember else SESSION_TTL
     response.set_cookie(COOKIE, auth.issue(ttl), max_age=ttl if body.remember else None, httponly=True,
                         samesite="lax", secure=request.url.scheme == "https", path="/")
@@ -1041,18 +1049,14 @@ async def get_settings(request: Request):
 @router.put("/settings")
 async def put_settings(patch: dict, request: Request):
     c = _ctx(request)
-    if "archive_dir" in patch:
-        d = str(patch["archive_dir"] or "").strip()
-        try:
-            c.engine.check_archive_dir(Path(d) if d else c.store.boot.data_dir / "archive")
-        except ValueError as e:
-            raise HTTPException(422, f"archive_dir：{e}") from None  # 「字段：原因」，设置页按字段标出来
     try:
-        async with c.engine.file_changes.normal():
-            new = await c.store.update(patch)
+        new = await c.engine.update_settings(patch)
     except ValidationError as err:
         msgs = [f"{'.'.join(str(x) for x in e['loc'])}：{e['msg']}" for e in err.errors()]
         raise HTTPException(422, "；".join(msgs)) from None
+    except ValueError as err:
+        field = "output_dir" if "output_dir" in patch else "archive_dir"
+        raise HTTPException(422, f"{field}：{err}") from None
     c.engine.notify()
     return {"values": new.model_dump(), "effective": _effective(c), "output_sync": await output_sync.view(c.db)}
 

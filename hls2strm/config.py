@@ -366,17 +366,19 @@ class SettingsStore:
             known = {k: v for k, v in data.items() if k in Settings.model_fields}
             self.current = Settings.model_validate(known)
 
-    async def update(self, patch: dict) -> Settings:
+    async def update(self, patch: dict, *, validate: Callable[[Settings], None] | None = None) -> Settings:
         """改设置；sites 按站点、按字段合并，只传改动的部分就行。"""
         async with self._update_lock:
-            return await self._update(patch)
+            return await self._update(patch, validate)
 
-    async def _update(self, patch: dict) -> Settings:
+    async def _update(self, patch: dict, validate: Callable[[Settings], None] | None = None) -> Settings:
         data = self.current.model_dump()
         patch = dict(patch)
         for name, cfg in (patch.pop("sites", None) or {}).items():
             data["sites"][name] = {**data["sites"].get(name, {}), **cfg}
         new = Settings.model_validate({**data, **patch})
+        if validate is not None:
+            validate(new)
         from . import output_sync
         old = self.current
         sync = await output_sync.changed(self._db, old, new)
@@ -396,12 +398,18 @@ class SettingsStore:
 
     @property
     def output_dir(self) -> Path:
-        d = self.current.output_dir or self.boot.default_output_dir
+        return self.output_dir_for(self.current)
+
+    def output_dir_for(self, settings: Settings) -> Path:
+        d = settings.output_dir or self.boot.default_output_dir
         return Path(d).resolve() if d else self.boot.data_dir / "strm"
 
     @property
     def archive_dir(self) -> Path:
-        d = self.current.archive_dir
+        return self.archive_dir_for(self.current)
+
+    def archive_dir_for(self, settings: Settings) -> Path:
+        d = settings.archive_dir
         return Path(d).resolve() if d else self.boot.data_dir / "archive"
 
     @property

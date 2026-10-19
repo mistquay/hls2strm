@@ -37,6 +37,6 @@ ENV HLS2STRM_VERSION=${VERSION}
 EXPOSE 8080
 VOLUME ["/data", "/strm"]
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=4)"
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/readyz', timeout=4)"
 
 CMD ["python", "-m", "hls2strm"]
