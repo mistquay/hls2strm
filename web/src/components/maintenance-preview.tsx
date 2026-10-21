@@ -16,7 +16,7 @@ import {
 import { ask } from "./confirm";
 import { Button } from "./ui/button";
 import { Mono, Table, Th, Td } from "./ui/data";
-import { DialogContent } from "./ui/overlay";
+import { TaskPreviewFrame } from "./task-preview-frame";
 
 function Files({ id }: { id: number }) {
   const [page, setPage] = useState(0);
@@ -66,10 +66,12 @@ export function MaintenancePreview({
   jobId,
   onJob,
   onClose,
+  embedded = false,
 }: {
   jobId: number;
   onJob: (id: number) => void;
-  onClose: () => void;
+  onClose?: () => void;
+  embedded?: boolean;
 }) {
   const run = useRun();
   const queryClient = useQueryClient();
@@ -175,12 +177,13 @@ export function MaintenancePreview({
     });
   };
   return (
-    <DialogContent
+    <TaskPreviewFrame
+      embedded={embedded}
       title={`${restoring ? "回收恢复" : "媒体清理"} · 任务 #${jobId}`}
       className="max-w-5xl"
       footer={
         <>
-          <Button disabled={busy} onClick={onClose}>{job && ["running", "paused"].includes(job.status) ? "关闭并稍后查看" : "关闭"}</Button>
+          {!embedded && <Button disabled={busy} onClick={onClose}>{job && ["running", "paused"].includes(job.status) ? "关闭并稍后查看" : "关闭"}</Button>}
           {job?.status === "running" && (
             <>
               <Button onClick={() => control("pause")}>暂停</Button>
@@ -402,6 +405,6 @@ export function MaintenancePreview({
           取消只停止后续项。清理前和清理中的资料、目录或文件变化会导致该组跳过或失败，不会自动扩大范围。清理后重新扫描更新空间统计。
         </p>
       </div>
-    </DialogContent>
+    </TaskPreviewFrame>
   );
 }

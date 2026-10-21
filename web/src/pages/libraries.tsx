@@ -81,19 +81,19 @@ function LibrariesPanel() {
       body: (
         <>
           <p>在外部整理目录 <Mono>{l.external_root}</Mono> 里找已经没有 strm、只剩 nfo 和图片的影片目录（以前移出库时留下的），移进回收区。</p>
-          <p className="text-muted">回收区在整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除。一天内有改动的目录不动（可能正在整理）。结果和目录清单在任务日志里。</p>
+          <p className="text-muted">回收区在整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除；保留 0 天会永久删除。一天内有改动的目录不动（可能正在整理）。检查完成后在任务详情查看完整清单，再确认按原范围清理；关闭页面不停止任务。</p>
         </>
       ),
       choices: [
-        { value: "check", label: "只检查" },
-        { value: "apply", label: "移进回收区", variant: "primary" },
+        { value: "check", label: "只检查并生成预览", variant: "primary" },
       ],
     });
     if (!choice) return;
-    await run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/tidy?apply=${choice === "apply"}`), {
+    const result = await run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/tidy?apply=false`), {
       success: r => `已排队清理残留 #${r.job_id}`,
       ...done,
     });
+    if (result) navigate("jobs", {job: String(result.job_id)});
   };
 
   return (

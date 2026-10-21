@@ -396,6 +396,12 @@ async def delete_job(job_id: int, request: Request):
         manifest = _ctx(request).engine.storage.manifest(job_id)
         await asyncio.to_thread(manifest.unlink, missing_ok=True)
         await asyncio.to_thread(manifest.with_suffix(".tmp").unlink, missing_ok=True)
+    if job["kind"] == "tidy":
+        from .tidy_plans import manifest
+        directory = manifest(_ctx(request).engine.strm, job_id, 0).parent
+        if directory.is_dir():
+            for path in directory.glob(f"{int(job_id)}-*.jsonl"):
+                await asyncio.to_thread(path.unlink, missing_ok=True)
     return {"ok": True}
 
 
@@ -989,6 +995,14 @@ async def strm_prefix_apply(body: PrefixBody, request: Request):
 @router.get("/strm/changes")
 async def strm_changes(request: Request):
     return await _ctx(request).db.list_change_sets()
+
+
+@router.get("/strm/changes/{change_set}")
+async def strm_change_details(change_set: int, request: Request, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
+    db = _ctx(request).db
+    total = await db._one("SELECT COUNT(*) AS n FROM strm_changes WHERE change_set=?", (change_set,), browse=True)
+    rows = await db._all("SELECT * FROM strm_changes WHERE change_set=? ORDER BY id LIMIT ? OFFSET ?", (change_set, limit, offset), browse=True)
+    return {"items": [dict(r) for r in rows], "total": total["n"]}
 
 
 @router.post("/strm/changes/{change_set}/revert")

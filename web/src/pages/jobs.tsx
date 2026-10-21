@@ -5,7 +5,7 @@ import { ErrorText, Pager, QueryNotice } from "@/components/common";
 import { ask } from "@/components/confirm";
 import { CrawlResults, JobLogs } from "@/components/job-history";
 import { PrefixProgress } from "@/components/prefix-crawl";
-import { OperationPreview, type OperationRequest } from "@/components/operation-preview";
+import { TaskFilePreview } from "@/components/task-file-preview";
 import { navigate } from "@/lib/route";
 import { defaultVerifyOptions, verifyHint, VerifyOptions, verifyParams } from "@/components/verify-options";
 import { Button } from "@/components/ui/button";
@@ -49,7 +49,7 @@ function progressText(j: Job): string {
   if (j.kind === "locate" && st.checked != null) text += `，更新 ${n("updated")}，找不到 ${n("missing")}`;
   if (j.kind === "tidy" && st.orphans != null) {
     text += `，只剩 nfo、图片的目录 ${n("orphans")} 个（${fmtBytes(Number(st.bytes ?? 0))}）`;
-    if (j.params.apply) text += `，已移走 ${n("moved")}` + (st.failed ? `，失败 ${n("failed")}` : "");
+    if (j.params.apply) text += `，已处理 ${n("moved")}` + (st.skipped ? `，跳过 ${n("skipped")}` : "") + (st.failed ? `，失败 ${n("failed")}` : "");
   }
   if (j.kind === "verify" && st.checked != null) {
     text += `，检查 ${n("checked")}，正常 ${n("ok")}，strm 缺 ${n("strm")}，nfo 缺 ${n("nfo")}，封面缺 ${n("cover")}`;
@@ -417,7 +417,7 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
         </div>
 
         {job.state.child_job_id && <Button onClick={()=>navigate("jobs",{job:String(job.state.child_job_id)})}>查看后续处理任务 #{String(job.state.child_job_id)}</Button>}
-        {job.kind==="preview" && !!job.params.operation && <OperationPreview request={job.params.operation as unknown as OperationRequest} initialJobId={job.id} onApplied={id=>navigate("jobs",{job:String(id)})} />}
+        <TaskFilePreview job={job} />
         <KV
           items={[
             ["类型", kindName(job.kind)],
