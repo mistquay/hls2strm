@@ -27,6 +27,7 @@ class Maintenance:
 
     def configuration(self):
         return [{"id": lib["id"], "roots": [str(r) for r in self.roots(lib)],
+                 "inbox": str(self.e.writer.library_root(lib).absolute()), "archive": str(self.e.store.archive_dir.absolute()),
                  "missing_policy": lib.get("missing_policy", "restore"), "versions": lib["versions"]}
                 for lib in sorted(self.e.libs.values(), key=lambda l: l["id"])]
 
@@ -55,7 +56,8 @@ class Maintenance:
                 await self.db.add_tasks(job, kind, ["all"], 20)
                 self.e.notify()
                 return job
-        job = await self.db.create_job(kind, names[kind], params)
+        name = "无可用源归档预览" if kind == "maintenance_preview" and params.get("request", {}).get("action") == "unavailable" else names[kind]
+        job = await self.db.create_job(kind, name, params)
         await self.db.add_tasks(job, kind, ["all"], 20)
         self.e.notify()
         return job
@@ -135,7 +137,8 @@ class Maintenance:
         lib = self.e._library(asset["library_id"])
         if lib.get("operation_pending"):
             raise ValueError("资产所在库有未完成配置变更")
-        if root not in self.roots(lib):
+        inbox = asset["data"].get("inbox") and root == self.e.writer.library_root(lib).absolute()
+        if root not in self.roots(lib) and not inbox:
             raise ValueError("资产根目录不再属于配置库")
         if await asyncio.to_thread(safe_directory, root) != asset["data"]["root_identity"]:
             raise ValueError("资产根目录已被替换")
@@ -174,7 +177,7 @@ class Maintenance:
         return result
 
     async def validate_outputs(self, item, data):
-        libs = {a["library_id"] for a in data["assets"]}
+        libs = set(data.get("library_ids", [a["library_id"] for a in data["assets"]]))
         fields = lambda rows: sorted((r["library_id"], r["strm_path"], r["via"]) for r in rows if r["library_id"] in libs)
         if fields(await self.db.get_outputs(item["video_id"])) != fields(data["outputs"]):
             raise ValueError("预览后输出关联或路径已改变，请重新核对")
@@ -219,6 +222,8 @@ class Maintenance:
             await asyncio.to_thread(validate, Path(a["root"]), a["data"], strict=False)
             actual, _ = await asyncio.to_thread(entries, directory)
             before = {f["path"]: (f.get("fingerprint"), f.get("sha256")) for f in a["data"]["files"]}
+            if a["data"].get("partial"):
+                actual = [f for f in actual if f["path"] in before]
             for f in actual:
                 if f["path"] not in before or before[f["path"]] != (f.get("fingerprint"), f.get("sha256")):
                     raise ValueError("中断后出现新文件或文件改变，保留现场")
@@ -242,8 +247,11 @@ class Maintenance:
                 raise ValueError("库配置已变化，请重新预览")
             kind = "maintenance_apply" if preview["kind"] == "maintenance_preview" else "maintenance_restore"
             params = {"preview_id": preview_id, "retention_days": preview["params"].get("request", {}).get("retention_days", 7)}
+            name = "执行已确认媒体清理" if kind == "maintenance_apply" else "恢复已确认回收文件"
+            if kind == "maintenance_apply" and preview["params"].get("request", {}).get("action") == "unavailable":
+                name = "执行无可用源归档"
             cur = await conn.execute("INSERT INTO jobs(kind,name,params,status,created_at) VALUES(?,?,?,'running',?)", (kind,
-                "执行已确认媒体清理" if kind == "maintenance_apply" else "恢复已确认回收文件", json.dumps(params), int(time.time())))
+                name, json.dumps(params), int(time.time())))
             job_id = cur.lastrowid
             await conn.execute("INSERT INTO tasks(job_id,kind,target,priority,updated_at) VALUES(?,?,'all',20,?)", (job_id, kind, int(time.time())))
             await conn.execute("UPDATE jobs SET state=? WHERE id=?", (json.dumps({**preview["state"], "apply_job_id": job_id}), preview_id))
@@ -380,6 +388,7 @@ class Maintenance:
         while rows := await self.db._all("""SELECT f.*,i.data FROM cleanup_files f JOIN maintenance_items i ON i.id=f.item_id
             JOIN jobs j ON j.kind='maintenance_apply' AND json_extract(j.params,'$.preview_id')=i.preview_id
             WHERE f.id>? AND f.state='trashed' AND j.status IN ('done','cancelled') AND i.state IN ('done','abandoned')
+            AND COALESCE(json_extract(i.data,'$.request.disposition'),'trash')!='archive'
             AND json_extract(j.params,'$.expires_at')<?
             AND NOT EXISTS (SELECT 1 FROM jobs restoration JOIN maintenance_items ri
                 ON ri.preview_id=json_extract(restoration.params,'$.preview_id')
@@ -442,5 +451,7 @@ class Maintenance:
                         await conn.execute("DELETE FROM collection_exclusions WHERE video_id=? AND job_id=?", (item["video_id"], job_id))
                     await conn.execute("UPDATE maintenance_items SET state='abandoned' WHERE id=?", (item["id"],))
         await self.progress(job_id, job["params"]["preview_id"])
-        await self.db._write("UPDATE jobs SET params=json_set(params,'$.expires_at',?) WHERE id=?",
-                             (int(time.time()) + job["params"].get("retention_days", 7) * 86400, job_id))
+        preview = await self.db.get_job(job["params"]["preview_id"])
+        if preview["params"]["request"].get("disposition") != "archive":
+            await self.db._write("UPDATE jobs SET params=json_set(params,'$.expires_at',?) WHERE id=?",
+                                 (int(time.time()) + job["params"].get("retention_days", 7) * 86400, job_id))

@@ -100,11 +100,11 @@ export interface AssetFilter {
 }
 export interface CleanupConfig {
   query: AssetFilter;
-  action: "resources" | "remove" | "reconcile";
+  action: "resources" | "remove" | "reconcile" | "unavailable";
   scope: "library" | "global";
   resource_types: string[];
   keep_extra: number;
-  disposition: "trash" | "permanent";
+  disposition: "trash" | "permanent" | "archive";
   retention_days: number;
   stop_collection: boolean;
   allow_empty: boolean;
@@ -138,6 +138,11 @@ export interface MaintenanceJob {
     files?: number;
     bytes?: number;
     skipped?: number;
+    unknown?: number;
+    archive_root?: string;
+    kept?: number;
+    directories?: number;
+    error?: string;
     failed?: number;
     failed_roots?: number;
     done?: number;
@@ -162,6 +167,9 @@ export interface MaintenanceItem {
     code: string;
     title: string;
     slug: string;
+    reason?: string;
+    archive_root?: string;
+    sources?: { site: string; status: string; retired: boolean }[];
     metadata: LocalMetadata;
     field_sources: Record<string, string>;
     assets: {

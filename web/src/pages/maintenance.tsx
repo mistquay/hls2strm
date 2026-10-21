@@ -40,7 +40,7 @@ export default function Maintenance() {
   const run = useRun();
   const queryClient = useQueryClient();
   const { data: libs = [] } = useLibraries(true);
-  const [view, setView] = useState("assets");
+  const [view, setView] = useState(() => route.params.get("tab") === "unavailable" ? "unavailable" : "assets");
   const [query, setQuery] = useState<AssetFilter>(() => {
     let video: Record<string, unknown> = {};
     try {
@@ -115,7 +115,7 @@ export default function Maintenance() {
         bytes: number;
         extra_bytes: number;
       }>(`/api/maintenance/assets/query?offset=${page * 50}`, query),
-    enabled: view !== "history" && view !== "space",
+    enabled: !["history", "space", "unavailable"].includes(view),
   });
   const completedScan = overview.data?.jobs.find((job) => job.kind === "maintenance_scan" && job.status === "done")?.id;
   useEffect(() => {
@@ -187,6 +187,20 @@ export default function Maintenance() {
       setBusy(false);
     }
   };
+  const unavailablePreview = async () => {
+    setBusy(true);
+    try {
+      await run(async () => {
+        const result = await api.post<{ job_id: number }>("/api/maintenance/preview", {
+          action: "unavailable", scope: "library", disposition: "archive", stop_collection: true,
+          query: { library_ids: query.library_ids, video_ids: query.video_ids },
+        });
+        setJobId(result.job_id);
+      }, refresh);
+    } finally {
+      setBusy(false);
+    }
+  };
   const policy = async (id: number, value: string) => {
     if (
       !(await ask(
@@ -217,6 +231,7 @@ export default function Maintenance() {
           ["assets", "本地资料与筛选"],
           ["cleanup", "筛选清理"],
           ["differences", "磁盘差异"],
+          ["unavailable", "无可用源／清退残留"],
           ["history", "记录与恢复"],
         ].map(([key, label]) => (
           <Button
@@ -239,8 +254,10 @@ export default function Maintenance() {
         title="维护范围"
         actions={
           <>
-            <Button disabled={scanSubmitting || activeScan} onClick={() => scan()}>扫描磁盘与 NFO</Button>
-            <Button disabled={scanSubmitting || activeScan} onClick={() => scan(true)}>强制重读 NFO</Button>
+            {view !== "unavailable" && <>
+              <Button disabled={scanSubmitting || activeScan} onClick={() => scan()}>扫描磁盘与 NFO</Button>
+              <Button disabled={scanSubmitting || activeScan} onClick={() => scan(true)}>强制重读 NFO</Button>
+            </>}
             <Button onClick={() => run(async () => {}, refresh)}>
               刷新结果
             </Button>
@@ -268,8 +285,9 @@ export default function Maintenance() {
           {query.library_ids?.length
             ? `已选择 ${query.library_ids.length} 个库`
             : "未限定库：扫描和筛选全部配置库"}
-          。已配置外部整理目录时只扫描外部整理目录，未配置才扫描输出目录。NFO
-          读取不改写文件；源站资料与本地资料分别保留。扫描完成后自动刷新结果。
+          {view === "unavailable"
+            ? "。本次直接核查外部整理目录及收件目录，不依赖旧扫描或输出记录。"
+            : "。已配置外部整理目录时只扫描外部整理目录，未配置才扫描输出目录。NFO 读取不改写文件；源站资料与本地资料分别保留。扫描完成后自动刷新结果。"}
         </p>
         <div className="space-y-1 pb-3 text-xs text-muted">
           {libs.filter((lib) => !query.library_ids?.length || query.library_ids.includes(lib.id)).map((lib) => (
@@ -286,7 +304,20 @@ export default function Maintenance() {
       {view === "space" && (
         <MaintenanceSpace overview={overview} query={query} libs={libs} />
       )}
-      {view !== "space" && view !== "history" && (
+      {view === "unavailable" && <Panel title="无可用源影片与清退残留核查">
+        <div className="space-y-3 py-3 text-sm">
+          <p>只看本地源状态、站点启停及支持的线路，不请求源站、不探测播放。站点停用、线路全停用也计为无可用源，不仅限于已清退站点；“本地可用”不等于已经验证能播放。</p>
+          <p>按 STRM 内容识别已改名、移动或失去输出记录的影片；只剩 NFO 的目录需能唯一关联影片，普通版与其他版本有歧义时跳过。</p>
+          <p>确认后将独占影片目录内全部文件（STRM、NFO、图片、字幕、预告片等）移到库外归档目录，停止所选库重新收录。平铺收件区仅归档明确属于影片的 STRM；共享整理目录、身份冲突、链接和实体视频保留并说明原因。</p>
+          <p className="break-all">归档目录：{overview.data?.archive_root || "读取中"}。归档不自动过期，不是永久删除，也不保证释放源磁盘空间；请确保 Emby 没有扫描此目录。</p>
+          <p className="text-warn">预览只读取文件并保存清单；确认执行前请暂停外部刮削写入。文件移出后仍需 Emby 刷新媒体库，本功能不调用 Emby API。</p>
+          {!!query.video_ids?.length && <p>仅核查从影片库带入的 {query.video_ids.length} 部影片。</p>}
+          <Button variant="primary" disabled={busy || activeScan || !!overview.error} onClick={unavailablePreview}>
+            {busy ? "提交中…" : "只读核查并生成归档预览"}
+          </Button>
+        </div>
+      </Panel>}
+      {!["space", "history", "unavailable"].includes(view) && (
         <>
           <MaintenanceFilters query={query} update={update} />
           {view === "differences" && (

@@ -83,8 +83,13 @@ def change_file(row, root, restore=False):
     return "deleted"
 
 
-async def thread_change(*args, **kwargs):
-    worker = asyncio.create_task(asyncio.to_thread(change_file, *args, **kwargs))
+async def thread_change(*args, archive_root=None, archive_identity=None, **kwargs):
+    change = change_file
+    if archive_root is not None:
+        from .maintenance_archive import change_file as change
+        kwargs["archive_root"] = Path(archive_root)
+        kwargs["archive_identity"] = archive_identity
+    worker = asyncio.create_task(asyncio.to_thread(change, *args, **kwargs))
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -103,7 +108,7 @@ def root_for(data, source):
 async def reserve(manager, job, item, data, request):
     db = manager.db
     vid = item["video_id"]
-    libs = sorted({a["library_id"] for a in data["assets"]})
+    libs = data["library_ids"] if request.action == "unavailable" else sorted({a["library_id"] for a in data["assets"]})
     scopes = [0] if request.scope == "global" else libs
     async with db._tx() as conn:
         if request.action != "resources":
@@ -120,7 +125,7 @@ async def reserve(manager, job, item, data, request):
 
 async def finish_item(manager, job, item, data, request):
     db, vid = manager.db, item["video_id"]
-    libs = {a["library_id"] for a in data["assets"]}
+    libs = set(data["library_ids"]) if request.action == "unavailable" else {a["library_id"] for a in data["assets"]}
     async with db._tx() as conn:
         for lid in libs:
             if request.action != "resources":
@@ -132,7 +137,8 @@ async def finish_item(manager, job, item, data, request):
         if request.action == "resources" or not request.stop_collection:
             await conn.execute("DELETE FROM collection_exclusions WHERE video_id=? AND job_id=?", (vid, job["id"]))
         else:
-            await conn.execute("UPDATE collection_exclusions SET reason='用户确认主动删除' WHERE video_id=? AND job_id=?", (vid, job["id"]))
+            reason = "用户确认无可用源归档" if request.action == "unavailable" else "用户确认主动删除"
+            await conn.execute("UPDATE collection_exclusions SET reason=? WHERE video_id=? AND job_id=?", (reason, vid, job["id"]))
         await conn.execute("UPDATE maintenance_items SET state='done',error='' WHERE id=?", (item["id"],))
     for lid in libs:
         manager.e.strm._index.pop(lid, None)
@@ -165,9 +171,20 @@ async def apply(manager, job, task):
                     await manager.validate_outputs(item, data)
                     files = [dict(r) for r in await db._all("SELECT * FROM cleanup_files WHERE item_id=? ORDER BY id", (item["id"],))]
                     resumed = item["state"] != "planned"
-                    if not resumed:
+                    if request.action == "unavailable":
+                        from .maintenance_unavailable import source_state, validate_item
+                        if str(e.archive_root().absolute()) != data["archive_root"]:
+                            raise ValueError("归档位置已变化，请重新预览")
+                        if resumed:
+                            if (await source_state(manager, item["video_id"]))[0]:
+                                raise ValueError("影片已有本地可用源，停止后续归档")
+                        else:
+                            if any(Path(f["destination"]).exists() for f in files):
+                                raise ValueError("归档目标已有文件，未处理该影片")
+                            await validate_item(manager, data, paths)
+                    elif not resumed:
                         await manager.validate_assets(data["assets"], request, paths=paths)
-                    else:
+                    if resumed:
                         await manager.validate_resuming(data, files, request)
                     await reserve(manager, job, item, data, request)
                     for file in files:
@@ -179,10 +196,14 @@ async def apply(manager, job, task):
                             file["destination"] = str(root / TRASH_DIR / "maintenance" / str(job["id"]) / Path(file["source"]).relative_to(root))
                         await db._write("UPDATE cleanup_files SET state='prepared',destination=?,error='' WHERE id=?", (file["destination"], file["id"]))
                         current_file = file["id"]
-                        result = await thread_change(file, root)
+                        result = await thread_change(file, root, archive_root=data.get("archive_root"),
+                                                     archive_identity=data.get("archive_identity"))
                         await db._write("UPDATE cleanup_files SET state=?,error='' WHERE id=?", (result, file["id"]))
                         current_file = None
                     await finish_item(manager, job, item, data, request)
+                    if request.action == "unavailable":
+                        from .maintenance_archive import remove_empty_folders
+                        await asyncio.to_thread(remove_empty_folders, data["assets"])
             except (OSError, ValueError) as error:
                 if current_file is not None:
                     await db._write("UPDATE cleanup_files SET error=? WHERE id=?", (str(error), current_file))
@@ -190,8 +211,9 @@ async def apply(manager, job, task):
             await manager.progress(job["id"], preview["id"], item["id"], before)
     await manager.progress(job["id"], preview["id"])
     await manager.record_space(job["id"], preview["id"], "after")
-    await db._write("UPDATE jobs SET params=json_set(params,'$.expires_at',?) WHERE id=?",
-                    (int(time.time()) + request.retention_days * 86400, job["id"]))
+    if request.disposition != "archive":
+        await db._write("UPDATE jobs SET params=json_set(params,'$.expires_at',?) WHERE id=?",
+                        (int(time.time()) + request.retention_days * 86400, job["id"]))
 
 
 async def restore_preview(manager, job, task):
@@ -257,7 +279,8 @@ async def restore(manager, job, task):
                     for a in data["assets"]:
                         await manager.check_asset_root(a)
                     for f in files:
-                        if f["state"] != "restored" and Path(f["source"]).exists() and not (f["state"] == "restoring" and not Path(f["destination"]).exists()):
+                        if f["state"] != "restored" and Path(f["source"]).exists() and not (
+                                f["state"] == "restoring" and (data.get("archive_root") or not Path(f["destination"]).exists())):
                             raise ValueError("原路径冲突，保留两端")
                     for f in files:
                         await e.checkpoint(job["id"])
@@ -265,14 +288,17 @@ async def restore(manager, job, task):
                             continue
                         f["state"] = "restoring"
                         await db._write("UPDATE cleanup_files SET state='restoring' WHERE id=?", (f["id"],))
-                        result = await thread_change(f, root_for(data, f["source"]), restore=True)
+                        if data.get("archive_root") and str(e.archive_root().absolute()) != data["archive_root"]:
+                            raise ValueError("归档目录配置已变化，未恢复")
+                        result = await thread_change(f, root_for(data, f["source"]), restore=True,
+                                                     archive_root=data.get("archive_root"), archive_identity=data.get("archive_identity"))
                         await db._write("UPDATE cleanup_files SET state=? WHERE id=?", (result, f["id"]))
                     remaining = await db._one("SELECT 1 FROM cleanup_files WHERE item_id=? AND state!='restored' LIMIT 1", (data["original_item"],))
                     if remaining:
                         raise ValueError("存在不可恢复或未完成文件，已恢复的保留，禁收保护未解除")
                     async with db._tx() as conn:
                         await conn.execute("UPDATE maintenance_items SET state='restored',error='' WHERE id IN (?,?)", (item["id"], data["original_item"]))
-                        for lid in {a["library_id"] for a in data["assets"]}:
+                        for lid in data.get("library_ids", {a["library_id"] for a in data["assets"]}):
                             async with conn.execute("""SELECT 1 FROM maintenance_items other,json_each(other.data,'$.assets') a
                                 WHERE other.preview_id=? AND other.video_id=? AND json_extract(a.value,'$.library_id')=?
                                 AND other.state!='restored' AND EXISTS(SELECT 1 FROM cleanup_files f WHERE f.item_id=other.id

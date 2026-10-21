@@ -6,7 +6,7 @@ from pathlib import Path
 import secrets
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 import aiosqlite
 
 from .maintenance_files import RESOURCE_TYPES
@@ -18,14 +18,26 @@ from .storage import natural_key
 class CleanupRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     query: AssetFilter = Field(default_factory=AssetFilter)
-    action: Literal["resources", "remove", "reconcile"] = "resources"
+    action: Literal["resources", "remove", "reconcile", "unavailable"] = "resources"
     scope: Literal["library", "global"] = "library"
     resource_types: list[Literal["extra", "poster", "fanart", "thumb", "nfo", "trailer", "subtitle"]] = Field(default_factory=lambda: ["extra"])
     keep_extra: int = Field(3, ge=0, le=10000)
-    disposition: Literal["trash", "permanent"] = "trash"
+    disposition: Literal["trash", "permanent", "archive"] = "trash"
     retention_days: int = Field(7, ge=0, le=365)
     stop_collection: bool = True
     allow_empty: bool = False
+
+    @model_validator(mode="after")
+    def archive_scope(self):
+        if self.action == "unavailable":
+            if self.disposition != "archive" or not self.stop_collection or self.scope != "library":
+                raise ValueError("无可用源核查仅支持指定库归档并停止收录")
+            unsupported = self.query.model_dump(exclude={"library_ids", "video_ids"}, exclude_defaults=True)
+            if unsupported:
+                raise ValueError("无可用源核查仅支持库和影片范围，不支持资料筛选")
+        elif self.disposition == "archive":
+            raise ValueError("归档处置仅用于无可用源核查")
+        return self
 
 
 def selected_files(asset, request):
@@ -158,6 +170,15 @@ async def _preview(manager, job, task, reader):
 
 
 async def preview(manager, job, task):
+    if job["params"]["request"].get("action") == "unavailable":
+        from .maintenance_unavailable import preview as unavailable_preview
+        try:
+            return await unavailable_preview(manager, job)
+        except (OSError, ValueError) as error:
+            current = await manager.db.get_job(job["id"])
+            await manager.db.update_job(job["id"], state={**current["state"], "ready": False,
+                                                        "partial_failure": True, "error": str(error)})
+            raise
     async with manager.db.snapshot_lock:
         async with aiosqlite.connect(manager.db.path, isolation_level=None) as reader:
             reader.row_factory = aiosqlite.Row

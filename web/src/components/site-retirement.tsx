@@ -58,6 +58,9 @@ export function SiteRetirement() {
             它在各输出库里的文件原样搬进归档目录，按库分开，已刮削的整个影片目录放「已刮削」、收件目录里没刮削的 strm 放「未刮削」，媒体库看不到、刮削器也监控不到。
             恢复时原样搬回。只看本地记录，不抓源站、不探测播放。
           </p>
+          <Button size="sm" disabled={busy} onClick={() => { setOpen(false); navigate("maintenance", { tab: "unavailable" }); }}>
+            核查无可用源影片及清退残留
+          </Button>
           {!!records.data?.length && <div className="space-y-2 rounded border border-line p-3">
             <div className="font-medium">已清退</div>
             {records.data.map(r => <div key={r.site} className="flex flex-wrap items-center gap-2">

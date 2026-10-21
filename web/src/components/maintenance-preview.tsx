@@ -2,8 +2,8 @@ import {
   maintenanceBytes as fmtBytes,
   maintenanceStatus,
 } from "@/lib/maintenance";
-import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { fmtNum } from "@/lib/format";
 import { useRun } from "@/lib/queries";
@@ -44,7 +44,7 @@ function Files({ id }: { id: number }) {
         <div key={f.id} className="break-all border-b border-line py-1 text-xs">
           <Mono>{f.source}</Mono> · {resourceNames[f.kind] || f.kind} ·{" "}
           {fmtBytes(f.bytes)} · {maintenanceStatus[f.state] || f.state}
-          {f.destination && <p>回收位置：{f.destination}</p>}
+          {f.destination && <p>归档／回收位置：{f.destination}</p>}
           {f.error && <p className="text-err">{f.error}</p>}
         </div>
       ))}
@@ -70,6 +70,7 @@ export function MaintenancePreview({
   onJob: (id: number) => void;
 }) {
   const run = useRun();
+  const queryClient = useQueryClient();
   const [page, setPage] = useState(0);
   const [files, setFiles] = useState<number>();
   const [busy, setBusy] = useState(false);
@@ -86,6 +87,12 @@ export function MaintenancePreview({
   const preview =
     job?.kind === "maintenance_preview" ||
     job?.kind === "maintenance_restore_preview";
+  useEffect(() => {
+    if (!job || preview || ["running", "paused"].includes(job.status)) return;
+    for (const key of ["maintenance-overview", "maintenance-exclusions", "maintenance-assets", "libraries", "videos", "status"]) {
+      void queryClient.invalidateQueries({ queryKey: [key] });
+    }
+  }, [job?.id, job?.status, preview, queryClient]);
   const restoring = job?.kind.includes("restore");
   const ready =
     preview &&
@@ -109,13 +116,17 @@ export function MaintenancePreview({
                   ? `资源类型：${request.resource_types.map((k) => resourceNames[k]).join("、")}`
                   : request.action === "reconcile"
                     ? "仅清理缺失记录"
+                    : request.action === "unavailable"
+                      ? "归档无可用源影片及清退残留"
                     : "删除影片副本"}
                 ；作用范围：
                 {request.scope === "global" ? "所有库的当前影片版本" : "选定库"}
                 。
               </p>
               {request.action !== "reconcile" && <p>
-                {request.disposition === "permanent" ||
+                {request.disposition === "archive"
+                  ? "全部已确认文件移到库外归档目录，不自动过期。Emby 需刷新媒体库，且不得扫描归档目录。"
+                  : request.disposition === "permanent" ||
                 request.retention_days === 0
                   ? "文件永久删除，无法从本服务恢复。"
                   : `文件移进回收区，保留 ${request.retention_days} 天；不会立即释放磁盘空间。`}
@@ -241,6 +252,10 @@ export function MaintenancePreview({
           {job ? maintenanceStatus[job.status] || job.status : "读取中"}{" "}
           {job?.state.partial_failure && <b className="text-err">有失败项</b>}
         </p>
+        {job?.state.error && <p className="text-err">{job.state.error}。本次核查未完成，不能执行，请处理后重新核查。</p>}
+        {preview && request?.action === "unavailable" && job?.status === "running" && <p className="break-all text-muted">
+          正在核查 {job.state.root || "目录"} · 已读取 {fmtNum(job.state.directories || 0)} 个目录；当前只读，不移动文件。
+        </p>}
         {request && (
           <div className="rounded border border-line p-3">
             <p>
@@ -253,9 +268,15 @@ export function MaintenancePreview({
                 ? `资源清理（额外剧照保留 ${request.keep_extra} 张）`
                 : request.action === "remove"
                   ? "整片清理"
+                  : request.action === "unavailable"
+                    ? "无可用源归档（按本地策略，未探测播放）"
                   : "缺失记录核对"}
               ；{request.scope === "global" ? "全局范围" : "指定库范围"}。
             </p>
+            {request.action === "unavailable" && <>
+              <p className="break-all">归档目录：{job?.state.archive_root || "核查中"}；不自动过期。保留有可用源影片 {fmtNum(job?.state.kept || 0)} 部；未识别目录 {fmtNum(job?.state.unknown || 0)} 个，不会处理。</p>
+              <p>范围包括所选库的外部整理目录和收件区；确认前核对文件清单及所有跳过原因。</p>
+            </>}
             <p>
               预览包含 {fmtNum(job?.state.eligible)} 个可执行组、
               {fmtNum(job?.state.files)} 个文件，
@@ -273,7 +294,7 @@ export function MaintenancePreview({
         {!preview && (
           <p>
             完成 {fmtNum(job?.state.done || 0)} 组；失败{" "}
-            {fmtNum(job?.state.failed || 0)}；回收{" "}
+            {fmtNum(job?.state.failed || 0)}；归档／回收{" "}
             {fmtNum(job?.state.trashed_files || 0)} 个 /{" "}
             {fmtBytes(job?.state.trashed_bytes || 0)}；永久删除{" "}
             {fmtNum(job?.state.deleted_files || 0)} 个 /{" "}
@@ -294,13 +315,13 @@ export function MaintenancePreview({
             ))}
           </details>
         )}
-        <Table>
+        <Table className="min-w-[42rem] table-fixed">
           <thead>
             <tr>
-              <Th>影片 / 命中资料</Th>
-              <Th>范围</Th>
-              <Th>状态</Th>
-              <Th>清单</Th>
+              <Th className="w-[30%]">影片 / 命中资料</Th>
+              <Th className="w-[40%]">范围</Th>
+              <Th className="w-[18%]">状态</Th>
+              <Th className="w-[12%]">清单</Th>
             </tr>
           </thead>
           <tbody>
@@ -309,6 +330,8 @@ export function MaintenancePreview({
                 <Td>
                   <b>{item.data.code || item.data.slug}</b>
                   <p>{item.data.title}</p>
+                  {item.data.reason && <p className="text-xs text-warn">{item.data.reason}</p>}
+                  {item.data.sources && <p className="text-xs text-muted">源：{item.data.sources.map(s => `${s.site} · ${s.status}${s.retired ? "（已清退）" : ""}`).join("；") || "无源记录"}</p>}
                   <p className="text-xs text-muted">
                     {item.data.metadata.release_date ||
                       item.data.metadata.year ||
