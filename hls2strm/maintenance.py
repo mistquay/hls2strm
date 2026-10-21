@@ -20,6 +20,7 @@ class Maintenance:
         self.e, self.db = engine, engine.db
         self.scan_lock = asyncio.Lock()
         self.scan_create_lock = asyncio.Lock()
+        self.unavailable_create_lock = asyncio.Lock()
 
     def roots(self, lib):
         # 输出目录是整理前的收件目录，MDCNG 的最终目录才是维护对象。
@@ -39,6 +40,21 @@ class Maintenance:
     async def create(self, kind, params):
         names = {"maintenance_scan": "扫描磁盘与 NFO", "maintenance_preview": "媒体清理预览",
                  "maintenance_restore_preview": "回收恢复预览"}
+        if kind == "maintenance_preview" and params.get("request", {}).get("action") == "unavailable":
+            def scope(values):
+                query = values["request"]["query"]
+                return (sorted(set(query.get("library_ids") or self.e.libs)), sorted(set(query.get("video_ids") or [])))
+
+            async with self.unavailable_create_lock:
+                active = await self.db._all("SELECT id,params FROM jobs WHERE kind='maintenance_preview' "
+                    "AND status IN ('running','paused') AND json_extract(params,'$.request.action')='unavailable' ORDER BY id DESC", browse=True)
+                for previous in active:
+                    if scope(json.loads(previous["params"])) == scope(params):
+                        return previous["id"]
+                job = await self.db.create_job(kind, "无可用源归档预览", params)
+                await self.db.add_tasks(job, kind, ["all"], 20)
+                self.e.notify()
+                return job
         if kind == "maintenance_scan":
             params["library_ids"] = sorted(set(params.get("library_ids") or self.e.libs))
             for lid in params["library_ids"]:
@@ -56,8 +72,7 @@ class Maintenance:
                 await self.db.add_tasks(job, kind, ["all"], 20)
                 self.e.notify()
                 return job
-        name = "无可用源归档预览" if kind == "maintenance_preview" and params.get("request", {}).get("action") == "unavailable" else names[kind]
-        job = await self.db.create_job(kind, name, params)
+        job = await self.db.create_job(kind, names[kind], params)
         await self.db.add_tasks(job, kind, ["all"], 20)
         self.e.notify()
         return job

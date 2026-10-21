@@ -65,9 +65,11 @@ function Files({ id }: { id: number }) {
 export function MaintenancePreview({
   jobId,
   onJob,
+  onClose,
 }: {
   jobId: number;
   onJob: (id: number) => void;
+  onClose: () => void;
 }) {
   const run = useRun();
   const queryClient = useQueryClient();
@@ -89,7 +91,7 @@ export function MaintenancePreview({
     job?.kind === "maintenance_restore_preview";
   useEffect(() => {
     if (!job || preview || ["running", "paused"].includes(job.status)) return;
-    for (const key of ["maintenance-overview", "maintenance-exclusions", "maintenance-assets", "libraries", "videos", "status"]) {
+    for (const key of ["maintenance-jobs", "maintenance-overview", "maintenance-exclusions", "maintenance-assets", "libraries", "videos", "status"]) {
       void queryClient.invalidateQueries({ queryKey: [key] });
     }
   }, [job?.id, job?.status, preview, queryClient]);
@@ -160,7 +162,7 @@ export function MaintenancePreview({
           setPage(0);
           onJob(r.job_id);
         },
-        { invalidate: [["maintenance-overview"]] },
+        { invalidate: [["maintenance-jobs"], ["maintenance-overview"]] },
       );
     } finally {
       setBusy(false);
@@ -169,7 +171,7 @@ export function MaintenancePreview({
   const control = async (action: string) => {
     if (!job) return;
     await run(() => api.post(`/api/jobs/${job.id}/${action}`), {
-      invalidate: [["maintenance-job"], ["jobs"]],
+      invalidate: [["maintenance-job"], ["maintenance-jobs"], ["jobs"]],
     });
   };
   return (
@@ -178,6 +180,7 @@ export function MaintenancePreview({
       className="max-w-5xl"
       footer={
         <>
+          <Button disabled={busy} onClick={onClose}>{job && ["running", "paused"].includes(job.status) ? "关闭并稍后查看" : "关闭"}</Button>
           {job?.status === "running" && (
             <>
               <Button onClick={() => control("pause")}>暂停</Button>
@@ -252,9 +255,11 @@ export function MaintenancePreview({
           {job ? maintenanceStatus[job.status] || job.status : "读取中"}{" "}
           {job?.state.partial_failure && <b className="text-err">有失败项</b>}
         </p>
+        <p className="text-xs text-muted">关闭弹窗不会停止后台任务。可从本页任务记录或通用任务详情重新打开；刷新页面会恢复当前任务。</p>
         {job?.state.error && <p className="text-err">{job.state.error}。本次核查未完成，不能执行，请处理后重新核查。</p>}
         {preview && request?.action === "unavailable" && job?.status === "running" && <p className="break-all text-muted">
-          正在核查 {job.state.root || "目录"} · 已读取 {fmtNum(job.state.directories || 0)} 个目录；当前只读，不移动文件。
+          {job.state.scan_phase === "preparing" ? "正在建立本地影片索引" : job.state.scan_phase === "planning" ? "正在核对归档清单" : `正在核查 ${job.state.root || "目录"}`}
+          {" "}· 已读取 {fmtNum(job.state.directories || 0)} 个目录；当前只读，不移动文件。
         </p>}
         {request && (
           <div className="rounded border border-line p-3">

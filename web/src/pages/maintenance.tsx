@@ -3,13 +3,12 @@ import { MaintenanceOptions } from "@/components/maintenance-options";
 import { MaintenanceAssets } from "@/components/maintenance-assets";
 import { MaintenanceSpace, type Root } from "@/components/maintenance-space";
 import { MaintenanceScan } from "@/components/maintenance-scan";
-import { maintenanceStatus } from "@/lib/maintenance";
+import { MaintenanceJobs } from "@/components/maintenance-jobs";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
-import { fmtTime } from "@/lib/format";
 import { useLibraries, useRun } from "@/lib/queries";
-import { navigate, useRoute } from "@/lib/route";
+import { replaceParams, useRoute } from "@/lib/route";
 import {
   type Asset,
   type AssetFilter,
@@ -40,7 +39,14 @@ export default function Maintenance() {
   const run = useRun();
   const queryClient = useQueryClient();
   const { data: libs = [] } = useLibraries(true);
-  const [view, setView] = useState(() => route.params.get("tab") === "unavailable" ? "unavailable" : "assets");
+  const tab = route.params.get("tab") || "assets";
+  const view = ["space", "assets", "cleanup", "differences", "unavailable", "history"].includes(tab) ? tab : "assets";
+  const setView = (value: string) => {
+    const params = new URLSearchParams(route.params);
+    params.set("tab", value);
+    params.delete("job");
+    replaceParams(params);
+  };
   const [query, setQuery] = useState<AssetFilter>(() => {
     let video: Record<string, unknown> = {};
     try {
@@ -67,7 +73,15 @@ export default function Maintenance() {
   const [selection, setSelection] = useState<Set<number>>(new Set());
   const [all, setAll] = useState(false);
   const [excluded, setExcluded] = useState<Set<number>>(new Set());
-  const [jobId, setJobId] = useState<number>();
+  const requestedJob = Number(route.params.get("job"));
+  const jobId = Number.isSafeInteger(requestedJob) && requestedJob > 0 ? requestedJob : undefined;
+  const setJobId = (id?: number) => {
+    const params = new URLSearchParams(route.params);
+    params.set("tab", view);
+    if (id) params.set("job", String(id));
+    else params.delete("job");
+    replaceParams(params);
+  };
   const [busy, setBusy] = useState(false);
   const [scanSubmitting, setScanSubmitting] = useState(false);
   const [binding, setBinding] = useState<Asset>();
@@ -150,6 +164,7 @@ export default function Maintenance() {
     invalidate: [
       ["maintenance-assets"],
       ["maintenance-overview"],
+      ["maintenance-jobs"],
       ["maintenance-exclusions"],
       ["libraries"],
     ],
@@ -304,19 +319,23 @@ export default function Maintenance() {
       {view === "space" && (
         <MaintenanceSpace overview={overview} query={query} libs={libs} />
       )}
-      {view === "unavailable" && <Panel title="无可用源影片与清退残留核查">
+      {view === "unavailable" && <><Panel title="无可用源影片与清退残留核查">
         <div className="space-y-3 py-3 text-sm">
           <p>只看本地源状态、站点启停及支持的线路，不请求源站、不探测播放。站点停用、线路全停用也计为无可用源，不仅限于已清退站点；“本地可用”不等于已经验证能播放。</p>
           <p>按 STRM 内容识别已改名、移动或失去输出记录的影片；只剩 NFO 的目录需能唯一关联影片，普通版与其他版本有歧义时跳过。</p>
           <p>确认后将独占影片目录内全部文件（STRM、NFO、图片、字幕、预告片等）移到库外归档目录，停止所选库重新收录。平铺收件区仅归档明确属于影片的 STRM；共享整理目录、身份冲突、链接和实体视频保留并说明原因。</p>
           <p className="break-all">归档目录：{overview.data?.archive_root || "读取中"}。归档不自动过期，不是永久删除，也不保证释放源磁盘空间；请确保 Emby 没有扫描此目录。</p>
           <p className="text-warn">预览只读取文件并保存清单；确认执行前请暂停外部刮削写入。文件移出后仍需 Emby 刷新媒体库，本功能不调用 Emby API。</p>
+          <p>提交后可关闭弹窗，任务继续后台运行。完成后从下方任务记录打开原预览，无需一直等待或重新扫描；同范围核查未结束时再次点击会打开原任务。</p>
           {!!query.video_ids?.length && <p>仅核查从影片库带入的 {query.video_ids.length} 部影片。</p>}
-          <Button variant="primary" disabled={busy || activeScan || !!overview.error} onClick={unavailablePreview}>
-            {busy ? "提交中…" : "只读核查并生成归档预览"}
-          </Button>
+          <div className="flex flex-wrap gap-2">
+            <Button variant="primary" disabled={busy || activeScan || !!overview.error} onClick={unavailablePreview}>
+              {busy ? "提交中…" : "只读核查并生成归档预览"}
+            </Button>
+            <Button onClick={() => document.getElementById("unavailable-tasks")?.scrollIntoView({ behavior: "smooth", block: "start" })}>查看任务记录</Button>
+          </div>
         </div>
-      </Panel>}
+      </Panel><MaintenanceJobs category="unavailable" onJob={setJobId} /></>}
       {!["space", "history", "unavailable"].includes(view) && (
         <>
           <MaintenanceFilters query={query} update={update} />
@@ -378,64 +397,7 @@ export default function Maintenance() {
       )}
       {view === "history" && (
         <>
-          <Panel title="维护任务与恢复">
-            <Table>
-              <thead>
-                <tr>
-                  <Th>任务</Th>
-                  <Th>状态</Th>
-                  <Th>时间</Th>
-                  <Th>操作</Th>
-                </tr>
-              </thead>
-              <tbody>
-                {overview.data?.jobs.map((job) => (
-                  <tr key={job.id}>
-                    <Td>
-                      #{job.id} {job.name}
-                    </Td>
-                    <Td>
-                      {maintenanceStatus[job.status] || job.status}
-                      {job.state.partial_failure && (
-                        <b className="ml-2 text-err">有失败项</b>
-                      )}
-                    </Td>
-                    <Td>{fmtTime(job.created_at)}</Td>
-                    <Td>
-                      <div className="flex flex-wrap gap-2">
-                        <Button
-                          size="sm"
-                          onClick={() =>
-                            job.kind === "maintenance_scan"
-                              ? navigate("jobs", { q: String(job.id) })
-                              : setJobId(job.id)
-                          }
-                        >
-                          查看
-                        </Button>
-                        {job.kind === "maintenance_apply" &&
-                          !["running", "paused"].includes(job.status) && (
-                            <Button
-                              size="sm"
-                              onClick={() =>
-                                run(async () => {
-                                  const r = await api.post<{ job_id: number }>(
-                                    `/api/maintenance/jobs/${job.id}/restore-preview`,
-                                  );
-                                  setJobId(r.job_id);
-                                }, refresh)
-                              }
-                            >
-                              预览恢复
-                            </Button>
-                          )}
-                      </div>
-                    </Td>
-                  </tr>
-                ))}
-              </tbody>
-            </Table>
-          </Panel>
+          <MaintenanceJobs onJob={setJobId} />
           <Panel title="已停止收录">
             <Table>
               <thead>
@@ -515,7 +477,7 @@ export default function Maintenance() {
         onOpenChange={(open) => !open && setJobId(undefined)}
       >
         {jobId && (
-          <MaintenancePreview key={jobId} jobId={jobId} onJob={setJobId} />
+          <MaintenancePreview key={jobId} jobId={jobId} onJob={setJobId} onClose={() => setJobId(undefined)} />
         )}
       </Dialog>
     </div>

@@ -117,6 +117,7 @@ export interface MaintenanceJob {
   created_at: number;
   finished_at?: number;
   params: { request?: CleanupConfig; preview_id?: number; restore_of?: number; library_ids?: number[]; force?: boolean };
+  operation_request?: CleanupConfig | null;
   state: {
     scan_phase?: string;
     root?: string;

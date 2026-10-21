@@ -104,6 +104,34 @@ async def preview(body: CleanupRequest, request: Request):
     return await execute(request, body.model_dump(), create)
 
 
+@router.get("/maintenance/jobs")
+async def jobs(request: Request, category: Literal["all", "unavailable"] = "all",
+               status: Literal["", "active", "running", "paused", "done", "cancelled"] = "",
+               offset: int = Query(0, ge=0), limit: int = Query(20, ge=1, le=100)):
+    db = _ctx(request).db
+    # 执行和恢复任务沿已有引用找到原预览，分类不依赖任务名称。
+    tables = """jobs j
+        LEFT JOIN jobs p ON p.id=json_extract(j.params,'$.preview_id')
+        LEFT JOIN jobs original ON original.id=COALESCE(json_extract(j.params,'$.restore_of'),json_extract(p.params,'$.restore_of'))
+        LEFT JOIN jobs original_preview ON original_preview.id=json_extract(original.params,'$.preview_id')"""
+    operation = "COALESCE(json_extract(j.params,'$.request'),json_extract(p.params,'$.request'),json_extract(original_preview.params,'$.request'))"
+    condition = "j.kind IN ('maintenance_scan','maintenance_preview','maintenance_apply','maintenance_restore_preview','maintenance_restore')"
+    args = []
+    if category == "unavailable":
+        condition += f" AND json_extract({operation},'$.action')='unavailable'"
+    if status == "active":
+        condition += " AND j.status IN ('running','paused')"
+    elif status:
+        condition += " AND j.status=?"
+        args.append(status)
+    total = await db._one(f"SELECT COUNT(*) AS n FROM {tables} WHERE {condition}", args, browse=True)
+    rows = await db._all(f"SELECT j.id,j.kind,j.name,j.status,j.state,j.params,j.created_at,j.finished_at,{operation} AS operation_request "
+                         f"FROM {tables} WHERE {condition} ORDER BY j.id DESC LIMIT ? OFFSET ?", (*args, limit, offset), browse=True)
+    return {"items": [{**dict(r), "state": json.loads(r["state"]), "params": json.loads(r["params"]),
+                       "operation_request": json.loads(r["operation_request"]) if r["operation_request"] else None} for r in rows],
+            "total": total["n"], "offset": offset, "limit": limit}
+
+
 @router.get("/maintenance/jobs/{job_id}")
 async def details(job_id: int, request: Request, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):
     try:

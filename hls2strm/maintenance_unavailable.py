@@ -104,12 +104,14 @@ async def preview(manager, job):
     archive_identity = await asyncio.to_thread(check_root, archive_root)
     lids = sorted(set(request.query.library_ids or e.libs))
     scan_roots = roots(manager, lids)
+    await db.update_job(job["id"], state={"scan_phase": "preparing", "archive_root": str(archive_root)})
     keys = {slug: vid for vid, slug in await db.video_keys()}
     cdn = await db.cdn_video_map()
     groups, states, counts = {}, {}, Counter()
     await db._write("DELETE FROM cleanup_files WHERE item_id IN (SELECT id FROM maintenance_items WHERE preview_id=?)", (job["id"],))
     await db._write("DELETE FROM maintenance_items WHERE preview_id=?", (job["id"],))
     for lid, root, inbox in scan_roots:
+        await db.update_job(job["id"], state={**dict(counts), "scan_phase": "walking", "root": str(root), "archive_root": str(archive_root)})
         identity = await asyncio.to_thread(safe_directory, root)
         iterator = walk(root, keys, cdn)
         try:
@@ -163,7 +165,7 @@ async def preview(manager, job):
                         group["error"] = group["error"] or error
                         counts["assets"] += 1
                     counts["directories"] += 1
-                await db.update_job(job["id"], state={**dict(counts), "root": str(root)})
+                await db.update_job(job["id"], state={**dict(counts), "scan_phase": "walking", "root": str(root), "archive_root": str(archive_root)})
         finally:
             iterator.close()
         if identity != await asyncio.to_thread(safe_directory, root):
@@ -202,7 +204,7 @@ async def preview(manager, job):
                 counts["bytes"] += sum(stamp[2] for _, stamp, _ in files.values())
         counts["checked"] += 1
         counts["skipped" if error else "eligible"] += 1
-        await db.update_job(job["id"], state=dict(counts))
+        await db.update_job(job["id"], state={**dict(counts), "scan_phase": "planning", "archive_root": str(archive_root)})
     if config != manager.configuration():
         raise ValueError("核查期间库配置已变化，请重新核查")
     await db.update_job(job["id"], state={**dict(counts), "ready": True, "configuration": config,
