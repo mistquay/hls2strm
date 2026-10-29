@@ -10,14 +10,20 @@ import { api, type ChangeSet, type Job, type MissingOutput, type Page, type Pref
 import { fmtNum, fmtTime } from "@/lib/format";
 import { STRM_KINDS } from "@/lib/labels";
 import { useLibraries, useRun, useStatus } from "@/lib/queries";
+import { navigate, useRoute } from "@/lib/route";
 
 const kindTone = (k: string) => (k === "ours" ? "ok" : k === "invalid" ? "err" : "neutral");
 
 export default function Strm() {
+  const route = useRoute();
+  const libraryId = Number(route.params.get("library")) || undefined;
+  const libraries = useLibraries();
+  const library = libraries.data?.find(lib => lib.id === libraryId);
   const { data: status } = useStatus();
   const run = useRun();
   const qc = useQueryClient();
-  const [dir, setDir] = useState("");
+  const [dir, setDir] = useState<string | null>(null);
+  const scanDir = dir ?? (library?.external_root || library?.root || "");
   const [scanId, setScanId] = useState<number | null>(null);
   const scansQuery = useQuery({
     queryKey: ["scans"],
@@ -26,8 +32,8 @@ export default function Strm() {
   });
   const scans = scansQuery.data ?? [];
   useEffect(() => {
-    if (scanId == null && scans.length) setScanId(scans[0].id);
-  }, [scans, scanId]);
+    if (scanId == null && scans.length && !libraryId) setScanId(scans[0].id);
+  }, [scans, scanId, libraryId]);
   const scan = scans.find(j => j.id === scanId);
   const summaryQuery = useQuery({
     queryKey: ["scan-summary", scanId, scan?.status],
@@ -37,7 +43,7 @@ export default function Strm() {
   const summary = summaryQuery.data;
 
   const startScan = async () => {
-    const r = await run(() => api.post<{ job_id: number }>("/api/strm/scan", { dir }), {
+    const r = await run(() => api.post<{ job_id: number }>("/api/strm/scan", { dir: scanDir }), {
       success: r => `已开始扫描（任务 #${r.job_id}）`,
       invalidate: [["scans"], ["jobs"]],
     });
@@ -54,18 +60,19 @@ export default function Strm() {
 
   return (
     <>
-      <Panel title="扫描 strm">
+      <Notice tone="info">先扫描 STRM，再分别选择纳管或改前缀。扫描不改媒体文件；纳管会改地址且可能搬文件，改前缀只改 STRM 内容。{library && `当前默认纳管目标：${library.name}；扫描目录与目标库是两回事，请分别核对。`}</Notice>
+      <Panel title="扫描已有 STRM（不改文件）">
         <div className="flex flex-wrap items-end gap-3">
-          <Field label="目录（留空 = 输出根目录；也可以是别的工具生成 strm 的目录）" className="min-w-[300px] flex-1">
-            <Input value={dir} onChange={e => setDir(e.target.value)} placeholder={status?.output_dir} />
+          <Field label="扫描目录（留空 = 输出根目录，不代表扫描所有外部目录）" className="min-w-0 basis-full sm:flex-1">
+            <Input value={scanDir} onChange={e => setDir(e.target.value)} placeholder={status?.output_dir} />
           </Field>
-          <Button variant="primary" onClick={startScan} disabled={run.busy}>
+          <Button variant="primary" onClick={startScan} disabled={run.busy || !!libraryId && !library}>
             <FolderSearch />
             开始扫描
           </Button>
           <Field label="看哪次扫描" className="w-[340px] max-w-full">
-            <Select value={scanId ?? ""} onChange={e => setScanId(Number(e.target.value))} disabled={!scans.length}>
-              {scans.length === 0 && <option value="">还没扫描过</option>}
+            <Select value={scanId ?? ""} onChange={e => setScanId(Number(e.target.value) || null)} disabled={!scans.length}>
+              <option value="">{scans.length ? "选择一次扫描或先扫描当前目录" : "还没扫描过"}</option>
               {scans.map(j => (
                 <option key={j.id} value={j.id}>
                   #{j.id} {String(j.params.dir ?? "")} · {fmtTime(j.created_at)}
@@ -84,7 +91,7 @@ export default function Strm() {
       {summary && scanId && (
         <>
           <div className="grid gap-4 xl:grid-cols-2">
-            <Adopt scanId={scanId} />
+            <Adopt key={`${scanId}:${libraryId || 0}`} scanId={scanId} initialLibraryId={libraryId} />
             <PrefixChange scanId={scanId} old={prefixOld} setOld={setPrefixOld} onApplied={refreshScan} />
           </div>
           <Files scanId={scanId} dir={String(summary.job.params.dir ?? "")} prefix={filePrefix} setPrefix={setFilePrefix} />
@@ -129,7 +136,8 @@ function Summary({ summary, onPrefix, onFilter }: { summary: ScanSummary; onPref
         <div className="rounded-md border border-line p-3">
           <div className="mb-2 flex items-center gap-2">
             <h4 className="text-sm font-semibold">库里有记录但文件缺失</h4>
-            <span className="text-xs text-muted">对相应的库执行「核对并补回」或「重写输出」即可重新生成。</span>
+            <span className="text-xs text-muted">此扫描范围找不到，不代表已经删除。改名/移动先找回位置；主动删除且不想补回，用“手动删除后”；误删想重建才选补回。</span>
+            <Button size="sm" onClick={() => navigate("maintenance")}>选择正确处理方式</Button>
             <Button size="icon-sm" variant="ghost" className="ml-auto" onClick={() => setShowMissing(false)} aria-label="收起">
               <X />
             </Button>
@@ -204,14 +212,19 @@ function Summary({ summary, onPrefix, onFilter }: { summary: ScanSummary; onPref
   );
 }
 
-function Adopt({ scanId }: { scanId: number }) {
+function Adopt({ scanId, initialLibraryId }: { scanId: number; initialLibraryId?: number }) {
   const { data: libs = [] } = useLibraries();
   const run = useRun();
-  const [f, setF] = useState({ library_id: 0, kinds: ["ours", "cdn"], fetch_missing: true, prefix: "" });
+  const [f, setF] = useState({ library_id: initialLibraryId || 0, kinds: ["ours", "cdn"], fetch_missing: true, prefix: "" });
   const toggleKind = (k: string) => setF(p => ({ ...p, kinds: p.kinds.includes(k) ? p.kinds.filter(x => x !== k) : [...p.kinds, k] }));
   const start = async () => {
-    if (f.kinds.includes("named") && !(await ask("纳管「文件名识别」的文件？", "这些文件的内容会被改成本服务的地址。确认它们都是对应站点的影片（不是 115、alist 里同番号的其他片源）再继续。", { confirmText: "继续纳管" })))
-      return;
+    const target = libs.find(lib => lib.id === f.library_id);
+    if (!(await ask("确认纳管范围与文件影响", <div className="space-y-3">
+      <p>扫描 #{scanId}；目标：{target?.name || "按文件所在目录匹配库，不在库内的跳过"}；类型：{f.kinds.map(kind => STRM_KINDS[kind]).join("、")}；前缀：{f.prefix || "不限"}。</p>
+      <p>这不是仅登记路径：会把 STRM 改成本服务地址。普通库按模板归位，可能搬动同名 NFO/主图并删除旧 STRM；外部库通常原地更新 STRM。缺影片时{f.fetch_missing ? "会尝试从 Jable 抓详情，后续输出可能补资源" : "跳过，不联网补详情"}。</p>
+      {f.kinds.includes("named") && <p className="text-err">已选仅按文件名识别：115、Alist 等其他片源可能同番号，请确认它们确实应该替换成本服务源。</p>}
+      <p className="text-warn">先核对扫描清单和目标库，暂停外部整理写入；纳管不能替代跨库移动后的旧关联清理。</p>
+    </div>, { confirmText: "确认改写并纳管", danger: true }))) return;
     await run(() => api.post<{ job_id: number }>("/api/strm/adopt", { scan_id: scanId, ...f, library_id: f.library_id || null }), {
       success: r => `已创建纳管任务 #${r.job_id}，完成后重新扫描可以看到结果`,
       invalidate: [["jobs"]],
@@ -219,7 +232,7 @@ function Adopt({ scanId }: { scanId: number }) {
   };
   return (
     <Panel title="纳管">
-      <p className="mb-3 text-[13px] text-muted">把识别出的影片关联到输出库：文件按库的目录结构归位，内容改成本服务的地址，之后随重写、改前缀一起维护。</p>
+      <p className="mb-3 text-[13px] text-muted">建立输出关联并改写 STRM 地址，不是仅登记路径。普通库可能按模板移动文件、删除旧 STRM；外部库通常原地更新。缺影片时目前只尝试 Jable 详情。</p>
       <div className="grid gap-3 sm:grid-cols-2">
         <Field label="放进哪个库">
           <Select value={f.library_id} onChange={e => setF({ ...f, library_id: Number(e.target.value) })}>
@@ -246,8 +259,8 @@ function Adopt({ scanId }: { scanId: number }) {
         </Check>
       </div>
       <p className="mt-2 text-xs text-muted">「文件名识别」可能是 115、alist 里同番号的其他片源，确认后再勾。</p>
-      <Button variant="primary" className="mt-3" onClick={start} disabled={!f.kinds.length}>
-        开始纳管
+      <Button variant="primary" className="mt-3" onClick={start} disabled={!f.kinds.length || run.busy || !!f.library_id && !libs.some(lib => lib.id === f.library_id)}>
+        确认范围后纳管
       </Button>
     </Panel>
   );

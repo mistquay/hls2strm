@@ -7,7 +7,6 @@ import { navigate } from "@/lib/route";
 import { useReorder } from "@/components/use-reorder";
 import { Chip, Mono, Notice, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Select, Switch, Textarea } from "@/components/ui/form";
-import { rewriteAll } from "@/lib/actions";
 import { api, type LineConfig, type LineSpecMeta, type SchemaProp, type SettingsResponse, type SettingsValues, type SiteConfig } from "@/lib/api";
 import { DOMAIN_MODES, PLAY_MODES, RESOLVE_MODES, VARIANT_MODES } from "@/lib/labels";
 import { useMeta, useRun } from "@/lib/queries";
@@ -254,8 +253,8 @@ export default function Settings() {
             actions={
               <>
               {data.output_sync.job_id && <Button size="sm" onClick={()=>navigate("jobs",{job:String(data.output_sync!.job_id)})}>查看同步任务 #{data.output_sync.job_id}</Button>}
-              {!["running","paused","synced"].includes(data.output_sync.status) && <Button size="sm" variant="primary" disabled={run.busy} onClick={() => rewriteAll(run).then(() => qc.invalidateQueries({queryKey:["settings"]}))}>
-                重写全部输出
+              {!["running","paused","synced"].includes(data.output_sync.status) && <Button size="sm" variant="primary" onClick={() => navigate("maintenance")}>
+                去媒体库管理确认重写
               </Button>}
               </>
             }

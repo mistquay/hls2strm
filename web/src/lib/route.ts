@@ -1,6 +1,7 @@
 // hash 路由：#/videos?site=jable。后端只在 / 提供页面，用 hash 不用改服务端；旧版的 #videos 也认得
 
 import { useMemo, useSyncExternalStore } from "react";
+import { canonicalRoute } from "./library-management";
 
 export interface Route {
   page: string;
@@ -10,7 +11,7 @@ export interface Route {
 function parse(hash: string): Route {
   const raw = hash.replace(/^#\/?/, "");
   const [page, query = ""] = raw.split("?", 2);
-  return { page: page || "overview", params: new URLSearchParams(query) };
+  return canonicalRoute(page || "overview", new URLSearchParams(query));
 }
 
 function subscribe(cb: () => void) {

@@ -7,7 +7,6 @@ import { CrawlResults, JobLogs } from "@/components/job-history";
 import { PrefixProgress } from "@/components/prefix-crawl";
 import { TaskFilePreview } from "@/components/task-file-preview";
 import { navigate } from "@/lib/route";
-import { defaultVerifyOptions, verifyHint, VerifyOptions, verifyParams } from "@/components/verify-options";
 import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, KV, Mono, Panel, Progress, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Segmented, Select, Textarea } from "@/components/ui/form";
@@ -19,7 +18,7 @@ import { useJobs, useLibraries, useMeta, useRun, useStatus } from "@/lib/queries
 import { replaceParams, useRoute } from "@/lib/route";
 import { cn } from "@/lib/utils";
 
-type Kind = "list" | "videos" | "backfill" | "probe" | "quality" | "verify" | "rewrite";
+type Kind = "list" | "videos" | "backfill" | "probe" | "quality";
 
 const KINDS: { value: Kind; label: string }[] = [
   { value: "list", label: "列表地址" },
@@ -27,8 +26,6 @@ const KINDS: { value: Kind; label: string }[] = [
   { value: "probe", label: "补源" },
   { value: "quality", label: "画质探测" },
   { value: "backfill", label: "补全详情" },
-  { value: "verify", label: "核对输出" },
-  { value: "rewrite", label: "重写输出" },
 ];
 
 export const jobTotal = (j: Job) => Object.values(j.tasks).reduce((a, b) => a + (b ?? 0), 0);
@@ -187,17 +184,15 @@ function NewJob() {
   const run = useRun();
   const [kind, setKind] = useState<Kind>("list");
   const [f, setF] = useState({ site: "jable", source: "", sort: "post_date", start_page: 1, end_page: 0, detail: true, urls: "", library_id: 1 });
-  const [verify, setVerify] = useState(defaultVerifyOptions);
   const set = (patch: Partial<typeof f>) => setF(prev => ({ ...prev, ...patch }));
   const site = meta.site(f.site);
-  const allLibs = kind === "rewrite" || kind === "probe" || kind === "verify" || kind === "quality";
+  const allLibs = kind === "probe" || kind === "quality";
 
   const create = async () => {
     const body: Record<string, unknown> = { kind };
     if (kind === "list") Object.assign(body, { site: f.site, source: f.source, sort: f.sort, start_page: f.start_page || 1, end_page: f.end_page || 0, detail: f.detail });
     if (kind === "videos") Object.assign(body, { site: f.site, urls: f.urls });
     if (kind === "probe") body.site = f.site;
-    if (kind === "verify") Object.assign(body, verifyParams(verify));
     if (kind !== "backfill" && f.library_id) body.library_id = f.library_id;
     await run(() => api.post<{ id: number }>("/api/jobs", body), { success: r => `已创建任务 #${r.id}`, invalidate: [["jobs"], ["status"]] });
   };
@@ -209,12 +204,10 @@ function NewJob() {
     probe: "给库里的影片找备用源：按番号到所选站点逐部查找（每部一次请求），找到就挂成这部影片的另一个源，播放时原来的源不能用会自动换过去。某个站没有的影片，在「补源重查间隔」内不再重复查。",
     quality:
       "给还不知道画质的源认出分辨率：取播放地址、读一次播放列表（多码率的直接写着各档分辨率，Jable 这种单档的抽几个分片按码率估）。多线路的源每条线路各探一次，mp4 线路认不出、跳过。地址过期的要重新访问源站（详情页、播放页），按站点限速排队，影片多时要跑很久；平时抓详情、播放时已经会顺手探测（只请求 CDN），一般不用跑全库。",
-    verify: verifyHint,
-    rewrite: "改了对外地址、播放模式、令牌或路径模板以后，用它重写已有的 strm 和 nfo（不联网），路径变了会搬动文件。",
   };
 
   return (
-    <Panel title="新建任务">
+    <Panel title="新建抓取 / 补源任务" actions={<Button size="sm" onClick={() => navigate("maintenance", f.library_id ? {library: String(f.library_id)} : {})}>核对、重写与清理 → 媒体库管理</Button>}>
       <Segmented value={kind} onChange={setKind} options={KINDS} className="mb-4 flex-wrap" />
       <div className="flex flex-wrap items-end gap-3">
         {(kind === "list" || kind === "videos" || kind === "probe") && (
@@ -271,9 +264,6 @@ function NewJob() {
               抓详情
             </Check>
           </>
-        )}
-        {kind === "verify" && (
-          <VerifyOptions value={verify} onChange={setVerify} />
         )}
         <Button variant="primary" onClick={create} disabled={run.busy}>
           {run.busy ? "正在提交…" : "创建任务"}

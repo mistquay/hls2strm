@@ -5,11 +5,14 @@ import { MaintenanceSpace, type Root } from "@/components/maintenance-space";
 import { MaintenanceScan } from "@/components/maintenance-scan";
 import { MaintenanceJobs } from "@/components/maintenance-jobs";
 import { MetadataFallback } from "@/components/metadata-fallback";
+import { LibraryManagementHome } from "@/components/library-management-home";
+import Strm from "./strm";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { useLibraries, useRun } from "@/lib/queries";
 import { replaceParams, useRoute } from "@/lib/route";
+import { cleanupDefaults, managementLibraryIds, managementParams, managementTabs, managementView, type ManagementView } from "@/lib/library-management";
 import {
   type Asset,
   type AssetFilter,
@@ -37,17 +40,28 @@ interface Exclusion {
 }
 export default function Maintenance() {
   const route = useRoute();
+  const view = managementView(route.params);
+  const scope = ["library", "libraries", "ids", "filter"].map(key => route.params.get(key) || "").join("|");
+  const resetScope = ["metadata", "strm"].includes(view) && ["libraries", "ids", "filter"].some(key => route.params.has(key));
+  return <div className="space-y-4">
+    <nav aria-label="媒体库管理" className="flex flex-wrap gap-2">
+      {managementTabs.map(([key, label]) => <Button key={key} aria-current={view === key ? "page" : undefined}
+        variant={view === key ? "primary" : "outline"} onClick={() => replaceParams(managementParams(route.params, key))}>{label}</Button>)}
+    </nav>
+    {resetScope ? <Panel title="此工具不按影片筛选执行"><p className="mb-4 text-sm">资料补全按单个库、STRM 工具按扫描目录执行，不能套用带入的影片筛选或多库选择。为避免扩大操作范围，请明确清除原筛选后再选择目标。</p><Button onClick={() => {
+      const params = new URLSearchParams(route.params);
+      for (const key of ["libraries", "ids", "filter", "job"]) params.delete(key);
+      replaceParams(params);
+    }}>清除原筛选，重新选择目标</Button></Panel> : view === "center" ? <LibraryManagementHome /> : view === "metadata" ? <MetadataFallback /> : view === "strm" ? <Strm key={scope} /> :
+      <MaintenanceWorkspace key={scope} view={view} />}
+  </div>;
+}
+
+function MaintenanceWorkspace({view}: {view: ManagementView}) {
+  const route = useRoute();
   const run = useRun();
   const queryClient = useQueryClient();
   const { data: libs = [] } = useLibraries(true);
-  const tab = route.params.get("tab") || "assets";
-  const view = ["space", "assets", "cleanup", "differences", "unavailable", "history", "metadata"].includes(tab) ? tab : "assets";
-  const setView = (value: string) => {
-    const params = new URLSearchParams(route.params);
-    params.set("tab", value);
-    params.delete("job");
-    replaceParams(params);
-  };
   const [query, setQuery] = useState<AssetFilter>(() => {
     let video: Record<string, unknown> = {};
     try {
@@ -57,8 +71,8 @@ export default function Maintenance() {
     }
     return {
       source: "nfo",
-      library_ids: route.params.get("library")
-        ? [Number(route.params.get("library"))]
+      library_ids: managementLibraryIds(route.params).length
+        ? managementLibraryIds(route.params)
         : video.library_id
           ? [Number(video.library_id)]
           : [],
@@ -68,6 +82,7 @@ export default function Maintenance() {
         .map(Number),
       video,
       sort: "bytes",
+      status: view === "differences" ? "missing" : "",
     };
   });
   const [page, setPage] = useState(0);
@@ -87,15 +102,20 @@ export default function Maintenance() {
   const [scanSubmitting, setScanSubmitting] = useState(false);
   const [binding, setBinding] = useState<Asset>();
   const [cleanup, setCleanup] = useState<Omit<CleanupConfig, "query">>({
-    action: "resources",
+    ...cleanupDefaults(view, route.params.get("action")),
     scope: "library",
     resource_types: ["extra"],
     keep_extra: 3,
-    disposition: "permanent",
     retention_days: 7,
     stop_collection: true,
     allow_empty: false,
   });
+  const action = route.params.get("action");
+  useEffect(() => {
+    setCleanup(c => ({...c, ...cleanupDefaults(view, action)}));
+    setQuery(q => ({...q, status: view === "differences" ? "missing" : ""}));
+    setPage(0);
+  }, [view, action]);
   const signature = JSON.stringify(query);
   useEffect(() => {
     setPage(0);
@@ -148,8 +168,16 @@ export default function Maintenance() {
       ),
     enabled: view === "history",
   });
-  const update = (values: Partial<AssetFilter>) =>
-    setQuery((q) => ({ ...q, ...values }));
+  const update = (values: Partial<AssetFilter>) => {
+    setQuery(q => ({...q, ...values}));
+    if (values.library_ids) {
+      const params = new URLSearchParams(route.params);
+      params.delete("library"); params.delete("libraries"); params.delete("job");
+      if (values.library_ids.length === 1) params.set("library", String(values.library_ids[0]));
+      if (values.library_ids.length > 1) params.set("libraries", values.library_ids.join(","));
+      replaceParams(params);
+    }
+  };
   const toggle = (id: number) => {
     const change = (previous: Set<number>) => {
       const next = new Set(previous);
@@ -239,35 +267,12 @@ export default function Maintenance() {
     ? Math.max(0, (assets.data?.total || 0) - excluded.size)
     : selection.size;
   const activeScan = overview.data?.jobs.some((j) => j.kind === "maintenance_scan" && ["running", "paused"].includes(j.status));
-  if (view === "metadata") return <MetadataFallback />;
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2">
-        {[
-          ["space", "空间概览"],
-          ["assets", "本地资料与筛选"],
-          ["cleanup", "筛选清理"],
-          ["differences", "磁盘差异"],
-          ["unavailable", "无可用源／清退残留"],
-          ["history", "记录与恢复"],
-          ["metadata", "源站资料补全"],
-        ].map(([key, label]) => (
-          <Button
-            key={key}
-            variant={view === key ? "primary" : "outline"}
-            onClick={() => {
-              setView(key);
-              setPage(0);
-              if (key === "differences") {
-                update({ status: "missing" });
-                setCleanup((c) => ({ ...c, action: "reconcile" }));
-              } else if (view === "differences") update({ status: "" });
-            }}
-          >
-            {label}
-          </Button>
-        ))}
-      </div>
+      {view === "differences" && <Panel title="手动删除之后：先确认缺失，不要先补回"><div className="space-y-2 text-sm">
+        <p>先确认挂载在线，再“扫描磁盘与 NFO”。下方默认只列缺失记录，动作默认“磁盘已删，同步记录”：不再次删除磁盘文件，保留“停止收录”才能防止后续重新添加。</p>
+        <p className="text-warn">如果只是移动或改名，先回“操作指南”选择同步位置/纳管；不要把库外或另一库里的文件误认为已删除。经常手动删除时，先成功盘点并启用“缺失先等待确认”。</p>
+      </div></Panel>}
       <Panel
         title="维护范围"
         actions={
@@ -389,13 +394,14 @@ export default function Maintenance() {
               setExcluded(new Set());
             }}
           />
-          <MaintenanceOptions
+          {(view === "cleanup" || view === "differences") && <MaintenanceOptions
             cleanup={cleanup}
             setCleanup={setCleanup}
             busy={busy}
             selectedCount={selectedCount}
             preview={preview}
-          />
+          />}
+          {view === "assets" && <p className="text-sm text-muted">本页仅盘点与查看资料，不展示删除动作。需要处理所选影片时，进入上方“清理文件”；手动删除后需要清理失效关联则进入“手动删除后”。</p>}
         </>
       )}
       {view === "history" && (

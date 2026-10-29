@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "typecheck": "tsc -b",
+    "test:library-management": "node --experimental-strip-types --test tests/library-management.test.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

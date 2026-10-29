@@ -1,14 +1,14 @@
 import { useState } from "react";
 import { Check } from "./ui/form";
 
-export const defaultVerifyOptions = { repair: true, covers: true, details: false, force_external: false };
+export const defaultVerifyOptions = { repair: false, covers: true, details: false, force_external: false };
 export type VerifyValues = typeof defaultVerifyOptions;
 
 export function verifyParams(v: VerifyValues) {
   return { repair: v.repair, covers: v.repair && v.covers, detail: v.repair && v.details, force_external: v.repair && v.force_external };
 }
 
-export const verifyHint = "检查 strm 的存在和播放地址、nfo 和封面。补回时在本地重写 strm、nfo，封面先尝试从别的库硬链接，再下载。没详情的影片可排队抓详情（外部整理库不抓）。外部整理库按内容查找，找到只更新路径，两边都找不到才写回收件目录；默认跳过不存在或为空的外部整理目录，请先检查挂载。";
+export const verifyHint = "默认不补回主文件。普通库检查 STRM 地址、NFO 和封面；外部库主要检查 STRM，仍会同步位置，开启多画质时可能增删本服务版本 STRM，所以不是完全只读。显式勾选补回后，普通库可重写 STRM/NFO、补图或抓详情；外部库两边都找不到时按策略写回收件区，不补外部 NFO/图片。主动删除且不想恢复时，请用“手动删除后 → 磁盘已删，同步记录”。挂载异常不要强制补回。";
 
 export function VerifyOptions({ value, onChange }: { value: VerifyValues; onChange: (v: VerifyValues) => void }) {
   const set = (patch: Partial<VerifyValues>) => onChange({ ...value, ...patch });

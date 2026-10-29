@@ -1,9 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
 import { MoreHorizontal, Pencil, Plus } from "lucide-react";
 import { useEffect, useState } from "react";
-import { ask, confirm } from "@/components/confirm";
+import { ask } from "@/components/confirm";
 import { ConfigTransfer } from "@/components/config-transfer";
-import { SiteRetirement } from "@/components/site-retirement";
 import { OperationPreview } from "@/components/operation-preview";
 import { QueryNotice } from "@/components/common";
 import { nextSubscriptionTime } from "@/components/subscription-schedule";
@@ -12,7 +11,7 @@ import { Button } from "@/components/ui/button";
 import { Chip, EmptyRow, Help, Mono, Panel, Table, Td, Th } from "@/components/ui/data";
 import { Check, Field, Input, Segmented, Select, Switch } from "@/components/ui/form";
 import { Dialog, DialogContent, Menu, MenuContent, MenuItem, MenuSeparator, MenuTrigger } from "@/components/ui/overlay";
-import { rewriteAll, runSubscription, verifyLibrary } from "@/lib/actions";
+import { runSubscription } from "@/lib/actions";
 import { api, type FacetItem, type FacetField, type Library, type Subscription } from "@/lib/api";
 import { fmtNum, fmtTime } from "@/lib/format";
 import { useLibraries, useMeta, useRun, useStatus, useSubscriptions } from "@/lib/queries";
@@ -51,50 +50,8 @@ function LibrariesPanel() {
   const libs = librariesQuery.data ?? [];
   const { data: subs = [] } = useSubscriptions();
   const { data: status } = useStatus();
-  const run = useRun();
   const [editing, setEditing] = useState<Library | "new" | null>(null);
   const names = (ids: number[]) => ids.map(id => libs.find(l => l.id === id)?.name ?? `#${id}`).join("、");
-  const done = { invalidate: [["libraries"], ["status"], ["jobs"]] };
-
-  const remove = async (l: Library) => {
-    const what = l.external_dir
-      ? `${fmtNum(l.videos)} 部影片的 strm（外部整理库只删 strm，nfo 和图片留给外部工具）`
-      : `目录下本服务生成的 ${fmtNum(l.videos)} 部影片的文件`;
-    const choice = await confirm({
-      title: `删除输出库「${l.name}」`,
-      body: <p>要不要同时删掉{what}？</p>,
-      choices: [
-        { value: "keep", label: "只删记录，保留文件" },
-        { value: "files", label: "连文件一起删", variant: "danger" },
-      ],
-    });
-    if (!choice) return;
-    await run(() => api.del<{ job_id: number }>(`/api/libraries/${l.id}?delete_files=${choice === "files"}`), {
-      success: r => `已排队删除任务 #${r.job_id}`,
-      ...done,
-    });
-  };
-
-  const tidy = async (l: Library) => {
-    const choice = await confirm({
-      title: `清理「${l.name}」的残留目录`,
-      body: (
-        <>
-          <p>在外部整理目录 <Mono>{l.external_root}</Mono> 里找已经没有 strm、只剩 nfo 和图片的影片目录（以前移出库时留下的），移进回收区。</p>
-          <p className="text-muted">回收区在整理目录下的 <Mono>{TRASH_DIR}</Mono>，放满设置里的保留天数后自动删除；保留 0 天会永久删除。一天内有改动的目录不动（可能正在整理）。检查完成后在任务详情查看完整清单，再确认按原范围清理；关闭页面不停止任务。</p>
-        </>
-      ),
-      choices: [
-        { value: "check", label: "只检查并生成预览", variant: "primary" },
-      ],
-    });
-    if (!choice) return;
-    const result = await run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/tidy?apply=false`), {
-      success: r => `已排队清理残留 #${r.job_id}`,
-      ...done,
-    });
-    if (result) navigate("jobs", {job: String(result.job_id)});
-  };
 
   return (
     <Panel
@@ -110,7 +67,7 @@ function LibrariesPanel() {
           </Button>
           <Button size="sm" onClick={() => navigate("schedules")}>定时任务</Button>
           <ConfigTransfer />
-          <SiteRetirement />
+          <Button size="sm" onClick={() => navigate("maintenance")}>媒体库管理</Button>
         </>
       }
       bodyClassName="px-4 py-0"
@@ -184,38 +141,7 @@ function LibrariesPanel() {
                   <Pencil />
                   编辑
                 </Button>
-                <Menu>
-                  <MenuTrigger asChild>
-                    <Button size="icon-sm" variant="ghost" aria-label="更多操作">
-                      <MoreHorizontal />
-                    </Button>
-                  </MenuTrigger>
-                  <MenuContent>
-                    <MenuItem onSelect={() => rewriteAll(run, l)}>重写输出</MenuItem>
-                    <MenuItem onSelect={() => verifyLibrary(run, l)}>核对并补回</MenuItem>
-                    <MenuItem onSelect={() => navigate("maintenance", {library: String(l.id)})}>库维护（NFO、空间与清理）</MenuItem>
-                    {l.external_dir && <MenuItem onSelect={() => navigate("maintenance", {library: String(l.id), tab: "metadata"})}>源站资料兜底补全</MenuItem>}
-                    {(l.rule || l.sources.length > 0 || l.excludes.length > 0) && (
-                      <MenuItem onSelect={() => run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/reclassify`), { success: r => `已排队重新归库 #${r.job_id}`, ...done })}>
-                        重新归库
-                      </MenuItem>
-                    )}
-                    {l.external_dir && (
-                      <MenuItem onSelect={() => run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/locate`), { success: r => `已排队同步位置 #${r.job_id}`, ...done })}>
-                        同步位置
-                      </MenuItem>
-                    )}
-                    {l.external_dir && <MenuItem onSelect={() => tidy(l)}>清理残留目录</MenuItem>}
-                    {l.id !== 1 && (
-                      <>
-                        <MenuSeparator />
-                        <MenuItem danger onSelect={() => remove(l)}>
-                          删除输出库
-                        </MenuItem>
-                      </>
-                    )}
-                  </MenuContent>
-                </Menu>
+                <Button size="sm" onClick={() => navigate("maintenance", {library: String(l.id)})}>管理文件与记录</Button>
               </Td>
             </tr>
           ))}

@@ -33,7 +33,7 @@ export function MetadataFallback() {
   const route = useRoute();
   const run = useRun();
   const { data: libraries = [] } = useLibraries(true);
-  const [library, setLibrary] = useState(route.params.get("library") || "");
+  const library = route.params.get("library") || "";
   const [mode, setMode] = useState<Mode>("missing");
   const [images, setImages] = useState(true);
   const [failedDir, setFailedDir] = useState("");
@@ -77,7 +77,6 @@ export function MetadataFallback() {
   const act = (action: string) => job && run(() => api.post(`/api/jobs/${job.id}/${action}`), refresh);
   const chosen = libraries.find(lib => String(lib.id) === library);
   return <div className="space-y-4">
-    <Button onClick={() => navigate("maintenance", library ? { library } : {})}>返回库维护</Button>
     <Panel title="源站资料兜底补全 · 仅手动">
       <p className="py-3 text-sm text-muted">三个模式独立检查、独立确认。使用数据库已有资料，不重抓详情，不修改外部刮削器配置，不设置定时任务。</p>
       <div className="grid gap-3 md:grid-cols-3">
@@ -88,7 +87,12 @@ export function MetadataFallback() {
         </button>)}
       </div>
       <div className="grid gap-4 py-4 md:grid-cols-2">
-        <Field label="外部整理库"><Select value={library} onChange={e => { setLibrary(e.target.value); openJob(); }}>
+        <Field label="外部整理库"><Select value={library} onChange={e => {
+          const params = new URLSearchParams(route.params);
+          params.delete("job");
+          if (e.target.value) params.set("library", e.target.value); else params.delete("library");
+          replaceParams(params); setPage(0); setPaused(false);
+        }}>
           <option value="">请选择一个库</option>
           {libraries.filter(lib => lib.external_dir).map(lib => <option key={lib.id} value={lib.id}>{lib.name}</option>)}
         </Select></Field>

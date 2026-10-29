@@ -6,7 +6,7 @@ import { siteSignal } from "@/components/site-signals";
 import { nextSubscriptionTime } from "@/components/subscription-schedule";
 import { Button } from "@/components/ui/button";
 import { Chip, Dot, EmptyRow, KV, Mono, Notice, Panel, Table, Td, Th, type Tone } from "@/components/ui/data";
-import { rewriteAll, runSubscription, verifyLibrary } from "@/lib/actions";
+import { runSubscription } from "@/lib/actions";
 import { api, type DomainTestResult, type Status, type Subscription } from "@/lib/api";
 import { fmtDomainTest, fmtDur, fmtNum, fmtTime, pct } from "@/lib/format";
 import { kindName, PLAY_MODES } from "@/lib/labels";
@@ -62,8 +62,8 @@ export default function Overview() {
           tone="warn"
           actions={
             <>
-              <Button size="sm" onClick={() => verifyLibrary(run, null)}>
-                核对并补回
+              <Button size="sm" onClick={() => navigate("maintenance")}>
+                判断缺失原因与处理方式
               </Button>
               <Button size="sm" variant="ghost" onClick={() => navigate("libraries")}>
                 看是哪些库
@@ -203,7 +203,7 @@ export default function Overview() {
             >
               补全缺失详情
             </Button>
-            <Button onClick={() => rewriteAll(run)}>重写全部输出</Button>
+            <Button onClick={() => navigate("maintenance")}>媒体库管理（重写 / 清理 / 恢复）</Button>
           </div>
           <h3 className="mb-1 mt-5 text-sm font-semibold">活动任务的队列</h3>
           <Table>

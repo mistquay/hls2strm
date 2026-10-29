@@ -18,7 +18,12 @@ export function MaintenanceOptions({
   preview: () => void;
 }) {
   return (
-    <Panel title="选择清理动作">
+    <Panel title={cleanup.action === "reconcile" ? "同步失效记录（不再次删除磁盘文件）" : "选择清理动作与文件处置"}>
+      <p role="status" className={`py-3 text-sm ${cleanup.action !== "reconcile" && (cleanup.disposition === "permanent" || cleanup.retention_days === 0) ? "text-err" : "text-warn"}`}>
+        {cleanup.action === "reconcile" ? "当前只处理确认缺失的输出关联，不删除残留 NFO/图片；保留停止收录可阻止以后重新输出。" :
+          cleanup.disposition === "permanent" || cleanup.retention_days === 0 ? "当前处置是永久删除（包括回收 0 天），执行后无法通过回收恢复。先查看完整文件预览。" :
+            `当前处置是移入回收区，保留 ${cleanup.retention_days} 天；到期可能永久清理。同盘回收不立即释放磁盘空间。`}
+      </p>
       <div className="grid gap-3 py-3 sm:grid-cols-2 lg:grid-cols-4">
         <Field label="动作">
           <Select
@@ -146,7 +151,7 @@ export function MaintenanceOptions({
           disabled={busy || !selectedCount}
           onClick={preview}
         >
-          生成清理预览
+          {cleanup.action === "reconcile" ? "预览失效记录清理" : "生成文件清理预览"}
         </Button>
       </div>
     </Panel>
