@@ -379,6 +379,8 @@ async def delete_job(job_id: int, request: Request):
         raise HTTPException(400,"清退设置尚未完成，先重试执行任务或恢复清退再删除")
     if await db._one("SELECT 1 FROM jobs WHERE json_extract(params,'$.preview_id')=? LIMIT 1",(job_id,),bulk=True):
         raise HTTPException(400,"预览仍被执行任务引用，先处理并删除关联执行任务")
+    if job["kind"] == "metadata_apply":
+        raise HTTPException(400, "补全执行记录包含文件写入与接管凭据，暂不支持删除")
     if job["kind"].startswith("maintenance_"):
         if await db._one("SELECT 1 FROM jobs WHERE json_extract(params,'$.restore_of')=? LIMIT 1", (job_id,)):
             raise HTTPException(400, "清理记录仍被恢复任务引用")
@@ -389,7 +391,7 @@ async def delete_job(job_id: int, request: Request):
     if await db._one("SELECT 1 FROM libraries WHERE operation_job_id=? AND operation_pending=1 LIMIT 1",(job_id,)):
         raise HTTPException(400,"输出库仍有未完成的变更，先完成或重新预览后处理")
     await db.delete_job(job_id)
-    if job["kind"] in ("maintenance_preview", "maintenance_restore_preview"):
+    if job["kind"] in ("maintenance_preview", "maintenance_restore_preview", "metadata_preview"):
         await db._write("DELETE FROM cleanup_files WHERE item_id IN (SELECT id FROM maintenance_items WHERE preview_id=?)", (job_id,))
         await db._write("DELETE FROM maintenance_items WHERE preview_id=?", (job_id,))
     if job["kind"] == "storage_scan":

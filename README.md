@@ -156,6 +156,8 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 ### 交给 mdcng 等外部工具整理刮削
 
+外部工具未刮到资料时，可在输出库菜单使用 **源站资料兜底补全**：分别处理“缺 NFO/图片”“已有 NFO 补空字段”“未整理文件接管”，均需手动预览和确认，不增加定时任务。使用 hls2strm 已有资料，保留已有刮削字段；操作与边界见 [手动补全说明](docs/metadata-fallback.md)。
+
 只想要 strm、刮削和归类交给 mdcng 时，给库填上**外部整理目录**，也就是 mdcng 为这个库整理输出的目标目录。这样的库叫外部整理库：
 
 - 库目录变成"收件目录"：影片第一次入库时按模板写一个 strm，不写 nfo，也不下载封面。mdcng 监控这个目录，把 strm 移走、改名，并生成 nfo 和图片。

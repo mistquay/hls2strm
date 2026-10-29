@@ -22,6 +22,8 @@ export const KIND_NAMES: Record<string, string> = {
   storage_scan: "目录占用与清理预览",
   storage_clean: "清理额外剧照",
   maintenance_scan: "扫描磁盘与 NFO",
+  metadata_preview: "源站资料补全预览",
+  metadata_apply: "执行源站资料补全",
   maintenance_preview: "媒体清理预览",
   maintenance_apply: "执行媒体清理",
   maintenance_restore_preview: "回收恢复预览",

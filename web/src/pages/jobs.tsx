@@ -351,6 +351,9 @@ function JobDetail({ job, now, onDeleted }: { job: Job; now: number; onDeleted: 
       </header>
       <div className="scroll-thin min-h-0 flex-1 space-y-5 overflow-y-auto px-5 py-4">
         <div className="flex flex-wrap gap-1.5">
+          {job.kind.startsWith("metadata_") && <Button size="sm" variant="primary" onClick={() => navigate("maintenance", {
+            tab: "metadata", job: String(job.id),
+          })}>查看补全预览 / 结果</Button>}
           {job.kind.startsWith("maintenance_") && job.kind !== "maintenance_scan" && <Button size="sm" variant="primary" onClick={() => navigate("maintenance", {
             tab: "history", job: String(job.id),
           })}>

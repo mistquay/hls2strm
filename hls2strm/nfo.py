@@ -11,8 +11,8 @@ VERSION = 1
 
 
 class SafeTree(ET.TreeBuilder):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
         self.depth = 0
         self.nodes = 0
 

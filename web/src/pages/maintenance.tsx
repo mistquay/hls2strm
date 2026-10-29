@@ -4,6 +4,7 @@ import { MaintenanceAssets } from "@/components/maintenance-assets";
 import { MaintenanceSpace, type Root } from "@/components/maintenance-space";
 import { MaintenanceScan } from "@/components/maintenance-scan";
 import { MaintenanceJobs } from "@/components/maintenance-jobs";
+import { MetadataFallback } from "@/components/metadata-fallback";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
@@ -40,7 +41,7 @@ export default function Maintenance() {
   const queryClient = useQueryClient();
   const { data: libs = [] } = useLibraries(true);
   const tab = route.params.get("tab") || "assets";
-  const view = ["space", "assets", "cleanup", "differences", "unavailable", "history"].includes(tab) ? tab : "assets";
+  const view = ["space", "assets", "cleanup", "differences", "unavailable", "history", "metadata"].includes(tab) ? tab : "assets";
   const setView = (value: string) => {
     const params = new URLSearchParams(route.params);
     params.set("tab", value);
@@ -129,7 +130,7 @@ export default function Maintenance() {
         bytes: number;
         extra_bytes: number;
       }>(`/api/maintenance/assets/query?offset=${page * 50}`, query),
-    enabled: !["history", "space", "unavailable"].includes(view),
+    enabled: !["history", "space", "unavailable", "metadata"].includes(view),
   });
   const completedScan = overview.data?.jobs.find((job) => job.kind === "maintenance_scan" && job.status === "done")?.id;
   useEffect(() => {
@@ -238,6 +239,7 @@ export default function Maintenance() {
     ? Math.max(0, (assets.data?.total || 0) - excluded.size)
     : selection.size;
   const activeScan = overview.data?.jobs.some((j) => j.kind === "maintenance_scan" && ["running", "paused"].includes(j.status));
+  if (view === "metadata") return <MetadataFallback />;
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-2">
@@ -248,6 +250,7 @@ export default function Maintenance() {
           ["differences", "磁盘差异"],
           ["unavailable", "无可用源／清退残留"],
           ["history", "记录与恢复"],
+          ["metadata", "源站资料补全"],
         ].map(([key, label]) => (
           <Button
             key={key}

@@ -110,6 +110,8 @@ class Engine:
         self.storage = Storage(self, boot.data_dir)
         from .maintenance import Maintenance
         self.maintenance = Maintenance(self)
+        from .metadata_fallback import MetadataFallback
+        self.metadata = MetadataFallback(self, boot.data_dir)
         self._workers: list[asyncio.Task] = []
         self._scheduler: asyncio.Task | None = None
         self._subscription_schedule_started_at = time.time()
@@ -273,6 +275,7 @@ class Engine:
                        "maintenance_scan": self.maintenance.scan, "maintenance_preview": self.maintenance.preview,
                        "maintenance_apply": self.maintenance.apply, "maintenance_restore_preview": self.maintenance.restore_preview,
                        "maintenance_restore": self.maintenance.restore,
+                       "metadata_preview": self.metadata.preview, "metadata_apply": self.metadata.apply,
                        "source_remove": self._do_source_remove, "source_restore": self._do_source_restore,
                        "preview":self.operations.preview,"apply_preview":self.operations.apply,"selection_prepare":self.operations.selected,
                        "prefix_stats":self._do_prefix_stats}[task["kind"]]
@@ -378,6 +381,7 @@ class Engine:
         finished = int(time.time())
         state = job["state"]
         if (counts.get("failed") or counts.get("cancelled") or (job["kind"] == "storage_clean" and state.get("failed"))
+                or (job["kind"].startswith("metadata_") and (state.get("failed") or state.get("error")))
                 or (job["kind"].startswith("maintenance_") and (state.get("failed") or state.get("failed_roots")))):
             state["partial_failure"] = True
         else:
@@ -1926,6 +1930,8 @@ class Engine:
                 await self.db.cancel_open_tasks(job_id)
                 await self.db.update_job(job_id, status="cancelled", finished_at=int(time.time()))
         elif action == "retry":
+            if job["kind"] == "metadata_apply":
+                raise ValueError("请在源站资料补全页面确认暂停外部刮削后重试")
             if job["kind"].startswith("maintenance_"):
                 await self.maintenance.retry(job_id)
                 return

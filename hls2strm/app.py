@@ -105,6 +105,8 @@ def create_app(boot: BootConfig | None = None) -> FastAPI:
     app.include_router(storage_api.router, prefix="/api", dependencies=[Depends(api.require_auth)])
     from . import maintenance_api
     app.include_router(maintenance_api.router, prefix="/api", dependencies=[Depends(api.require_auth)])
+    from . import metadata_api
+    app.include_router(metadata_api.router, prefix="/api", dependencies=[Depends(api.require_auth)])
     from . import prefix_api
     app.include_router(prefix_api.router, prefix="/api", dependencies=[Depends(api.require_auth)])
     app.include_router(play.router)

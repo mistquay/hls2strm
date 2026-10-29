@@ -194,6 +194,7 @@ function LibrariesPanel() {
                     <MenuItem onSelect={() => rewriteAll(run, l)}>重写输出</MenuItem>
                     <MenuItem onSelect={() => verifyLibrary(run, l)}>核对并补回</MenuItem>
                     <MenuItem onSelect={() => navigate("maintenance", {library: String(l.id)})}>库维护（NFO、空间与清理）</MenuItem>
+                    {l.external_dir && <MenuItem onSelect={() => navigate("maintenance", {library: String(l.id), tab: "metadata"})}>源站资料兜底补全</MenuItem>}
                     {(l.rule || l.sources.length > 0 || l.excludes.length > 0) && (
                       <MenuItem onSelect={() => run(() => api.post<{ job_id: number }>(`/api/libraries/${l.id}/reclassify`), { success: r => `已排队重新归库 #${r.job_id}`, ...done })}>
                         重新归库
