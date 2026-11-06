@@ -13,6 +13,7 @@ from .cache import AsyncCache
 from .fetcher import close_stream
 from .quality import filter_master
 from .runtime import deadline, traffic, trace, play_discovery, background
+from .media_format import media_container
 
 
 def candidate_key(resolved) -> tuple[int, int]:
@@ -85,7 +86,8 @@ class PlaybackSelection:
         headers = resolved.traits.headers
         settings = self.resolver.store.current
         target = resolved.url
-        if target.split("?", 1)[0].lower().endswith(".m3u8"):
+        playlist = target.split("?", 1)[0].lower().endswith(".m3u8")
+        if playlist:
             for _ in range(4):
                 if hasattr(fetcher, "get_playlist"):
                     raw = await fetcher.get_playlist(target, headers=headers, timeout=settings.resolve_attempt_timeout)
@@ -119,13 +121,20 @@ class PlaybackSelection:
             if "text/html" in kind or "application/json" in kind:
                 raise FetchError("CDN 返回错误页面而非媒体")
             got = 0
+            sample = b""
             async with asyncio.timeout(settings.resolve_attempt_timeout):
                 async for chunk in response.aiter_content():
+                    if len(sample) < 32:
+                        sample += chunk[:32-len(sample)]
                     got += len(chunk)
                     if got >= nbytes:
                         break
             if not got:
                 raise FetchError("媒体预检返回空内容")
+            container = "m3u8" if playlist else media_container(resolved.url, kind, sample)
+            if not container:
+                raise FetchError("无法识别媒体容器")
+            return container
         finally:
             await close_stream(response)
 
@@ -134,6 +143,7 @@ class PlaybackSelection:
         limit = deadline.get() or time.monotonic() + resolver.store.current.resolve_timeout
         dt, tt = deadline.set(limit), traffic.set("play")
         prior_discovery = options.pop("_discovered", False)
+        required_container = options.pop("container", "")
         discovery_token = play_discovery.set(set()) if play_discovery.get() is None else None
         if prior_discovery:
             v = await resolver.db.get_video(slug)
@@ -165,7 +175,8 @@ class PlaybackSelection:
                         raise
                     key = candidate_key(resolved)
                     try:
-                        await asyncio.wait_for(self.probe(resolved, options.get("want")), resolver.store.current.resolve_attempt_timeout)
+                        detected = await asyncio.wait_for(self.probe(resolved, options.get("want")), resolver.store.current.resolve_attempt_timeout)
+                        resolved.container = detected or resolved.media_container
                     except PoolBusy:
                         resolver.metrics.inc("play_preflight_busy")
                         raise
@@ -179,8 +190,16 @@ class PlaybackSelection:
                         await self.failed(resolved, message)
                         resolver.metrics.inc("play_preflight_failover")
                         continue
+                    if required_container and resolved.media_container != required_container:
+                        # 客户端已按该容器创建播放器；主动排除其他格式，不惩罚健康源。
+                        blocked.add(key)
+                        tried.add(key)
+                        cooling.discard(key)
+                        trace(f"候选 {key} 是 {resolved.media_container}，本次需要 {required_container}")
+                        continue
                     self.cooling.pop(key, None)
                     resolved.playback_options = {**options, "excluded": [list(k) for k in tried],
+                                                 **({"container": required_container} if required_container else {}),
                                                  "_discovered": bool(play_discovery.get())}
                     return resolved
         except TimeoutError:

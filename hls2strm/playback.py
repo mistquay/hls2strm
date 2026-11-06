@@ -49,7 +49,8 @@ class PlaybackSessions:
         ttl = self.items[key][0] - time.monotonic()
         data = {"video": resolved.video, "source": resolved.source, "line": resolved.line,
                 "proxy_forced": resolved.proxy_forced, "allow_direct": resolved.allow_direct, "requested": resolved.requested,
-                "playback_options": resolved.playback_options, "started": resolved.started, "replacement": resolved.replacement}
+                "playback_options": resolved.playback_options, "started": resolved.started,
+                "replacement": resolved.replacement, "container": resolved.container}
         await db._write("INSERT INTO play_sessions(id,source_id,data,expires_at) VALUES(?,?,?,?)",
                         (key, resolved.source["id"], json.dumps(data), int(time.time()+ttl)))
         self.created += 1
@@ -79,7 +80,7 @@ class PlaybackSessions:
             data = json.loads(row["data"])
             resolved = Resolved(data["video"], data["source"], get_site(data["source"]["site"]), data["line"],
                                 data["proxy_forced"], data.get("allow_direct", False), data.get("requested"), data.get("playback_options"),
-                                data.get("started", True), data.get("replacement", ""))
+                                data.get("started", True), data.get("replacement", ""), data.get("container", ""))
             self.items[key] = (time.monotonic()+row["expires_at"]-time.time(), resolved)
             while self.capacity and len(self.items) > self.capacity:
                 self.items.popitem(last=False)

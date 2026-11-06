@@ -42,6 +42,7 @@ from .playback_selection import PlaybackSelection, candidate_key
 from .runtime import play_discovery
 from .hls_relay import HLSUpstreamStatus, playlist_bytes
 from .play_history import attempt as history_attempt, delivery as history_delivery
+from .media_format import CONTAINERS, MEDIA_TYPES, media_container
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +85,11 @@ class Resolved:
     playback_options: dict | None = None  # 创建会话时保留显式选源、版本与画质限制。
     started: bool = False  # 已交付媒体的会话不允许跨源。
     replacement: str = ""  # 首次交付失败后的固定新会话地址。
+    container: str = ""  # 媒体预检确认的容器，与 STRM 的扩展名无关。
+
+    @property
+    def media_container(self) -> str:
+        return self.container or media_container(self.url) or "mp4"
 
     @property
     def traits(self) -> StreamTraits:
@@ -639,6 +645,7 @@ class Resolver:
         refreshed.playback_options = r.playback_options
         refreshed.started = r.started
         refreshed.replacement = r.replacement
+        refreshed.container = r.container
         self.sessions.update(session, refreshed)
         return refreshed
 
@@ -731,7 +738,7 @@ def _variant_wanted(ctx, r: Resolved, want: int | None) -> bool:
     if want is None and ctx.store.current.variant_mode != "highest":
         return False
     row = r.line or r.source
-    return _is_hls(r.url) and len({quality_tier(h) for h in parse_heights(row["heights"])}) > 1
+    return r.media_container == "m3u8" and len({quality_tier(h) for h in parse_heights(row["heights"])}) > 1
 
 
 async def _pick_variant(ctx, r: Resolved, want: int | None) -> str:
@@ -802,7 +809,8 @@ async def cors_preflight():
 
 @router.get("/api/resolve/{name:path}")
 async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin: str = "", fetch_mode: str = "",
-                              min_remaining: int | None = None, mode: str = "", relay: str = ""):
+                              min_remaining: int | None = None, mode: str = "", relay: str = "",
+                              prepare: bool = False, container: str = ""):
     """给 embyGateway 的 http_resolver 后端用：返回客户端（外网）能播的地址，由网关 302。
 
     mode（不带用设置里的 resolve_mode）：
@@ -833,6 +841,13 @@ async def resolve_for_gateway(name: str, request: Request, ua: str = "", origin:
         mode = "proxy"
     if mode not in ("auto", "redirect", "strict_redirect", "proxy"):
         raise HTTPException(400, f"mode 只能是 auto、redirect、strict_redirect、proxy：{mode}")
+    if container and container not in CONTAINERS:
+        raise HTTPException(422, "不支持的播放容器")
+    if prepare or container:
+        from .gateway_playback import prepare_playback
+        return await prepare_playback(request, slug, want, mode=mode, relay=relay, ua=ua,
+                                      origin=origin, fetch_mode=fetch_mode, min_remaining=min_remaining,
+                                      container=container)
     ctx.metrics.inc("resolve_requests")
     extra = f"，UA {ua[:60]}" + (f"，fetch_mode {fetch_mode}" if fetch_mode else "")
     base = str(request.base_url).rstrip("/") if relay == "gateway" else s.resolve_proxy_url
@@ -1013,7 +1028,8 @@ def playback_source(r: Resolved) -> dict:
             "served_slug": r.video["slug"], "requested_slug": (r.requested or r.video)["slug"],
             "edition_fallback": r.requested is not None,
             "site": r.site.name, "label": r.site.label, "line": r.line["line"] if r.line else "",
-            "host": host_label(r.host), "media_type": "hls" if _is_hls(r.url) else "file",
+            "host": host_label(r.host), "media_type": "hls" if r.media_container == "m3u8" else "file",
+            "container": r.media_container,
             "height": (r.line or r.source).get("height") or 0,
             "duration": r.video.get("duration") or 0}
 
@@ -1057,7 +1073,7 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
         await close_stream(resp)
         out["Content-Location"] = await _media_location(request, r)
         return Response(status_code=resp.status_code, headers=out,
-                        media_type=resp.headers.get("content-type") or "video/mp4")
+                        media_type=resp.headers.get("content-type") or MEDIA_TYPES[r.media_container])
 
     async def body():
         sent = 0
@@ -1079,7 +1095,7 @@ async def _proxy_file(request: Request, r: Resolved) -> Response:
             await close_stream(resp)
 
     return StreamingResponse(body(), status_code=resp.status_code, headers=out,
-                             media_type=resp.headers.get("content-type") or "video/mp4")
+                             media_type=resp.headers.get("content-type") or MEDIA_TYPES[r.media_container])
 
 
 def _starting_range(request: Request) -> bool:
@@ -1114,7 +1130,7 @@ async def _proxy_start(request: Request, r: Resolved, t: str, want=None, *, all_
             # 单次交付预算不能吃光整次起播预算，剩余时间给其他源。
             async with asyncio.timeout(_ctx(request).store.current.resolve_attempt_timeout):
                 return await (_proxy_playlist(request, r, t, want, all_variants=all_variants)
-                              if _is_hls(r.url) else _proxy_file(request, r))
+                              if r.media_container == "m3u8" else _proxy_file(request, r))
         except TimeoutError:
             error = _cdn_error(request, r, "媒体首包超时")
         except HTTPException as e:
@@ -1122,9 +1138,10 @@ async def _proxy_start(request: Request, r: Resolved, t: str, want=None, *, all_
         r = await _recover_start(request, r, error, want)
 
 
-@router.api_route("/media/{source_id}", methods=["GET", "HEAD"])
+@router.api_route("/media/{source_id:int}.{container}", methods=["GET", "HEAD"])
+@router.api_route("/media/{source_id:int}", methods=["GET", "HEAD"])
 async def media_file(source_id: int, request: Request, s: str, t: str = "", want: int | None = None,
-                     variants: str = ""):
+                     variants: str = "", container: str = ""):
     """网页播放：清单、Range/拖动保持源、线路和地址快照一致。"""
     _check_token(request, t)
     history_attempt(request,"")
@@ -1134,6 +1151,8 @@ async def media_file(source_id: int, request: Request, s: str, t: str = "", want
             r = await ctx.resolver.sessions.restore(ctx.db, s, source_id)
         except (NotFound, VideoGone):
             raise HTTPException(404, "播放会话不存在或已失效，请重新试播") from None
+        if container and container != r.media_container:
+            raise HTTPException(409, "播放容器与已准备会话不一致，请重新发起播放")
         if r.replacement:
             response = RedirectResponse(r.replacement, status_code=307)
             if request.headers.get("origin"):
@@ -1144,7 +1163,7 @@ async def media_file(source_id: int, request: Request, s: str, t: str = "", want
             history_delivery(request,r)
             async with asyncio.timeout(ctx.store.current.resolve_attempt_timeout):
                 response = await (_proxy_playlist(request, r, t, want, all_variants=variants == "all")
-                                  if _is_hls(r.url) else _proxy_file(request, r))
+                                  if r.media_container == "m3u8" else _proxy_file(request, r))
         except PoolBusy as e:
             raise HTTPException(503, str(e), headers={"Retry-After": "1"}) from None
         except (HTTPException, Blocked, FetchError, ParseError, TimeoutError, NotFound) as e:
@@ -1187,6 +1206,7 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
             r = await ctx.resolver.ensure_source(r.source["id"], min_remaining=required,
                                                 line_id=r.line["id"] if r.line else None)
             r.playback_options, r.started = previous.playback_options, previous.started
+            r.container = previous.container
         else:
             r = await _resolve_or_http(request, (requested or r.video)["slug"], min_remaining=required,
                                        site=request.query_params.get("src") or None, line=request.query_params.get("line") or None,
@@ -1194,7 +1214,7 @@ async def _proxy_playlist(request: Request, r: Resolved, t: str, want: int | Non
         if requested and r.video["id"] != requested["id"]:
             r.requested = requested
         history_delivery(request,r)
-        if not _is_hls(r.url):
+        if r.media_container != "m3u8":
             return await _proxy_file(request, r)
         try:
             raw = await _playlist(ctx, r.url, r.traits.headers)

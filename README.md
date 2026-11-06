@@ -345,6 +345,12 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 
 `GET /api/resolve/{slug}.m3u8`，用 `Authorization: Bearer <resolve_token>` 认证（也可以用 `?token=`）。在设置里填了「网关解析令牌」之后才开放。
 
+新版网关增加 `prepare=1` 播放准备协议：先完成选源与有限媒体预检，返回 `protocol_version=1`、实际 `container` / `media_type` 和已确认的播放地址。中转使用带真实扩展名的 `/media/{source_id}.{container}?s=…`，直连使用这次已确认的 CDN 地址；不会返回尚未选源的 `/play` 兜底地址。MP4、HLS 等源均可参与起播选源，不调用 FFmpeg、不重封装、不转码。
+
+网关在 `PlaybackInfo` 返回前调用此协议，更新客户端看到的容器、路径与播放地址，并把请求绑定到用户、媒体版本及 `PlaySessionId`。后续 Range 请求复用准备结果，不重新随机选源。已声明格式后的首包恢复仅选择同容器候选；不支持已交付媒体后跨格式续接。未使用播放准备协议、仍按 `.m3u8` 请求的客户端可通过 `container=m3u8` 限定格式，不能把 MP4 当作 HLS 返回。
+
+**升级顺序：先部署 hls2strm，再部署配套网关。** 新网关拒绝缺少准备协议的解析结果，避免继续向客户端交付错误格式；旧网关不带 `prepare=1` 时仍使用下面的兼容接口行为。升级后客户端需要重新发起播放以取得新 `PlaybackInfo`。网关重启或准备票据过期后也需要重新准备；不迁移客户端已缓存的播放地址。
+
 - 正常情况：返回 200 和 `{"slug", "url", "relay", "expires_at", "ttl", "duration"}`；`relay` 说明 `url` 是不是本服务的中转地址。
 - `mode` 参数（不带时用设置里的「网关默认给的地址」，默认 auto）：
   - `auto`：按挑源偏好（画质优先 / 直连优先）挑，挑中的能让客户端直连就给 CDN 地址，要中转就给中转地址。
@@ -392,7 +398,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 2. 网关管理台 → 后端：新建「外部解析 (http_resolver)」。
    - 接口地址：`http://<本服务>:8080/api/resolve`（经网关中转时，网关按它去掉 `/api/resolve` 得到本服务的地址）
    - Token：填第 1 步的令牌
-   - 超时：**25 秒左右**。本服务挑源、取地址最多 20 秒（「取地址总时限」）；网关先超时会回退去反代 Emby。
+   - 超时：配套新网关按**至少 135 秒**处理起播请求，覆盖本服务最多 120 秒的选源预算及交付余量；同时用于中转响应头等待，不限制整部影片的传输时长。历史较小值自动归一为该下限。已命中解析路由后失败会返回错误，不再回退到可能暴露内网 STRM 地址的 Emby 重定向。
      或者把本服务的「取地址总时限」调到 10 秒以内
    - 播放方式：「302」时要中转的片 302 到本服务的公网中转地址（本服务「设置 → 公网中转地址」要填、能从外网访问）；
      「经网关中转」时经网关转发，本服务不用暴露
@@ -404,7 +410,7 @@ HLS2STRM_DATA_DIR=./data HLS2STRM_UI_PASSWORD=xxx python -m hls2strm
 5. 网关的 license 需要带 `backend:http_resolver` 特性，否则这个后端会被禁用。
 
 验证方法：播放一部影片，网关请求详情里的 Redirect Backend 是这个后端，Location 是 CDN 地址（能直连）或中转地址；
-本服务日志里会出现「resolve xxx：返回 … 的 CDN 地址」或「返回经网关转发的中转地址」。
+新版还应检查 `PlaybackInfo.MediaSources[].Container`、播放地址扩展名与媒体响应类型一致；本服务日志出现「prepare xxx」及实际容器，网关日志出现 `[PlaybackPrepare]`。旧接口日志仍为「resolve xxx」。HTTP 200/206 或“已交付”仅证明服务端响应，需使用真实客户端验证起播、拖动、备用源恢复及并发播放。
 
 ## 被拦截了怎么办
 
